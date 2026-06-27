@@ -1,0 +1,53 @@
+# RocksDB build of the DeBank cronos writer image.
+# Builds RocksDB from source to match the version cronos v1.7.x pins
+# (nix/rocksdb.nix: v10.5.1) and links cronosd with COSMOS_BUILD_OPTIONS=rocksdb.
+# The trace_debankBlock emitter is pulled via the go.mod replace
+# (github.com/evmos/ethermint => github.com/Chaintable/ethermint-cronos).
+
+FROM golang:1.25-bookworm AS go-builder
+
+# RocksDB build + link dependencies
+RUN apt-get update && \
+    apt-get install -y libgflags-dev libsnappy-dev zlib1g-dev libbz2-dev liblz4-dev libzstd-dev && \
+    rm -rf /var/lib/apt/lists/*
+
+# Build RocksDB v10.5.1 from source (matches grocksdb v1.10.3 / cronos nix pin)
+RUN git clone https://github.com/facebook/rocksdb.git /tmp/rocksdb && \
+    cd /tmp/rocksdb && \
+    git checkout v10.5.1 && \
+    make -j$(nproc) install-shared && \
+    ldconfig && \
+    rm -rf /tmp/rocksdb
+
+WORKDIR /code
+COPY . /code/
+
+# Chaintable/ethermint-cronos is public; GOPRIVATE skips the checksum DB/proxy for it.
+RUN GOPRIVATE='github.com/Chaintable/*' make install COSMOS_BUILD_OPTIONS=rocksdb
+
+# --------------------------------------------------------
+FROM ubuntu:22.04
+
+RUN apt-get update \
+    && apt-get install -y libsnappy1v5 libgflags2.2 zlib1g libbz2-1.0 liblz4-1 libzstd1 ca-certificates curl jq \
+    && rm -rf /var/lib/apt/lists/*
+
+# RocksDB shared objects from the builder
+COPY --from=go-builder /usr/local/lib/ /usr/local/lib/
+RUN ldconfig
+
+# cronosd binary
+COPY --from=go-builder /go/bin/cronosd /usr/bin/cronosd
+
+WORKDIR /opt
+
+# EVM JSON-RPC
+EXPOSE 8545
+# EVM WebSocket
+EXPOSE 8546
+# CometBFT P2P
+EXPOSE 26656
+# CometBFT RPC
+EXPOSE 26657
+
+CMD ["/usr/bin/cronosd", "version"]
