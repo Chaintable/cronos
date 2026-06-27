@@ -64,11 +64,6 @@ jobs:
         with:
           registry-type: public
 
-      - name: Ensure ECR public repository exists
-        run: |
-          aws ecr-public create-repository --repository-name "chaintable/${IMAGE}" --region "${AWS_REGION}" 2>err.txt \
-            || { grep -q "RepositoryAlreadyExistsException" err.txt && echo "repository already exists"; }
-
       - name: Set up Buildx
         uses: docker/setup-buildx-action@v3
 
