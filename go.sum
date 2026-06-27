@@ -657,8 +657,8 @@ github.com/Azure/go-ansiterm v0.0.0-20230124172434-306776ec8161 h1:L/gRVlceqvL25
 github.com/Azure/go-ansiterm v0.0.0-20230124172434-306776ec8161/go.mod h1:xomTg63KZ2rFqZQzSB4Vz2SUXa1BpHTVz9L5PTmPC4E=
 github.com/BurntSushi/toml v0.3.1/go.mod h1:xHWCNGjB5oqiDr8zfno3MHue2Ht5sIBksp03qcyfWMU=
 github.com/BurntSushi/xgb v0.0.0-20160522181843-27f122750802/go.mod h1:IVnqGOEym/WlBOVXweHU+Q+/VP0lqqI8lqeDx9IjBqo=
-github.com/Chaintable/ethermint-cronos v0.22.1-0.20260627055900-6763b30664ee h1:OHJAtkT2cVkxvgGRopYQY40qSYNGz4GYL/7fsIYMZyc=
-github.com/Chaintable/ethermint-cronos v0.22.1-0.20260627055900-6763b30664ee/go.mod h1:Y10y/8dKWLGVuJdDV0mfsqx3T4W9UcdWHYw0t3SDm34=
+github.com/Chaintable/ethermint-cronos v0.22.1-0.20260627062305-d1c0639724fe h1:3jEp2sQJbj+WnalhNgww/OjLpx1Zqz4T+LEsZZ/an4Q=
+github.com/Chaintable/ethermint-cronos v0.22.1-0.20260627062305-d1c0639724fe/go.mod h1:Y10y/8dKWLGVuJdDV0mfsqx3T4W9UcdWHYw0t3SDm34=
 github.com/DataDog/datadog-go v3.2.0+incompatible/go.mod h1:LButxg5PwREeZtORoXG3tL4fMGNddJ+vMq1mwgfaqoQ=
 github.com/DataDog/datadog-go v4.8.3+incompatible h1:fNGaYSuObuQb5nzeTQqowRAd9bpDIRRV4/gUtIBjh8Q=
 github.com/DataDog/datadog-go v4.8.3+incompatible/go.mod h1:LButxg5PwREeZtORoXG3tL4fMGNddJ+vMq1mwgfaqoQ=
