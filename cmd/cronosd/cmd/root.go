@@ -184,6 +184,8 @@ func initRootCmd(
 		rootCmd.AddCommand(changeSetCmd)
 	}
 
+	rootCmd.AddCommand(RollbackToVersionCmd())
+
 	// add keybase, auxiliary RPC, query, and tx child commands
 	rootCmd.AddCommand(
 		server.StatusCommand(),
