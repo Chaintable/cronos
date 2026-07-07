@@ -649,6 +649,10 @@ func New(
 		[]evmkeeper.CustomContractFn{},
 		cast.ToUint64(appOpts.Get(server.FlagQueryGasLimit)),
 	)
+	// Wire the consensus params keeper so the EVM query/trace path can populate
+	// ctx.ConsensusParams() (baseapp only sets it during block execution); without
+	// it the GASLIMIT opcode reads 0 on replay and diverges gaslimit-dependent txs.
+	app.EvmKeeper.SetConsensusParamsKeeper(app.ConsensusParamsKeeper)
 
 	// this line is used by starport scaffolding # stargate/app/keeperDefinition
 
