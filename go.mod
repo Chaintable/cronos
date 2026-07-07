@@ -306,7 +306,7 @@ replace (
 	// release/v1.15
 	github.com/ethereum/go-ethereum => github.com/crypto-org-chain/go-ethereum v1.10.20-0.20250815065500-a4fbafcae0dd
 	// DeBank: ethermint-cronos fork carrying the trace_debankBlock emitter (branch v1.7.8, base = ethermint 2593e6ed).
-	github.com/evmos/ethermint => github.com/Chaintable/ethermint-cronos v0.22.1-0.20260628091737-4c6016d2835a
+	github.com/evmos/ethermint => github.com/Chaintable/ethermint-cronos v0.22.1-0.20260707064336-65be60d1e51f
 	// Fix upstream GHSA-h395-qcrw-5vmq and GHSA-3vp4-m3rf-835h vulnerabilities.
 	// TODO Remove it: https://github.com/cosmos/cosmos-sdk/issues/10409
 	github.com/gin-gonic/gin => github.com/gin-gonic/gin v1.9.0
