@@ -16,13 +16,16 @@ import (
 )
 
 type indexRecord struct {
-	Ordinal   uint64 `json:"ordinal"`
-	Height    uint64 `json:"height"`
-	Offset    int64  `json:"offset"`
-	Length    uint64 `json:"length"`
-	Key       string `json:"key"`
-	OldSHA256 string `json:"old_sha256"`
-	NewSHA256 string `json:"new_sha256"`
+	Ordinal      uint64 `json:"ordinal"`
+	Height       uint64 `json:"height"`
+	Offset       int64  `json:"offset"`
+	Length       uint64 `json:"length"`
+	Key          string `json:"key"`
+	OldSHA256    string `json:"old_sha256"`
+	NewSHA256    string `json:"new_sha256"`
+	SlotsAdded   uint64 `json:"slots_added"`
+	SlotsRemoved uint64 `json:"slots_removed"`
+	SlotsChanged uint64 `json:"slots_changed"`
 }
 
 type packWriter struct {
@@ -91,6 +94,7 @@ func (w *packWriter) Write(record packRecord) error {
 	entry := indexRecord{
 		Ordinal: record.Ordinal, Height: record.Height, Offset: start, Length: uint64(framedSize), Key: record.Key,
 		OldSHA256: hex.EncodeToString(record.OldSHA256[:]), NewSHA256: hex.EncodeToString(record.NewSHA256[:]),
+		SlotsAdded: record.SlotsAdded, SlotsRemoved: record.SlotsRemoved, SlotsChanged: record.SlotsChanged,
 	}
 	indexBody, err := json.Marshal(entry)
 	if err != nil {
@@ -177,6 +181,7 @@ func hashFile(path string) (string, int64, error) {
 
 func iteratePack(dir string, manifest planManifest, fn func(packRecord) error) error {
 	expectedOrdinal := uint64(1)
+	var previousHeight uint64
 	for _, chunk := range manifest.Chunks {
 		packPath := filepath.Join(dir, chunk.Pack)
 		packHash, packSize, err := hashFile(packPath)
@@ -228,11 +233,17 @@ func iteratePack(dir string, manifest planManifest, fn func(packRecord) error) e
 				_ = file.Close()
 				return fmt.Errorf("unexpected pack record schema/ordinal %d/%d", record.Schema, record.Ordinal)
 			}
+			if record.Height < uint64(manifest.FirstHeight) || record.Height > uint64(manifest.FinalHeight) ||
+				(previousHeight != 0 && record.Height <= previousHeight) {
+				_ = file.Close()
+				return fmt.Errorf("pack record height %d is outside or out of order for range %d-%d", record.Height, manifest.FirstHeight, manifest.FinalHeight)
+			}
 			if err := fn(record); err != nil {
 				_ = file.Close()
 				return err
 			}
 			expectedOrdinal++
+			previousHeight = record.Height
 			records++
 		}
 		if err := file.Close(); err != nil {

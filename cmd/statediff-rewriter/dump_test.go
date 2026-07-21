@@ -133,3 +133,63 @@ func TestSealDumpRejectsGenesisStorage(t *testing.T) {
 	_, _, _, err := sealDump(staging)
 	require.ErrorContains(t, err, "genesis changeset contains EVM storage")
 }
+
+func TestSealDumpAcceptsExactPilotRange(t *testing.T) {
+	staging := filepath.Join(t.TempDir(), "dump.staging")
+	var body []byte
+	for version := int64(100); version <= 109; version++ {
+		body = append(body, encodeChangeSet(t, version)...)
+	}
+	writeDumpFile(t, staging, "block-100.zz", zlibBody(t, body))
+	context := dumpContext{
+		Schema: pilotDumpManifestSchema, FirstVersion: 100, LastVersion: 109,
+		SnapshotID: "snap-test", ArchiveIdentity: archiveIdentity{Home: "/archive", LatestVersion: 200, FinalCommitHash: "0x200"},
+		CronosCommit: "cronos", EthermintCommit: "ethermint", ImageDigest: "sha256:test", BuildTags: "rocksdb",
+	}
+
+	sealed, manifest, _, err := sealDump(staging, context)
+	require.NoError(t, err)
+	require.Equal(t, pilotDumpManifestSchema, manifest.Schema)
+	require.Equal(t, int64(100), manifest.FirstVersion)
+	require.Equal(t, int64(109), manifest.LastVersion)
+	require.Equal(t, int64(10), manifest.Records)
+
+	var versions []int64
+	require.NoError(t, iterateSealedDump(sealed, manifest, func(version int64, _ *iavl.ChangeSet) error {
+		versions = append(versions, version)
+		return nil
+	}))
+	require.Equal(t, []int64{100, 101, 102, 103, 104, 105, 106, 107, 108, 109}, versions)
+
+	context.SnapshotID = "snap-other"
+	_, _, _, err = prepareDump(sealed, context)
+	require.ErrorContains(t, err, "identity does not match")
+}
+
+func TestSealDumpRejectsPilotRangeMismatch(t *testing.T) {
+	for _, testCase := range []struct {
+		name  string
+		first int64
+		last  int64
+	}{
+		{name: "starts-before", first: 99, last: 109},
+		{name: "starts-after", first: 101, last: 109},
+		{name: "ends-before", first: 100, last: 108},
+		{name: "ends-after", first: 100, last: 110},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			staging := filepath.Join(t.TempDir(), "dump.staging")
+			var body []byte
+			for version := testCase.first; version <= testCase.last; version++ {
+				body = append(body, encodeChangeSet(t, version)...)
+			}
+			writeDumpFile(t, staging, "block.zz", zlibBody(t, body))
+			_, _, _, err := sealDump(staging, dumpContext{
+				Schema: pilotDumpManifestSchema, FirstVersion: 100, LastVersion: 109,
+				SnapshotID: "snap-test", ArchiveIdentity: archiveIdentity{Home: "/archive", LatestVersion: 200, FinalCommitHash: "0x200"},
+				ImageDigest: "sha256:test",
+			})
+			require.Error(t, err)
+		})
+	}
+}

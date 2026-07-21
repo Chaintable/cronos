@@ -21,12 +21,19 @@ import (
 	"github.com/evmos/ethermint/debank/statediff"
 )
 
-const dumpManifestSchema = "cronos-changeset-dump/v1"
+const (
+	dumpManifestSchema      = "cronos-changeset-dump/v1"
+	pilotDumpManifestSchema = "cronos-changeset-pilot-dump/v1"
+)
+
 const maxChangeSetPayload = uint64(256 << 20)
 
 type countingWriter struct{ n int64 }
 
 type dumpContext struct {
+	Schema          string
+	FirstVersion    int64
+	LastVersion     int64
 	SnapshotID      string
 	ArchiveIdentity archiveIdentity
 	CronosCommit    string
@@ -185,6 +192,7 @@ func sealDump(stagingPath string, contexts ...dumpContext) (string, dumpManifest
 	}
 	if len(contexts) == 1 {
 		context := contexts[0]
+		manifest.Schema = context.Schema
 		manifest.SnapshotID, manifest.ArchiveIdentity = context.SnapshotID, context.ArchiveIdentity
 		manifest.CronosCommit, manifest.EthermintCommit = context.CronosCommit, context.EthermintCommit
 		manifest.ImageDigest, manifest.BuildTags = context.ImageDigest, context.BuildTags
@@ -214,8 +222,15 @@ func sealDump(stagingPath string, contexts ...dumpContext) (string, dumpManifest
 	})
 	manifest.FirstVersion = manifest.Files[0].FirstVersion
 	manifest.LastVersion = manifest.Files[len(manifest.Files)-1].LastVersion
-	if manifest.FirstVersion != 1 {
-		return "", dumpManifest{}, "", fmt.Errorf("dump starts at version %d, want 1", manifest.FirstVersion)
+	expectedFirst, expectedLast := int64(1), manifest.LastVersion
+	if len(contexts) == 1 {
+		expectedFirst, expectedLast = contexts[0].FirstVersion, contexts[0].LastVersion
+	}
+	if manifest.FirstVersion != expectedFirst {
+		return "", dumpManifest{}, "", fmt.Errorf("dump starts at version %d, want %d", manifest.FirstVersion, expectedFirst)
+	}
+	if manifest.LastVersion != expectedLast {
+		return "", dumpManifest{}, "", fmt.Errorf("dump ends at version %d, want %d", manifest.LastVersion, expectedLast)
 	}
 	for i, file := range manifest.Files {
 		manifest.Records += file.Records
@@ -223,15 +238,13 @@ func sealDump(stagingPath string, contexts ...dumpContext) (string, dumpManifest
 			return "", dumpManifest{}, "", fmt.Errorf("dump gap or overlap between %s and %s", manifest.Files[i-1].Path, file.Path)
 		}
 	}
-	if manifest.Records != manifest.LastVersion {
-		return "", dumpManifest{}, "", fmt.Errorf("dump has %d records through version %d", manifest.Records, manifest.LastVersion)
+	expectedRecords := manifest.LastVersion - manifest.FirstVersion + 1
+	if manifest.Records != expectedRecords {
+		return "", dumpManifest{}, "", fmt.Errorf("dump has %d records for versions %d through %d", manifest.Records, manifest.FirstVersion, manifest.LastVersion)
 	}
 	if len(contexts) == 1 {
-		if manifest.SnapshotID == "" || manifest.ImageDigest == "" {
-			return "", dumpManifest{}, "", fmt.Errorf("snapshot ID and image digest are required to seal an execution dump")
-		}
-		if manifest.ArchiveIdentity.LatestVersion != manifest.LastVersion {
-			return "", dumpManifest{}, "", fmt.Errorf("dump final version %d differs from archive %d", manifest.LastVersion, manifest.ArchiveIdentity.LatestVersion)
+		if err := validateDumpContext(manifest, contexts[0]); err != nil {
+			return "", dumpManifest{}, "", err
 		}
 	}
 
@@ -273,9 +286,8 @@ func prepareDump(path string, context dumpContext) (string, dumpManifest, string
 	if err := json.Unmarshal(body, &manifest); err != nil {
 		return "", dumpManifest{}, "", err
 	}
-	if manifest.Schema != dumpManifestSchema || manifest.SnapshotID != context.SnapshotID || manifest.ArchiveIdentity != context.ArchiveIdentity ||
-		manifest.CronosCommit != context.CronosCommit || manifest.EthermintCommit != context.EthermintCommit || manifest.ImageDigest != context.ImageDigest || manifest.BuildTags != context.BuildTags {
-		return "", dumpManifest{}, "", fmt.Errorf("sealed dump identity does not match this run")
+	if err := validateDumpContext(manifest, context); err != nil {
+		return "", dumpManifest{}, "", err
 	}
 	if err := iterateSealedDump(cleanPath, manifest, func(int64, *iavl.ChangeSet) error { return nil }); err != nil {
 		return "", dumpManifest{}, "", err
@@ -284,7 +296,8 @@ func prepareDump(path string, context dumpContext) (string, dumpManifest, string
 }
 
 func iterateSealedDump(path string, manifest dumpManifest, fn func(int64, *iavl.ChangeSet) error) error {
-	expected := int64(1)
+	expected := manifest.FirstVersion
+	var records int64
 	for _, file := range manifest.Files {
 		entry, err := scanZlibChangeSets(filepath.Join(path, file.Path), func(version int64, changeSet *iavl.ChangeSet) error {
 			if version != expected {
@@ -299,9 +312,39 @@ func iterateSealedDump(path string, manifest dumpManifest, fn func(int64, *iavl.
 		if entry.SHA256 != file.SHA256 || entry.Size != file.Size || entry.FirstVersion != file.FirstVersion || entry.LastVersion != file.LastVersion || entry.Records != file.Records {
 			return fmt.Errorf("sealed dump file changed: %s", file.Path)
 		}
+		records += entry.Records
 	}
 	if expected != manifest.LastVersion+1 {
 		return fmt.Errorf("dump ended at %d, want %d", expected-1, manifest.LastVersion)
+	}
+	expectedRecords := manifest.LastVersion - manifest.FirstVersion + 1
+	if records != manifest.Records || records != expectedRecords {
+		return fmt.Errorf("dump has %d records, manifest has %d for versions %d through %d", records, manifest.Records, manifest.FirstVersion, manifest.LastVersion)
+	}
+	return nil
+}
+
+func validateDumpContext(manifest dumpManifest, context dumpContext) error {
+	if context.Schema != dumpManifestSchema && context.Schema != pilotDumpManifestSchema {
+		return fmt.Errorf("unsupported dump schema %q", context.Schema)
+	}
+	if context.FirstVersion < 1 || context.LastVersion < context.FirstVersion {
+		return fmt.Errorf("invalid expected dump range %d-%d", context.FirstVersion, context.LastVersion)
+	}
+	if manifest.Schema != context.Schema || manifest.FirstVersion != context.FirstVersion || manifest.LastVersion != context.LastVersion ||
+		manifest.SnapshotID != context.SnapshotID || manifest.ArchiveIdentity != context.ArchiveIdentity ||
+		manifest.CronosCommit != context.CronosCommit || manifest.EthermintCommit != context.EthermintCommit ||
+		manifest.ImageDigest != context.ImageDigest || manifest.BuildTags != context.BuildTags {
+		return fmt.Errorf("sealed dump identity does not match this run")
+	}
+	if manifest.SnapshotID == "" || manifest.ImageDigest == "" {
+		return fmt.Errorf("snapshot ID and image digest are required to seal an execution dump")
+	}
+	if manifest.Schema == dumpManifestSchema && manifest.ArchiveIdentity.LatestVersion != manifest.LastVersion {
+		return fmt.Errorf("dump final version %d differs from archive %d", manifest.LastVersion, manifest.ArchiveIdentity.LatestVersion)
+	}
+	if manifest.LastVersion > manifest.ArchiveIdentity.LatestVersion {
+		return fmt.Errorf("dump final version %d exceeds archive %d", manifest.LastVersion, manifest.ArchiveIdentity.LatestVersion)
 	}
 	return nil
 }

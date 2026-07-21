@@ -77,8 +77,10 @@ func makeSealedPlan(t *testing.T) (string, planManifest, packRecord, storedObjec
 	require.NoError(t, err)
 	manifest := planManifest{
 		Schema: manifestSchema, Sealed: true, RunID: "test-run", Bucket: defaultBucket, Prefix: defaultPrefix, Region: defaultRegion,
-		Changed: 1, Chunks: chunks, RootIndex: "roots.sorted", SnapshotID: "snap-test", ImageDigest: "sha256:test",
+		FirstHeight: 2, FinalHeight: 2, Processed: 1, Changed: 1, Chunks: chunks,
+		RootIndex: "roots.sorted", SnapshotID: "snap-test", ImageDigest: "sha256:test",
 		CronosCommit: "cronos", EthermintCommit: "ethermint",
+		ArchiveIdentity: archiveIdentity{Home: "/archive", LatestVersion: 2, FinalCommitHash: "0x02"},
 	}
 	rootFile := filepath.Join(dir, manifest.RootIndex)
 	writeRootIndex(t, rootFile, rootRecord{Root: root, Height: 2})
@@ -137,6 +139,26 @@ func TestApplyRejectsBackupWithoutIndependentReadableCopy(t *testing.T) {
 	store := &fakeObjectStore{objects: map[string]storedObject{record.Key: oldObject}}
 	_, err = runWriteMode(context.Background(), manifestPath, filepath.Join(filepath.Dir(manifestPath), "apply.json"), proofPath, "apply", store)
 	require.ErrorContains(t, err, "active plan directory")
+}
+
+func TestWriteModesRejectPilotPlan(t *testing.T) {
+	manifestPath, manifest, _, _ := makeSealedPlan(t)
+	manifest.Schema = pilotManifestSchema
+	_, err := atomicJSON(manifestPath, manifest)
+	require.NoError(t, err)
+
+	store := &fakeObjectStore{objects: map[string]storedObject{}}
+	_, err = runWriteMode(context.Background(), manifestPath, filepath.Join(filepath.Dir(manifestPath), "apply.json"), "", "apply", store)
+	require.ErrorContains(t, err, "pilot plans support plan only")
+	require.Zero(t, store.puts)
+
+	_, err = runWriteMode(context.Background(), manifestPath, filepath.Join(filepath.Dir(manifestPath), "rollback.json"), "", "rollback", store)
+	require.ErrorContains(t, err, "pilot plans support plan only")
+	require.Zero(t, store.puts)
+
+	_, err = runVerify(context.Background(), manifestPath, filepath.Join(filepath.Dir(manifestPath), "verify"), store)
+	require.ErrorContains(t, err, "pilot plans support plan only")
+	require.Zero(t, store.puts)
 }
 
 func TestApplyAndRollbackLifecycle(t *testing.T) {

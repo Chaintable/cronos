@@ -22,15 +22,48 @@ import (
 )
 
 type planOptions struct {
-	DumpStaging string
-	ArchiveHome string
-	Output      string
-	Bucket      string
-	Prefix      string
-	Region      string
-	MinFree     uint64
-	SnapshotID  string
-	ImageDigest string
+	DumpStaging      string
+	ArchiveHome      string
+	Output           string
+	Bucket           string
+	Prefix           string
+	Region           string
+	MinFree          uint64
+	SnapshotID       string
+	ImageDigest      string
+	Pilot            bool
+	PilotFirstHeight int64
+	PilotFinalHeight int64
+}
+
+type planRange struct {
+	FirstHeight      int64
+	FinalHeight      int64
+	DumpFirstVersion int64
+	ManifestSchema   string
+	DumpSchema       string
+}
+
+func resolvePlanRange(options planOptions, latestVersion int64) (planRange, error) {
+	if latestVersion < 2 {
+		return planRange{}, fmt.Errorf("archive latest version %d is below block 2", latestVersion)
+	}
+	if !options.Pilot {
+		if options.PilotFirstHeight != 0 || options.PilotFinalHeight != 0 {
+			return planRange{}, fmt.Errorf("pilot heights require explicit pilot mode")
+		}
+		return planRange{
+			FirstHeight: 2, FinalHeight: latestVersion, DumpFirstVersion: 1,
+			ManifestSchema: manifestSchema, DumpSchema: dumpManifestSchema,
+		}, nil
+	}
+	if options.PilotFirstHeight < 2 || options.PilotFinalHeight < options.PilotFirstHeight || options.PilotFinalHeight > latestVersion {
+		return planRange{}, fmt.Errorf("invalid pilot range %d-%d for archive latest %d", options.PilotFirstHeight, options.PilotFinalHeight, latestVersion)
+	}
+	return planRange{
+		FirstHeight: options.PilotFirstHeight, FinalHeight: options.PilotFinalHeight,
+		DumpFirstVersion: options.PilotFirstHeight, ManifestSchema: pilotManifestSchema, DumpSchema: pilotDumpManifestSchema,
+	}, nil
 }
 
 func runPlan(ctx context.Context, options planOptions, objects objectStore) (planManifest, string, error) {
@@ -43,16 +76,18 @@ func runPlan(ctx context.Context, options planOptions, objects objectStore) (pla
 	if err != nil {
 		return planManifest{}, "", err
 	}
+	scope, err := resolvePlanRange(options, identity.LatestVersion)
+	if err != nil {
+		return planManifest{}, "", err
+	}
 	cronosCommit, ethermintCommit := buildCommits()
 	sealedDump, dumpInfo, dumpHash, err := prepareDump(options.DumpStaging, dumpContext{
+		Schema: scope.DumpSchema, FirstVersion: scope.DumpFirstVersion, LastVersion: scope.FinalHeight,
 		SnapshotID: options.SnapshotID, ArchiveIdentity: identity, CronosCommit: cronosCommit,
 		EthermintCommit: ethermintCommit, ImageDigest: options.ImageDigest, BuildTags: version.BuildTags,
 	})
 	if err != nil {
 		return planManifest{}, "", err
-	}
-	if dumpInfo.LastVersion != identity.LatestVersion {
-		return planManifest{}, "", fmt.Errorf("dump final version %d differs from archive %d", dumpInfo.LastVersion, identity.LatestVersion)
 	}
 	if !strings.HasSuffix(filepath.Clean(options.Output), ".staging") {
 		return planManifest{}, "", fmt.Errorf("plan output must end in .staging")
@@ -71,16 +106,19 @@ func runPlan(ctx context.Context, options planOptions, objects objectStore) (pla
 	}
 
 	manifest := planManifest{
-		Schema: manifestSchema, Sealed: true, RunID: fmt.Sprintf("bugb-%d", time.Now().UTC().UnixNano()),
+		Schema: scope.ManifestSchema, Sealed: true, RunID: fmt.Sprintf("bugb-%d", time.Now().UTC().UnixNano()),
 		CreatedAt: time.Now().UTC().Format(time.RFC3339Nano), Bucket: options.Bucket, Prefix: strings.TrimSuffix(options.Prefix, "/"), Region: options.Region,
-		FirstHeight: 2, FinalHeight: identity.LatestVersion, CronosCommit: cronosCommit, EthermintCommit: ethermintCommit,
+		FirstHeight: scope.FirstHeight, FinalHeight: scope.FinalHeight, CronosCommit: cronosCommit, EthermintCommit: ethermintCommit,
 		DumpPath: sealedDump, DumpManifestHash: dumpHash, ArchiveIdentity: identity,
 		SnapshotID: options.SnapshotID, ImageDigest: options.ImageDigest, BuildTags: version.BuildTags,
 	}
 	var ordinal uint64
 	err = iterateSealedDump(sealedDump, dumpInfo, func(height int64, changeSet *iavl.ChangeSet) error {
-		if height == 1 {
+		if height == 1 && scope.FirstHeight == 2 {
 			return nil
+		}
+		if height < scope.FirstHeight || height > scope.FinalHeight {
+			return fmt.Errorf("dump height %d is outside plan range %d-%d", height, scope.FirstHeight, scope.FinalHeight)
 		}
 		if err := ensureFreeSpace(options.Output, options.MinFree); err != nil {
 			return err
@@ -124,6 +162,9 @@ func runPlan(ctx context.Context, options planOptions, objects objectStore) (pla
 			return err
 		}
 		manifest.Changed++
+		manifest.SlotsAdded += record.SlotsAdded
+		manifest.SlotsRemoved += record.SlotsRemoved
+		manifest.SlotsChanged += record.SlotsChanged
 		manifest.NewBytes += int64(len(record.NewBody))
 		if record.NoncanonicalOld {
 			manifest.ChangedCanonical++
@@ -136,6 +177,11 @@ func runPlan(ctx context.Context, options planOptions, objects objectStore) (pla
 	if err != nil {
 		_ = rootIndex.Close()
 		return planManifest{}, "", err
+	}
+	expectedProcessed := scope.FinalHeight - scope.FirstHeight + 1
+	if manifest.Processed != expectedProcessed {
+		_ = rootIndex.Close()
+		return planManifest{}, "", fmt.Errorf("processed %d heights, want %d", manifest.Processed, expectedProcessed)
 	}
 	if err := rootIndex.Sync(); err != nil {
 		_ = rootIndex.Close()
@@ -225,14 +271,18 @@ func makePackRecord(height uint64, key string, object storedObject, root, parent
 	}, true, nil
 }
 
-func archiveRoots(archive *archiveReader, height int64) (common.Hash, common.Hash, error) {
+type commitInfoReader interface {
+	commitInfo(int64) (*storetypes.CommitInfo, error)
+}
+
+func archiveRoots(archive commitInfoReader, height int64) (common.Hash, common.Hash, error) {
 	rootInfo, err := archive.commitInfo(height - 1)
 	if err != nil {
 		return common.Hash{}, common.Hash{}, err
 	}
 	root := common.BytesToHash(rootInfo.Hash())
 	if height == 2 {
-		return root, common.BytesToHash((storetypes.CommitInfo{}).Hash()), nil
+		return root, common.Hash{}, nil
 	}
 	parentInfo, err := archive.commitInfo(height - 2)
 	if err != nil {

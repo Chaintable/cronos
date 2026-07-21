@@ -1,14 +1,62 @@
 package main
 
 import (
+	"fmt"
 	"testing"
 
+	storetypes "cosmossdk.io/store/types"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/rlp"
 	"github.com/stretchr/testify/require"
 
 	dtypes "github.com/evmos/ethermint/debank/types"
 )
+
+type fakeCommitInfoReader struct {
+	infos map[int64]*storetypes.CommitInfo
+}
+
+func (r fakeCommitInfoReader) commitInfo(version int64) (*storetypes.CommitInfo, error) {
+	info, ok := r.infos[version]
+	if !ok {
+		return nil, fmt.Errorf("unexpected commit info version %d", version)
+	}
+	return info, nil
+}
+
+func TestResolvePlanRange(t *testing.T) {
+	full, err := resolvePlanRange(planOptions{}, 200)
+	require.NoError(t, err)
+	require.Equal(t, planRange{
+		FirstHeight: 2, FinalHeight: 200, DumpFirstVersion: 1,
+		ManifestSchema: manifestSchema, DumpSchema: dumpManifestSchema,
+	}, full)
+
+	pilot, err := resolvePlanRange(planOptions{Pilot: true, PilotFirstHeight: 100, PilotFinalHeight: 109}, 200)
+	require.NoError(t, err)
+	require.Equal(t, planRange{
+		FirstHeight: 100, FinalHeight: 109, DumpFirstVersion: 100,
+		ManifestSchema: pilotManifestSchema, DumpSchema: pilotDumpManifestSchema,
+	}, pilot)
+
+	for _, options := range []planOptions{
+		{Pilot: true, PilotFirstHeight: 1, PilotFinalHeight: 10},
+		{Pilot: true, PilotFirstHeight: 100, PilotFinalHeight: 99},
+		{Pilot: true, PilotFirstHeight: 100, PilotFinalHeight: 201},
+		{PilotFirstHeight: 100, PilotFinalHeight: 109},
+	} {
+		_, err := resolvePlanRange(options, 200)
+		require.Error(t, err)
+	}
+}
+
+func TestArchiveRootsUsesZeroParentAtHeightTwo(t *testing.T) {
+	info := &storetypes.CommitInfo{Version: 1}
+	root, parent, err := archiveRoots(fakeCommitInfoReader{infos: map[int64]*storetypes.CommitInfo{1: info}}, 2)
+	require.NoError(t, err)
+	require.Equal(t, common.BytesToHash(info.Hash()), root)
+	require.Equal(t, common.Hash{}, parent)
+}
 
 func TestMakePackRecord(t *testing.T) {
 	root := common.BytesToHash([]byte{2})

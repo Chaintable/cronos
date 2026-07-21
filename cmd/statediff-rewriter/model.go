@@ -14,13 +14,14 @@ import (
 )
 
 const (
-	manifestSchema = "statediff-rewriter-manifest/v1"
-	packSchema     = uint64(1)
-	defaultBucket  = "chaintable-nodex-pipeline--apne1-az4--x-s3"
-	defaultPrefix  = "25/4cc51d2e"
-	defaultRegion  = "ap-northeast-1"
-	maxObjectSize  = int64(64 << 20)
-	chunkSize      = int64(512 << 20)
+	manifestSchema      = "statediff-rewriter-manifest/v1"
+	pilotManifestSchema = "statediff-rewriter-pilot-manifest/v1"
+	packSchema          = uint64(1)
+	defaultBucket       = "chaintable-nodex-pipeline--apne1-az4--x-s3"
+	defaultPrefix       = "25/4cc51d2e"
+	defaultRegion       = "ap-northeast-1"
+	maxObjectSize       = int64(64 << 20)
+	chunkSize           = int64(512 << 20)
 )
 
 type dumpFileManifest struct {
@@ -81,6 +82,9 @@ type planManifest struct {
 	ChangedConflict  int64           `json:"changed_conflicting_old_values"`
 	Unchanged        int64           `json:"unchanged"`
 	SkippedEqualRoot int64           `json:"skipped_equal_root"`
+	SlotsAdded       uint64          `json:"slots_added"`
+	SlotsRemoved     uint64          `json:"slots_removed"`
+	SlotsChanged     uint64          `json:"slots_changed"`
 	OldBytes         int64           `json:"old_bytes"`
 	NewBytes         int64           `json:"new_bytes"`
 	RootIndex        string          `json:"root_index"`

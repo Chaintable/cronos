@@ -46,6 +46,12 @@ func newPlanCommand() *cobra.Command {
 		Use:   "plan",
 		Short: "Seal a strict changeset dump and build a read-only changed-object plan",
 		RunE: func(command *cobra.Command, _ []string) error {
+			firstSet := command.Flags().Changed("pilot-first-height")
+			finalSet := command.Flags().Changed("pilot-final-height")
+			if firstSet != finalSet {
+				return fmt.Errorf("pilot-first-height and pilot-final-height must be set together")
+			}
+			options.Pilot = firstSet
 			objects, err := newS3ObjectStore(command.Context(), options.Region)
 			if err != nil {
 				return err
@@ -66,6 +72,8 @@ func newPlanCommand() *cobra.Command {
 	command.Flags().Uint64Var(&options.MinFree, "min-free-bytes", 0, "stop before filesystem free space falls below this value")
 	command.Flags().StringVar(&options.SnapshotID, "snapshot-id", "", "completed final-F EBS snapshot ID")
 	command.Flags().StringVar(&options.ImageDigest, "image-digest", "", "immutable rewriter image digest")
+	command.Flags().Int64Var(&options.PilotFirstHeight, "pilot-first-height", 0, "first height of a read-only pilot plan; requires pilot-final-height")
+	command.Flags().Int64Var(&options.PilotFinalHeight, "pilot-final-height", 0, "final height of a read-only pilot plan; requires pilot-first-height")
 	_ = command.MarkFlagRequired("dump")
 	_ = command.MarkFlagRequired("home")
 	_ = command.MarkFlagRequired("output")
@@ -83,6 +91,9 @@ func newApplyCommand() *cobra.Command {
 		RunE: func(command *cobra.Command, _ []string) error {
 			plan, _, err := loadPlanManifest(manifest)
 			if err != nil {
+				return err
+			}
+			if err := requireFullPlan(plan, "apply"); err != nil {
 				return err
 			}
 			objects, err := newS3ObjectStore(command.Context(), plan.Region)
@@ -115,6 +126,9 @@ func newVerifyCommand() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			if err := requireFullPlan(plan, "verify"); err != nil {
+				return err
+			}
 			objects, err := newS3ObjectStore(command.Context(), plan.Region)
 			if err != nil {
 				return err
@@ -141,6 +155,9 @@ func newRollbackCommand() *cobra.Command {
 		RunE: func(command *cobra.Command, _ []string) error {
 			plan, _, err := loadPlanManifest(manifest)
 			if err != nil {
+				return err
+			}
+			if err := requireFullPlan(plan, "rollback"); err != nil {
 				return err
 			}
 			objects, err := newS3ObjectStore(command.Context(), plan.Region)

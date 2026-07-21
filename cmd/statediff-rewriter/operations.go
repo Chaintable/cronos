@@ -70,6 +70,9 @@ func runWriteMode(ctx context.Context, manifestPath, checkpointPath, backupPath,
 	if err != nil {
 		return writeReport{}, err
 	}
+	if err := requireFullPlan(manifest, mode); err != nil {
+		return writeReport{}, err
+	}
 	if mode == "apply" {
 		if err := validateBackupProof(backupPath, manifestPath, manifestHash); err != nil {
 			return writeReport{}, fmt.Errorf("apply requires completed independent backup proof: %w", err)
@@ -159,11 +162,17 @@ func runVerify(ctx context.Context, manifestPath, checkpointDir string, objects 
 	if err != nil {
 		return verifyReport{}, err
 	}
+	if err := requireFullPlan(manifest, "verify"); err != nil {
+		return verifyReport{}, err
+	}
 	report := verifyReport{}
 	changedCheckpoint := filepath.Join(checkpointDir, "verify-changed.json")
 	changedCP, err := loadCheckpoint(changedCheckpoint, manifest.RunID, manifestHash, "verify-changed")
 	if err != nil {
 		return report, err
+	}
+	if changedCP.Frontier > uint64(manifest.Changed) || (changedCP.Height != 0 && (changedCP.Height < uint64(manifest.FirstHeight) || changedCP.Height > uint64(manifest.FinalHeight))) {
+		return report, fmt.Errorf("changed checkpoint is outside manifest range")
 	}
 	report.VerifiedChanged = int64(changedCP.Frontier)
 	if err := iteratePack(filepath.Dir(manifestPath), manifest, func(record packRecord) error {
@@ -195,6 +204,18 @@ func runVerify(ctx context.Context, manifestPath, checkpointDir string, objects 
 	if err := json.Unmarshal(dumpBody, &dumpInfo); err != nil {
 		return report, err
 	}
+	dumpSchema, dumpFirst := dumpManifestSchema, int64(1)
+	if manifest.Schema == pilotManifestSchema {
+		dumpSchema, dumpFirst = pilotDumpManifestSchema, manifest.FirstHeight
+	}
+	if err := validateDumpContext(dumpInfo, dumpContext{
+		Schema: dumpSchema, FirstVersion: dumpFirst, LastVersion: manifest.FinalHeight,
+		SnapshotID: manifest.SnapshotID, ArchiveIdentity: manifest.ArchiveIdentity,
+		CronosCommit: manifest.CronosCommit, EthermintCommit: manifest.EthermintCommit,
+		ImageDigest: manifest.ImageDigest, BuildTags: manifest.BuildTags,
+	}); err != nil {
+		return report, err
+	}
 	archive, err := openArchive(manifest.ArchiveIdentity.Home)
 	if err != nil {
 		return report, err
@@ -212,11 +233,20 @@ func runVerify(ctx context.Context, manifestPath, checkpointDir string, objects 
 	if err != nil {
 		return report, err
 	}
+	if blockCP.Frontier != 0 && (blockCP.Frontier < uint64(manifest.FirstHeight) || blockCP.Frontier > uint64(manifest.FinalHeight)) {
+		return report, fmt.Errorf("block checkpoint is outside manifest range")
+	}
 	if blockCP.Frontier >= uint64(manifest.FirstHeight) {
 		report.Processed = int64(blockCP.Frontier) - manifest.FirstHeight + 1
 	}
 	err = iterateSealedDump(manifest.DumpPath, dumpInfo, func(height int64, changeSet *iavl.ChangeSet) error {
-		if height == 1 || uint64(height) <= blockCP.Frontier {
+		if height == 1 && manifest.FirstHeight == 2 {
+			return nil
+		}
+		if height < manifest.FirstHeight || height > manifest.FinalHeight {
+			return fmt.Errorf("dump height %d is outside manifest range %d-%d", height, manifest.FirstHeight, manifest.FinalHeight)
+		}
+		if uint64(height) <= blockCP.Frontier {
 			return nil
 		}
 		canonical, err := statediff.CanonicalStorageDiff(changeSet)
@@ -263,6 +293,9 @@ func runVerify(ctx context.Context, manifestPath, checkpointDir string, objects 
 	}
 	if report.VerifiedChanged != manifest.Changed {
 		return report, fmt.Errorf("verified changed %d, want %d", report.VerifiedChanged, manifest.Changed)
+	}
+	if report.Processed != manifest.Processed {
+		return report, fmt.Errorf("verified blocks %d, want %d", report.Processed, manifest.Processed)
 	}
 	return report, nil
 }
