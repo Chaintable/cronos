@@ -1,0 +1,33 @@
+FROM golang:1.25-bookworm AS go-builder
+
+ARG GIT_COMMIT
+
+RUN apt-get update && \
+    apt-get install -y libgflags-dev libsnappy-dev zlib1g-dev libbz2-dev liblz4-dev libzstd-dev && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN git clone https://github.com/facebook/rocksdb.git /tmp/rocksdb && \
+    cd /tmp/rocksdb && \
+    git checkout v10.5.1 && \
+    PORTABLE=1 DISABLE_WARNING_AS_ERROR=1 make -j$(nproc) install-shared && \
+    ldconfig && \
+    rm -rf /tmp/rocksdb
+
+WORKDIR /code
+COPY . /code/
+RUN test -n "${GIT_COMMIT}" && \
+    GOPRIVATE='github.com/Chaintable/*' make build-statediff-rewriter COSMOS_BUILD_OPTIONS=rocksdb COMMIT="${GIT_COMMIT}"
+
+FROM ubuntu:22.04
+
+RUN apt-get update && \
+    apt-get install -y libsnappy1v5 libgflags2.2 zlib1g libbz2-1.0 liblz4-1 libzstd1 ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY --from=go-builder /usr/local/lib/ /usr/local/lib/
+RUN ldconfig
+COPY --from=go-builder /code/build/statediff-rewriter /usr/bin/statediff-rewriter
+
+WORKDIR /work
+ENTRYPOINT ["/usr/bin/statediff-rewriter"]
+CMD ["--help"]

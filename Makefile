@@ -106,13 +106,16 @@ all: build
 build: check-network print-ledger go.sum
 	@go build -mod=readonly $(BUILD_FLAGS) -o $(BUILDDIR)/cronosd ./cmd/cronosd
 
+build-statediff-rewriter: check-network go.sum
+	@go build -mod=readonly $(BUILD_FLAGS) -o $(BUILDDIR)/statediff-rewriter ./cmd/statediff-rewriter
+
 install: check-network print-ledger go.sum
 	@go install -mod=readonly $(BUILD_FLAGS) ./cmd/cronosd
 
 test:
 	@go test -tags=objstore -v -mod=readonly $(PACKAGES) -coverprofile=$(COVERAGE) -covermode=atomic
 
-.PHONY: all clean build install test
+.PHONY: all clean build build-statediff-rewriter install test
 
 clean:
 	rm -rf $(BUILDDIR)/
