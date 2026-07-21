@@ -124,6 +124,63 @@ schema = 3
   [mod."github.com/aws/aws-sdk-go"]
     version = "v1.49.0"
     hash = "sha256-hbg+kWydUF+yUX9eNtee/pNZKnRGc8fuOcsSdQlAaGs="
+  [mod."github.com/aws/aws-sdk-go-v2"]
+    version = "v1.41.6"
+    hash = "sha256-d6owyfsZ7IRTKdavt+br9omcKaIYg9hg/LGPts1VkeE="
+  [mod."github.com/aws/aws-sdk-go-v2/aws/protocol/eventstream"]
+    version = "v1.7.9"
+    hash = "sha256-od9DhmIaRdeAJ8HT4FwAfGByHoK/cX8TBB+0fx2kVkM="
+  [mod."github.com/aws/aws-sdk-go-v2/config"]
+    version = "v1.32.7"
+    hash = "sha256-z61nfA0WteEqNmhF0K5dRwJwicSQWS+/oOoHqxc+LiU="
+  [mod."github.com/aws/aws-sdk-go-v2/credentials"]
+    version = "v1.19.7"
+    hash = "sha256-2E23PbP2twoY03jLWgQYoHveXZ7r7/7cZYtWNPMTc+I="
+  [mod."github.com/aws/aws-sdk-go-v2/feature/ec2/imds"]
+    version = "v1.18.17"
+    hash = "sha256-eMquC4Ggfeg7a644kcwxHUUHIwY6O/XrSymrCqmflhE="
+  [mod."github.com/aws/aws-sdk-go-v2/internal/configsources"]
+    version = "v1.4.22"
+    hash = "sha256-IZkRPudCRm4UMsjrphfqHXxi7TQEDTDfE7oO1t3463Q="
+  [mod."github.com/aws/aws-sdk-go-v2/internal/endpoints/v2"]
+    version = "v2.7.22"
+    hash = "sha256-cnRMdIAuY1hAE5xJYxWXjGvUJ11F48SpO5IlSwDi820="
+  [mod."github.com/aws/aws-sdk-go-v2/internal/ini"]
+    version = "v1.8.4"
+    hash = "sha256-okyFQwcEqbwKwkGK5xp/VYE0fGg9cqG6AuLijIuf5xg="
+  [mod."github.com/aws/aws-sdk-go-v2/internal/v4a"]
+    version = "v1.4.23"
+    hash = "sha256-ZGBZ+PSn9XNgBdbyPQO+yxudjwsywrmQB4t6NAt5m6s="
+  [mod."github.com/aws/aws-sdk-go-v2/service/internal/accept-encoding"]
+    version = "v1.13.8"
+    hash = "sha256-vvRwvWMQ6SVNhKkIOwiBzQ5Yr3dEFNO7k6bLWig6NX4="
+  [mod."github.com/aws/aws-sdk-go-v2/service/internal/checksum"]
+    version = "v1.9.14"
+    hash = "sha256-Efhg49Wj999JwhJ/cU/wmFd0yzJqjaUrr52cNtke+WY="
+  [mod."github.com/aws/aws-sdk-go-v2/service/internal/presigned-url"]
+    version = "v1.13.22"
+    hash = "sha256-kBbTj5/J+EOrMYCRCoO5kNfh0PlGHeO+gcrvvZnl+MM="
+  [mod."github.com/aws/aws-sdk-go-v2/service/internal/s3shared"]
+    version = "v1.19.22"
+    hash = "sha256-kSp48EuNE4ZPOAO+gIBe0TvIraGFxux5A2Eut9qZ4Eo="
+  [mod."github.com/aws/aws-sdk-go-v2/service/s3"]
+    version = "v1.99.1"
+    hash = "sha256-IRnCa832TAV9oyVU1r0NJDUHphh48CMpPEXEccWymLc="
+  [mod."github.com/aws/aws-sdk-go-v2/service/signin"]
+    version = "v1.0.5"
+    hash = "sha256-d9Ju310g1j8i9+ylDPnRHZEC6GoRGOjmbL+yRpDvjoU="
+  [mod."github.com/aws/aws-sdk-go-v2/service/sso"]
+    version = "v1.30.9"
+    hash = "sha256-cC4k8KAPEu3Pb3AyRjsuNB4KyVhdJPVf1pr00KZ7sE4="
+  [mod."github.com/aws/aws-sdk-go-v2/service/ssooidc"]
+    version = "v1.35.13"
+    hash = "sha256-bmEmJ7nNjHoVKVvsQ9WmlzkuJjL0mS/Wd2V+otPIue0="
+  [mod."github.com/aws/aws-sdk-go-v2/service/sts"]
+    version = "v1.41.6"
+    hash = "sha256-vT36v9lPKBhesIVm4KRp/+nHPD6S6DaZIhCl/HHldrc="
+  [mod."github.com/aws/smithy-go"]
+    version = "v1.25.0"
+    hash = "sha256-dpsvzF6BFK7XwzVvci3mhLA5KhEZ+xrfuaRWqbmukPU="
   [mod."github.com/beorn7/perks"]
     version = "v1.0.1"
     hash = "sha256-h75GUqfwJKngCJQVE5Ao5wnO3cfKD9lSIteoLp/3xJ4="
@@ -328,9 +385,9 @@ schema = 3
     version = "v0.2.2"
     hash = "sha256-0MLfSJKdeK3Z7tWAXTdzwB4091dmyxIX38S5SKH5QAw="
   [mod."github.com/evmos/ethermint"]
-    version = "v0.22.1-0.20260622075215-2593e6edcfff"
-    hash = "sha256-aDgIpln5Hyq9788M+hMbbxAeSm4Tdf1Ho5rndYafOts="
-    replaced = "github.com/crypto-org-chain/ethermint"
+    version = "v0.22.1-0.20260721171431-e017d5ee7c8f"
+    hash = "sha256-TAo8sdTfOIPr3dCdsb2Xdu4bsYLMSEGzhxzdX7+v45Y="
+    replaced = "github.com/Chaintable/ethermint-cronos"
   [mod."github.com/fatih/color"]
     version = "v1.17.0"
     hash = "sha256-QsKMy3MsvjbYNcA9jP8w6c3wpmWDZ0079bybAEzmXR0="
