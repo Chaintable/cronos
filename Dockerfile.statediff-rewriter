@@ -1,7 +1,5 @@
 FROM golang:1.25-bookworm AS go-builder
 
-ARG GIT_COMMIT
-
 RUN apt-get update && \
     apt-get install -y libgflags-dev libsnappy-dev zlib1g-dev libbz2-dev liblz4-dev libzstd-dev && \
     rm -rf /var/lib/apt/lists/*
@@ -15,6 +13,7 @@ RUN git clone https://github.com/facebook/rocksdb.git /tmp/rocksdb && \
 
 WORKDIR /code
 COPY . /code/
+ARG GIT_COMMIT
 RUN test -n "${GIT_COMMIT}" && \
     GOPRIVATE='github.com/Chaintable/*' make build-statediff-rewriter COSMOS_BUILD_OPTIONS=rocksdb COMMIT="${GIT_COMMIT}"
 
