@@ -15,10 +15,6 @@ import (
 	dtypes "github.com/evmos/ethermint/debank/types"
 )
 
-func validatePlanForWrite(dir string, manifest planManifest) error {
-	return validatePlanForWriteContext(context.Background(), dir, manifest)
-}
-
 func validatePlanForWriteContext(ctx context.Context, dir string, manifest planManifest) error {
 	if ctx == nil {
 		return fmt.Errorf("plan preflight context is required")
