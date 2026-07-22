@@ -64,7 +64,7 @@ func newPlanCommand() *cobra.Command {
 	}
 	command := &cobra.Command{
 		Use:   "plan",
-		Short: "Seal a strict changeset dump and build a read-only changed-object plan",
+		Short: "Build a read-only changed-object plan from a sealed dump or frozen IAVL",
 		RunE: func(command *cobra.Command, _ []string) error {
 			firstSet := command.Flags().Changed("pilot-first-height")
 			finalSet := command.Flags().Changed("pilot-final-height")
@@ -88,6 +88,8 @@ func newPlanCommand() *cobra.Command {
 		},
 	}
 	command.Flags().StringVar(&options.DumpStaging, "dump", "", "changeset dump directory ending in .staging or .sealed")
+	command.Flags().BoolVar(&options.Direct, "direct", false, "read changesets directly from the frozen archive IAVL")
+	command.Flags().IntVar(&options.IAVLCacheSize, "iavl-cache-size", defaultDumpCacheSize, "IAVL node-cache entries for direct traversal")
 	command.Flags().StringVar(&options.ArchiveHome, "home", "", "frozen Cronos archive home")
 	command.Flags().StringVar(&options.Output, "output", "", "plan directory ending in .staging")
 	command.Flags().Uint64Var(&options.MinFree, "min-free-bytes", 0, "stop before filesystem free space falls below this value")
@@ -96,7 +98,6 @@ func newPlanCommand() *cobra.Command {
 	command.Flags().Int64Var(&options.PilotFirstHeight, "pilot-first-height", 0, "first height of a read-only pilot plan; requires pilot-final-height")
 	command.Flags().Int64Var(&options.PilotFinalHeight, "pilot-final-height", 0, "final height of a read-only pilot plan; requires pilot-first-height")
 	addParallelFlags(command, &options.Parallel, true, true)
-	_ = command.MarkFlagRequired("dump")
 	_ = command.MarkFlagRequired("home")
 	_ = command.MarkFlagRequired("output")
 	_ = command.MarkFlagRequired("min-free-bytes")

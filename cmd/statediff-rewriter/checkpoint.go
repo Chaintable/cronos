@@ -156,9 +156,18 @@ func loadPlanManifestContext(ctx context.Context, path string) (planManifest, st
 	); err != nil {
 		return planManifest{}, "", fmt.Errorf("manifest build identity: %w", err)
 	}
-	if !validSHA256Hex(manifest.DumpManifestHash) || !filepath.IsAbs(manifest.DumpPath) ||
-		filepath.Ext(filepath.Clean(manifest.DumpPath)) != ".sealed" {
-		return planManifest{}, "", fmt.Errorf("manifest dump identity is incomplete")
+	switch effectivePlanSourceMode(manifest) {
+	case planSourceDumpV1:
+		if !validSHA256Hex(manifest.DumpManifestHash) || !filepath.IsAbs(manifest.DumpPath) ||
+			filepath.Ext(filepath.Clean(manifest.DumpPath)) != ".sealed" {
+			return planManifest{}, "", fmt.Errorf("manifest dump identity is incomplete")
+		}
+	case planSourceDirectV1:
+		if manifest.DumpPath != "" || manifest.DumpManifestHash != "" || !filepath.IsAbs(manifest.ArchiveIdentity.Home) {
+			return planManifest{}, "", fmt.Errorf("manifest direct IAVL identity is invalid")
+		}
+	default:
+		return planManifest{}, "", fmt.Errorf("unsupported plan source mode %q", manifest.SourceMode)
 	}
 	if manifest.FirstHeight < 2 || manifest.FinalHeight < manifest.FirstHeight || manifest.FinalHeight > manifest.ArchiveIdentity.LatestVersion {
 		return planManifest{}, "", fmt.Errorf("manifest height range is invalid")

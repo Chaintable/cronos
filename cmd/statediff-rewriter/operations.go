@@ -1055,12 +1055,64 @@ func runVerifyWithOptions(
 	if err := requireReadOnlyPlanArtifacts(planDir, manifest, activeFilesystem); err != nil {
 		return verifyReport{}, err
 	}
-	dumpDir, err := requireSealedDumpDirectory(manifest.DumpPath)
-	if err != nil {
-		return verifyReport{}, err
-	}
-	if _, err := requireReadOnlyFilesystem(dumpDir, "sealed dump"); err != nil {
-		return verifyReport{}, err
+	var directArchive *archiveReader
+	var dumpInfo dumpManifest
+	var iterateVerifySource func(context.Context, func(int64, *iavl.ChangeSet) error) error
+	switch effectivePlanSourceMode(manifest) {
+	case planSourceDumpV1:
+		dumpDir, err := requireSealedDumpDirectory(manifest.DumpPath)
+		if err != nil {
+			return verifyReport{}, err
+		}
+		if _, err := requireReadOnlyFilesystem(dumpDir, "sealed dump"); err != nil {
+			return verifyReport{}, err
+		}
+		dumpBody, err := readRegularFileNoFollow(filepath.Join(dumpDir, "dump-manifest.v1.json"), "sealed dump manifest")
+		if err != nil {
+			return verifyReport{}, err
+		}
+		if sha256Hex(dumpBody) != manifest.DumpManifestHash {
+			return verifyReport{}, fmt.Errorf("dump manifest hash mismatch")
+		}
+		if err := decodeStrictJSON(dumpBody, &dumpInfo, "dump manifest"); err != nil {
+			return verifyReport{}, err
+		}
+		if err := validateDumpContext(dumpInfo, dumpContext{
+			Schema: dumpManifestSchema, FirstVersion: 1, LastVersion: manifest.FinalHeight,
+			SnapshotID: manifest.SnapshotID, ArchiveIdentity: manifest.ArchiveIdentity,
+			CronosCommit: manifest.CronosCommit, EthermintCommit: manifest.EthermintCommit,
+			IAVLCommit:  manifest.IAVLCommit,
+			ImageDigest: manifest.ImageDigest, BuildTags: manifest.BuildTags,
+		}); err != nil {
+			return verifyReport{}, err
+		}
+		if _, err := requireReadOnlySealedDump(manifest.DumpPath, dumpInfo); err != nil {
+			return verifyReport{}, err
+		}
+		iterateVerifySource = func(iterCtx context.Context, callback func(int64, *iavl.ChangeSet) error) error {
+			return iterateSealedDumpContext(iterCtx, manifest.DumpPath, dumpInfo, callback)
+		}
+	case planSourceDirectV1:
+		directArchive, err = openArchive(manifest.ArchiveIdentity.Home)
+		if err != nil {
+			return verifyReport{}, err
+		}
+		defer directArchive.Close()
+		directIdentity, err := directArchive.identity()
+		if err != nil {
+			return verifyReport{}, err
+		}
+		if directIdentity != manifest.ArchiveIdentity {
+			return verifyReport{}, fmt.Errorf("direct IAVL archive identity differs from sealed plan")
+		}
+		iterateVerifySource = func(iterCtx context.Context, callback func(int64, *iavl.ChangeSet) error) error {
+			return iterateArchiveDirectStateChangesContext(
+				iterCtx, directArchive, defaultDumpCacheSize,
+				manifest.FirstHeight, manifest.FinalHeight, callback,
+			)
+		}
+	default:
+		return verifyReport{}, fmt.Errorf("unsupported plan source mode %q", manifest.SourceMode)
 	}
 	checkpointDir, err = ensureNonSymlinkDirectory(checkpointDir, "verify checkpoint directory")
 	if err != nil {
@@ -1072,29 +1124,6 @@ func runVerifyWithOptions(
 		return verifyReport{}, err
 	}
 	defer func() { _ = releaseStagingLocks(locks) }()
-	dumpBody, err := readRegularFileNoFollow(filepath.Join(dumpDir, "dump-manifest.v1.json"), "sealed dump manifest")
-	if err != nil {
-		return verifyReport{}, err
-	}
-	if sha256Hex(dumpBody) != manifest.DumpManifestHash {
-		return verifyReport{}, fmt.Errorf("dump manifest hash mismatch")
-	}
-	var dumpInfo dumpManifest
-	if err := decodeStrictJSON(dumpBody, &dumpInfo, "dump manifest"); err != nil {
-		return verifyReport{}, err
-	}
-	if err := validateDumpContext(dumpInfo, dumpContext{
-		Schema: dumpManifestSchema, FirstVersion: 1, LastVersion: manifest.FinalHeight,
-		SnapshotID: manifest.SnapshotID, ArchiveIdentity: manifest.ArchiveIdentity,
-		CronosCommit: manifest.CronosCommit, EthermintCommit: manifest.EthermintCommit,
-		IAVLCommit:  manifest.IAVLCommit,
-		ImageDigest: manifest.ImageDigest, BuildTags: manifest.BuildTags,
-	}); err != nil {
-		return verifyReport{}, err
-	}
-	if _, err := requireReadOnlySealedDump(manifest.DumpPath, dumpInfo); err != nil {
-		return verifyReport{}, err
-	}
 	cpPath := checkpointPath
 	cp, err := loadCheckpoint(cpPath, manifest.RunID, manifestHash, "verify")
 	if err != nil {
@@ -1145,12 +1174,12 @@ func runVerifyWithOptions(
 		func(pipelineCtx context.Context, emit func(uint64, verifyTask) error) error {
 			var previousRoot common.Hash
 			var changedSeen uint64
-			err := iterateSealedDumpContext(pipelineCtx, manifest.DumpPath, dumpInfo, func(height int64, changeSet *iavl.ChangeSet) error {
+			err := iterateVerifySource(pipelineCtx, func(height int64, changeSet *iavl.ChangeSet) error {
 				if height == 1 {
 					return nil
 				}
 				if height < manifest.FirstHeight || height > manifest.FinalHeight {
-					return fmt.Errorf("dump height %d is outside manifest range %d-%d", height, manifest.FirstHeight, manifest.FinalHeight)
+					return fmt.Errorf("source height %d is outside manifest range %d-%d", height, manifest.FirstHeight, manifest.FinalHeight)
 				}
 				canonical, err := statediff.CanonicalStorageDiff(changeSet)
 				if err != nil {
@@ -1169,7 +1198,7 @@ func runVerifyWithOptions(
 					return err
 				}
 				if ok && record.Height < uint64(height) {
-					return fmt.Errorf("pack record height %d precedes dump height %d", record.Height, height)
+					return fmt.Errorf("pack record height %d precedes source height %d", record.Height, height)
 				}
 				if ok && record.Height == uint64(height) {
 					record, _, err = packStream.Next()
@@ -1274,6 +1303,15 @@ func runVerifyWithOptions(
 	}
 	if pipelineErr != nil || flushErr != nil {
 		return report, errors.Join(pipelineErr, flushErr)
+	}
+	if directArchive != nil {
+		identity, err := directArchive.identity()
+		if err != nil {
+			return report, err
+		}
+		if identity != manifest.ArchiveIdentity {
+			return report, fmt.Errorf("direct IAVL archive identity changed during verify")
+		}
 	}
 	if report.VerifiedChanged != manifest.Changed || changedFrontier != uint64(manifest.Changed) {
 		return report, fmt.Errorf("verified changed %d, want %d", report.VerifiedChanged, manifest.Changed)

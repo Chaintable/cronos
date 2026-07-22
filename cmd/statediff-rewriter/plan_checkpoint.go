@@ -153,7 +153,7 @@ func samePlanIdentity(left, right planManifest) bool {
 		left.Prefix == right.Prefix && left.Region == right.Region && left.FirstHeight == right.FirstHeight &&
 		left.FinalHeight == right.FinalHeight && left.CronosCommit == right.CronosCommit &&
 		left.EthermintCommit == right.EthermintCommit && left.IAVLCommit == right.IAVLCommit &&
-		left.DumpPath == right.DumpPath &&
+		effectivePlanSourceMode(left) == effectivePlanSourceMode(right) && left.DumpPath == right.DumpPath &&
 		left.DumpManifestHash == right.DumpManifestHash && left.ArchiveIdentity == right.ArchiveIdentity &&
 		left.SnapshotID == right.SnapshotID && left.ImageDigest == right.ImageDigest && left.BuildTags == right.BuildTags
 }

@@ -16,6 +16,8 @@ import (
 const (
 	manifestSchema      = "statediff-rewriter-manifest/v1"
 	pilotManifestSchema = "statediff-rewriter-pilot-manifest/v1"
+	planSourceDumpV1    = "dump-v1"
+	planSourceDirectV1  = "direct-iavl-v1"
 	packSchema          = uint64(1)
 	defaultBucket       = "chaintable-nodex-pipeline--apne1-az4--x-s3"
 	defaultPrefix       = "25/4cc51d2e"
@@ -76,8 +78,9 @@ type planManifest struct {
 	SnapshotID            string          `json:"snapshot_id"`
 	ImageDigest           string          `json:"image_digest"`
 	BuildTags             string          `json:"build_tags"`
-	DumpPath              string          `json:"dump_path"`
-	DumpManifestHash      string          `json:"dump_manifest_sha256"`
+	SourceMode            string          `json:"source_mode,omitempty"`
+	DumpPath              string          `json:"dump_path,omitempty"`
+	DumpManifestHash      string          `json:"dump_manifest_sha256,omitempty"`
 	ArchiveIdentity       archiveIdentity `json:"archive_identity"`
 	Processed             int64           `json:"processed"`
 	Changed               int64           `json:"changed"`
@@ -96,6 +99,13 @@ type planManifest struct {
 	RootIndexSHA256       string          `json:"root_index_sha256"`
 	RootMultisetSHA256    string          `json:"root_multiset_sha256"`
 	Chunks                []chunkManifest `json:"chunks"`
+}
+
+func effectivePlanSourceMode(manifest planManifest) string {
+	if manifest.SourceMode == "" {
+		return planSourceDumpV1
+	}
+	return manifest.SourceMode
 }
 
 type archiveIdentity struct {

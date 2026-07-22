@@ -7,12 +7,15 @@ import (
 	"strings"
 
 	dbm "github.com/cosmos/cosmos-db"
+	"github.com/cosmos/iavl"
+	iavldb "github.com/cosmos/iavl/db"
 	"github.com/crypto-org-chain/cronos/cmd/cronosd/opendb"
 
 	"cosmossdk.io/log"
 	"cosmossdk.io/store/metrics"
 	"cosmossdk.io/store/rootmulti"
 	storetypes "cosmossdk.io/store/types"
+	"cosmossdk.io/store/wrapper"
 )
 
 type archiveReader struct {
@@ -37,6 +40,18 @@ func openArchive(home string) (*archiveReader, error) {
 }
 
 func (a *archiveReader) Close() error { return a.db.Close() }
+
+func (a *archiveReader) evmIAVLDB() iavldb.DB {
+	return wrapper.NewDBWrapper(dbm.NewPrefixDB(a.db, []byte(evmIAVLPrefix)))
+}
+
+func (a *archiveReader) evmStateChangeSource(cacheSize int) stateChangeSource {
+	return iavl.NewImmutableTree(a.evmIAVLDB(), cacheSize, true, log.NewNopLogger())
+}
+
+func (a *archiveReader) evmLegacyLatestVersion() (int64, error) {
+	return legacyLatestRootVersion(a.evmIAVLDB())
+}
 
 func (a *archiveReader) commitInfo(version int64) (*storetypes.CommitInfo, error) {
 	info, err := a.store.GetCommitInfo(version)

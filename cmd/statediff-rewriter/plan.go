@@ -28,6 +28,8 @@ import (
 
 type planOptions struct {
 	DumpStaging      string
+	Direct           bool
+	IAVLCacheSize    int
 	ArchiveHome      string
 	Output           string
 	Bucket           string
@@ -45,6 +47,7 @@ type planOptions struct {
 const (
 	planBufferedWriteReserve = uint64(3 << 20)
 	planInitialWriteReserve  = uint64(4 << 20)
+	directTraversalChunkSize = int64(100_000)
 )
 
 type planRange struct {
@@ -143,6 +146,74 @@ func resolvePlanRange(options planOptions, latestVersion int64) (planRange, erro
 	}, nil
 }
 
+func iterateDirectStateChangesContext(
+	ctx context.Context,
+	source stateChangeSource,
+	first, last int64,
+	callback func(int64, *iavl.ChangeSet) error,
+) error {
+	if ctx == nil || source == nil || callback == nil {
+		return fmt.Errorf("direct traversal context, source, and callback are required")
+	}
+	if first < 2 || last < first {
+		return fmt.Errorf("invalid direct traversal range %d-%d", first, last)
+	}
+	for chunkFirst := first; ; {
+		chunkLast := chunkFirst + directTraversalChunkSize - 1
+		if chunkLast < chunkFirst || chunkLast > last {
+			chunkLast = last
+		}
+		expected := chunkFirst
+		err := traverseVerifiedStateChanges(source, chunkFirst, chunkLast, func(version int64, changeSet *iavl.ChangeSet) error {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			if version != expected {
+				return fmt.Errorf("direct traversal emitted version %d, want %d", version, expected)
+			}
+			if changeSet == nil {
+				return fmt.Errorf("direct traversal emitted nil changeset at version %d", version)
+			}
+			expected++
+			return callback(version, changeSet)
+		})
+		if err != nil {
+			return fmt.Errorf("direct traversal versions %d-%d: %w", chunkFirst, chunkLast, err)
+		}
+		if expected != chunkLast+1 {
+			return fmt.Errorf("direct traversal ended at version %d, want %d", expected-1, chunkLast)
+		}
+		if chunkLast == last {
+			return nil
+		}
+		chunkFirst = chunkLast + 1
+	}
+}
+
+func iterateArchiveDirectStateChangesContext(
+	ctx context.Context,
+	archive *archiveReader,
+	cacheSize int,
+	first, last int64,
+	callback func(int64, *iavl.ChangeSet) error,
+) error {
+	if archive == nil {
+		return fmt.Errorf("direct archive is required")
+	}
+	legacyLatest, err := archive.evmLegacyLatestVersion()
+	if err != nil {
+		return fmt.Errorf("resolve latest legacy EVM IAVL version: %w", err)
+	}
+	source := archive.evmStateChangeSource(cacheSize)
+	if legacyLatest >= first && legacyLatest < last {
+		if err := iterateDirectStateChangesContext(ctx, source, first, legacyLatest, callback); err != nil {
+			return err
+		}
+		first = legacyLatest + 1
+	}
+	return iterateDirectStateChangesContext(ctx, source, first, last, callback)
+}
+
 func runPlan(ctx context.Context, options planOptions, objects objectStore) (planManifest, string, error) {
 	if err := options.Parallel.validate(true); err != nil {
 		return planManifest{}, "", err
@@ -150,19 +221,34 @@ func runPlan(ctx context.Context, options planOptions, objects objectStore) (pla
 	if options.MinFree == 0 {
 		return planManifest{}, "", fmt.Errorf("min-free-bytes must be greater than zero")
 	}
+	if options.Direct {
+		if options.DumpStaging != "" {
+			return planManifest{}, "", fmt.Errorf("direct and dump sources are mutually exclusive")
+		}
+		if options.IAVLCacheSize < 0 {
+			return planManifest{}, "", fmt.Errorf("iavl-cache-size must not be negative")
+		}
+		if !filepath.IsAbs(options.ArchiveHome) {
+			return planManifest{}, "", fmt.Errorf("direct archive home must be absolute")
+		}
+	} else if options.DumpStaging == "" {
+		return planManifest{}, "", fmt.Errorf("exactly one plan source is required: --direct or --dump")
+	}
 	output, sealedPlan, err := resolvePlanOutput(options.Output)
 	if err != nil {
 		return planManifest{}, "", err
 	}
 	options.Output = output
-	dumpPath, err := canonicalDumpArgument(options.DumpStaging)
-	if err != nil {
-		return planManifest{}, "", err
-	}
-	options.DumpStaging = dumpPath
 	lockPaths := []string{options.Output}
-	if strings.HasSuffix(options.DumpStaging, ".staging") {
-		lockPaths = append(lockPaths, options.DumpStaging)
+	if !options.Direct {
+		dumpPath, err := canonicalDumpArgument(options.DumpStaging)
+		if err != nil {
+			return planManifest{}, "", err
+		}
+		options.DumpStaging = dumpPath
+		if strings.HasSuffix(options.DumpStaging, ".staging") {
+			lockPaths = append(lockPaths, options.DumpStaging)
+		}
 	}
 	locks, err := acquireStagingLocks(lockPaths...)
 	if err != nil {
@@ -191,21 +277,27 @@ func runPlan(ctx context.Context, options planOptions, objects objectStore) (pla
 	if err := requireRuntimeBuild(cronosCommit, ethermintCommit, iavlCommit, options.ImageDigest, version.BuildTags); err != nil {
 		return planManifest{}, "", err
 	}
-	sealedDump, dumpInfo, dumpHash, err := prepareDumpContext(ctx, options.DumpStaging, dumpContext{
-		Schema: scope.DumpSchema, FirstVersion: scope.DumpFirstVersion, LastVersion: scope.FinalHeight,
-		SnapshotID: options.SnapshotID, ArchiveIdentity: identity, CronosCommit: cronosCommit,
-		EthermintCommit: ethermintCommit, IAVLCommit: iavlCommit,
-		ImageDigest: options.ImageDigest, BuildTags: version.BuildTags,
-	})
-	if err != nil {
-		return planManifest{}, "", err
+	var sealedDump, dumpHash string
+	var dumpInfo dumpManifest
+	sourceMode := planSourceDirectV1
+	if !options.Direct {
+		sourceMode = planSourceDumpV1
+		sealedDump, dumpInfo, dumpHash, err = prepareDumpContext(ctx, options.DumpStaging, dumpContext{
+			Schema: scope.DumpSchema, FirstVersion: scope.DumpFirstVersion, LastVersion: scope.FinalHeight,
+			SnapshotID: options.SnapshotID, ArchiveIdentity: identity, CronosCommit: cronosCommit,
+			EthermintCommit: ethermintCommit, IAVLCommit: iavlCommit,
+			ImageDigest: options.ImageDigest, BuildTags: version.BuildTags,
+		})
+		if err != nil {
+			return planManifest{}, "", err
+		}
 	}
 	expectedManifest := planManifest{
 		Schema: scope.ManifestSchema, Sealed: true,
 		Bucket: options.Bucket, Prefix: strings.TrimSuffix(options.Prefix, "/"), Region: options.Region,
 		FirstHeight: scope.FirstHeight, FinalHeight: scope.FinalHeight,
 		CronosCommit: cronosCommit, EthermintCommit: ethermintCommit, IAVLCommit: iavlCommit,
-		DumpPath: sealedDump, DumpManifestHash: dumpHash, ArchiveIdentity: identity,
+		SourceMode: sourceMode, DumpPath: sealedDump, DumpManifestHash: dumpHash, ArchiveIdentity: identity,
 		SnapshotID: options.SnapshotID, ImageDigest: options.ImageDigest, BuildTags: version.BuildTags,
 	}
 	if existing, manifestPath, found, err := reuseSealedPlanContext(ctx, sealedPlan, expectedManifest); err != nil {
@@ -360,15 +452,24 @@ func runPlan(ctx context.Context, options planOptions, objects objectStore) (pla
 		firstSequence = resumeFrontier + 1
 	}
 	rootCheckpointMatched := resumeFrontier == 0
+	iteratePlanSource := func(iterCtx context.Context, callback func(int64, *iavl.ChangeSet) error) error {
+		if options.Direct {
+			return iterateArchiveDirectStateChangesContext(
+				iterCtx, archive, options.IAVLCacheSize,
+				scope.FirstHeight, scope.FinalHeight, callback,
+			)
+		}
+		return iterateSealedDumpContext(iterCtx, sealedDump, dumpInfo, callback)
+	}
 	err = runOrderedPipeline(ctx, firstSequence, options.Parallel.Concurrency, options.Parallel.Window,
 		func(pipelineCtx context.Context, emit func(uint64, planTask) error) error {
 			rollingDigest := common.Hash{}
-			scanErr := iterateSealedDumpContext(pipelineCtx, sealedDump, dumpInfo, func(height int64, changeSet *iavl.ChangeSet) error {
+			scanErr := iteratePlanSource(pipelineCtx, func(height int64, changeSet *iavl.ChangeSet) error {
 				if height == 1 && scope.FirstHeight == 2 {
 					return nil
 				}
 				if height < scope.FirstHeight || height > scope.FinalHeight {
-					return fmt.Errorf("dump height %d is outside plan range %d-%d", height, scope.FirstHeight, scope.FinalHeight)
+					return fmt.Errorf("source height %d is outside plan range %d-%d", height, scope.FirstHeight, scope.FinalHeight)
 				}
 				canonical, err := statediff.CanonicalStorageDiff(changeSet)
 				if err != nil {
@@ -383,7 +484,7 @@ func runPlan(ctx context.Context, options planOptions, objects objectStore) (pla
 				}
 				rollingDigest, err = extendPlanPrefixDigest(rollingDigest, uint64(height), root, parent, canonical)
 				if err != nil {
-					return fmt.Errorf("hash plan dump prefix at height %d: %w", height, err)
+					return fmt.Errorf("hash plan source prefix at height %d: %w", height, err)
 				}
 				if uint64(height) <= resumeFrontier {
 					record, err := readRootRecord(resumeRootReader)
@@ -395,7 +496,7 @@ func runPlan(ctx context.Context, options planOptions, objects objectStore) (pla
 					}
 					if uint64(height) == resumeFrontier {
 						if rollingDigest != prefixDigest {
-							return fmt.Errorf("plan checkpoint prefix differs from current dump at height %d", resumeFrontier)
+							return fmt.Errorf("plan checkpoint prefix differs from current source at height %d", resumeFrontier)
 						}
 						rootCheckpointMatched = true
 					}
@@ -558,11 +659,13 @@ func runPlan(ctx context.Context, options planOptions, objects objectStore) (pla
 	if finalIdentity != identity {
 		return planManifest{}, "", fmt.Errorf("archive identity changed during plan")
 	}
-	if err := validateSealedDumpManifest(sealedDump, dumpInfo, dumpHash); err != nil {
-		return planManifest{}, "", err
-	}
-	if err := validateSealedDumpArtifactsContext(ctx, sealedDump, dumpInfo); err != nil {
-		return planManifest{}, "", fmt.Errorf("sealed dump changed during plan: %w", err)
+	if !options.Direct {
+		if err := validateSealedDumpManifest(sealedDump, dumpInfo, dumpHash); err != nil {
+			return planManifest{}, "", err
+		}
+		if err := validateSealedDumpArtifactsContext(ctx, sealedDump, dumpInfo); err != nil {
+			return planManifest{}, "", fmt.Errorf("sealed dump changed during plan: %w", err)
+		}
 	}
 	if err := ctx.Err(); err != nil {
 		return planManifest{}, "", err
