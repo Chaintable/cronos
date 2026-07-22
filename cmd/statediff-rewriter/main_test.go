@@ -43,3 +43,15 @@ func TestCheckpointIntervalOnlyAppearsOnTimeBasedCheckpointCommands(t *testing.T
 		require.Nil(t, command.Flags().Lookup("checkpoint-interval"), name)
 	}
 }
+
+func TestStopAfterLegacyOnlyAppearsOnDump(t *testing.T) {
+	root := newRootCommand()
+	dump, _, err := root.Find([]string{"dump"})
+	require.NoError(t, err)
+	require.NotNil(t, dump.Flags().Lookup("stop-after-legacy"))
+	for _, name := range []string{"plan", "apply", "verify", "rollback"} {
+		command, _, findErr := root.Find([]string{name})
+		require.NoError(t, findErr)
+		require.Nil(t, command.Flags().Lookup("stop-after-legacy"), name)
+	}
+}

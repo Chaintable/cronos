@@ -49,12 +49,16 @@ type dumpOptions struct {
 	LegacyReferenceSamples int
 	SnapshotID             string
 	ImageDigest            string
+	StopAfterLegacy        bool
 }
 
 type dumpReport struct {
+	Phase                    string            `json:"phase"`
 	Output                   string            `json:"output"`
 	FirstVersion             int64             `json:"first_version"`
 	LastVersion              int64             `json:"last_version"`
+	CompletedLastVersion     int64             `json:"completed_last_version"`
+	TargetRecords            int64             `json:"target_records"`
 	Files                    int               `json:"files"`
 	GeneratedFiles           int64             `json:"generated_files"`
 	ReusedFiles              int64             `json:"reused_files"`
@@ -123,6 +127,7 @@ func newDumpCommand() *cobra.Command {
 	command.Flags().StringVar(&options.SnapshotID, "snapshot-id", "", "snapshot or immutable clone identity used to create this archive")
 	command.Flags().StringVar(&options.ImageDigest, "image-digest", "", "immutable rewriter image digest")
 	command.Flags().IntVar(&options.LegacyReferenceSamples, "legacy-reference-samples", options.LegacyReferenceSamples, "evenly spaced legacy versions compared with reference traversal")
+	command.Flags().BoolVar(&options.StopAfterLegacy, "stop-after-legacy", false, "prepare the legacy prefix of a full dump and stop before modern traversal")
 	_ = command.MarkFlagRequired("home")
 	_ = command.MarkFlagRequired("output")
 	_ = command.MarkFlagRequired("first-version")
@@ -204,6 +209,9 @@ func runDump(ctx context.Context, options dumpOptions) (dumpReport, error) {
 	if err != nil {
 		return dumpReport{}, err
 	}
+	if err := validateLegacyPreparation(options, latest, legacyRanges, modernRanges); err != nil {
+		return dumpReport{}, err
+	}
 	if len(legacyRanges) != 0 && options.LegacyReferenceSamples < 1 {
 		return dumpReport{}, fmt.Errorf("legacy-reference-samples must be positive when extracting legacy versions")
 	}
@@ -254,7 +262,9 @@ func runDump(ctx context.Context, options dumpOptions) (dumpReport, error) {
 		if err != nil {
 			return dumpReport{}, fmt.Errorf("extract legacy versions: %w", err)
 		}
-		legacyReport = &result.Scan
+		if result.Scanned {
+			legacyReport = &result.Scan
+		}
 		generatedFiles.Add(result.GeneratedFiles)
 		reusedFiles.Add(result.ReusedFiles)
 		generatedRecords.Add(result.GeneratedRecords)
@@ -268,6 +278,28 @@ func runDump(ctx context.Context, options dumpOptions) (dumpReport, error) {
 				return dumpReport{}, err
 			}
 		}
+	}
+	if options.StopAfterLegacy {
+		if err := validateDumpOutputComplete(evmDir, legacyRanges); err != nil {
+			return dumpReport{}, err
+		}
+		if err := validateDumpSourceUnchanged(archive, identity, output, sourceContext, sourceHash); err != nil {
+			return dumpReport{}, err
+		}
+		duration := time.Since(started)
+		records := countVersionRanges(legacyRanges)
+		return dumpReport{
+			Phase: "legacy-prepared", Output: output, FirstVersion: options.FirstVersion, LastVersion: options.LastVersion,
+			CompletedLastVersion: legacyRanges[len(legacyRanges)-1].Last,
+			TargetRecords:        options.LastVersion - options.FirstVersion + 1,
+			Files:                len(legacyRanges), GeneratedFiles: generatedFiles.Load(), ReusedFiles: reusedFiles.Load(), Records: records,
+			GeneratedRecords: generatedRecords.Load(), ReusedRecords: reusedRecords.Load(), Concurrency: 1,
+			CacheSize: options.CacheSize, ZlibLevel: options.ZlibLevel, DurationSeconds: duration.Seconds(),
+			HandledBlocksPerSecond:   float64(records) / duration.Seconds(),
+			GeneratedBlocksPerSecond: float64(generatedRecords.Load()) / duration.Seconds(),
+			LegacyLatestVersion:      legacyLatest, LegacyScan: legacyReport,
+			ModernRecords: countVersionRanges(modernRanges), LegacyReferenceSamples: legacyReferenceSamples,
+		}, nil
 	}
 
 	workerCount := options.Concurrency
@@ -330,19 +362,15 @@ func runDump(ctx context.Context, options dumpOptions) (dumpReport, error) {
 	if err := validateDumpOutputComplete(evmDir, ranges); err != nil {
 		return dumpReport{}, err
 	}
-	if finalLatest := rootmulti.GetLatestVersion(archive.db); finalLatest != latest {
-		return dumpReport{}, fmt.Errorf("archive latest version changed during dump: %d to %d", latest, finalLatest)
-	}
-	if source, finalSourceHash, found, err := loadDumpSource(filepath.Join(output, dumpSourceFileName)); err != nil {
+	if err := validateDumpSourceUnchanged(archive, identity, output, sourceContext, sourceHash); err != nil {
 		return dumpReport{}, err
-	} else if !found || source.Context != sourceContext || finalSourceHash != sourceHash {
-		return dumpReport{}, fmt.Errorf("dump source identity changed during extraction")
 	}
 
 	duration := time.Since(started)
 	records := options.LastVersion - options.FirstVersion + 1
 	return dumpReport{
-		Output: output, FirstVersion: options.FirstVersion, LastVersion: options.LastVersion,
+		Phase: "complete", Output: output, FirstVersion: options.FirstVersion, LastVersion: options.LastVersion,
+		CompletedLastVersion: options.LastVersion, TargetRecords: records,
 		Files: len(ranges), GeneratedFiles: generatedFiles.Load(), ReusedFiles: reusedFiles.Load(), Records: records,
 		GeneratedRecords: generatedRecords.Load(), ReusedRecords: reusedRecords.Load(),
 		Concurrency: workerCount, CacheSize: options.CacheSize, ZlibLevel: options.ZlibLevel,
@@ -351,6 +379,53 @@ func runDump(ctx context.Context, options dumpOptions) (dumpReport, error) {
 		LegacyLatestVersion:      legacyLatest, LegacyScan: legacyReport,
 		ModernRecords: countVersionRanges(modernRanges), LegacyReferenceSamples: legacyReferenceSamples,
 	}, nil
+}
+
+func validateLegacyPreparation(
+	options dumpOptions,
+	latest int64,
+	legacyRanges, modernRanges []versionRange,
+) error {
+	if !options.StopAfterLegacy {
+		return nil
+	}
+	if options.FirstVersion != 1 || options.LastVersion != latest {
+		return fmt.Errorf(
+			"stop-after-legacy requires the full archive range 1-%d, got %d-%d",
+			latest, options.FirstVersion, options.LastVersion,
+		)
+	}
+	if len(legacyRanges) == 0 {
+		return fmt.Errorf("stop-after-legacy requires legacy versions")
+	}
+	if len(modernRanges) == 0 {
+		return fmt.Errorf("stop-after-legacy requires a modern suffix")
+	}
+	return nil
+}
+
+func validateDumpSourceUnchanged(
+	archive *archiveReader,
+	expectedIdentity archiveIdentity,
+	output string,
+	expectedContext dumpContext,
+	expectedHash string,
+) error {
+	identity, err := archive.identity()
+	if err != nil {
+		return err
+	}
+	if identity != expectedIdentity {
+		return fmt.Errorf("archive identity changed during extraction: got %+v, want %+v", identity, expectedIdentity)
+	}
+	source, sourceHash, found, err := loadDumpSource(filepath.Join(output, dumpSourceFileName))
+	if err != nil {
+		return err
+	}
+	if !found || source.Context != expectedContext || sourceHash != expectedHash {
+		return fmt.Errorf("dump source identity changed during extraction")
+	}
+	return nil
 }
 
 func resolveDumpOutput(path string) (string, error) {

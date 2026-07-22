@@ -12,6 +12,7 @@ import (
 
 type legacyDumpResult struct {
 	Scan             legacyScanReport
+	Scanned          bool
 	GeneratedFiles   int64
 	ReusedFiles      int64
 	GeneratedRecords int64
@@ -41,6 +42,11 @@ func writeLegacyDumpRanges(
 	if err != nil {
 		return result, err
 	}
+	if writer.reusedFiles == int64(len(ranges)) {
+		result.ReusedFiles = writer.reusedFiles
+		result.ReusedRecords = writer.reusedRecords
+		return result, nil
+	}
 	defer func() { returnErr = errors.Join(returnErr, writer.abort()) }()
 
 	report, err := scanLegacyChangeSets(ctx, source, scanOptions, writer.write)
@@ -51,6 +57,7 @@ func writeLegacyDumpRanges(
 		return result, err
 	}
 	result.Scan = report
+	result.Scanned = true
 	result.GeneratedFiles = writer.generatedFiles
 	result.ReusedFiles = writer.reusedFiles
 	result.GeneratedRecords = writer.generatedRecords

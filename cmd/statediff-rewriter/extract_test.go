@@ -27,6 +27,23 @@ type fakeTraverser struct {
 	hashCalls   map[int64]int
 }
 
+type failingLegacySource struct{ calls int }
+
+func (source *failingLegacySource) InspectRoots(func(iavl.LegacyRootRecord) error) error {
+	source.calls++
+	return errors.New("legacy source must not be scanned")
+}
+
+func (source *failingLegacySource) InspectNodes(func(iavl.LegacyNodeRecord) error) error {
+	source.calls++
+	return errors.New("legacy source must not be scanned")
+}
+
+func (source *failingLegacySource) InspectOrphans(func(iavl.LegacyOrphanRecord) error) error {
+	source.calls++
+	return errors.New("legacy source must not be scanned")
+}
+
 func (f *fakeTraverser) TraverseStateChanges(start, end int64, callback func(int64, *iavl.ChangeSet) error) error {
 	f.start, f.end = start, end
 	for _, version := range f.versions {
@@ -113,6 +130,49 @@ func TestSplitDumpRangesAtLegacyBoundary(t *testing.T) {
 	require.Equal(t, legacy, all)
 }
 
+func TestValidateLegacyPreparation(t *testing.T) {
+	legacy := []versionRange{{First: 1, Last: 4}}
+	modern := []versionRange{{First: 5, Last: 10}}
+	require.NoError(t, validateLegacyPreparation(
+		dumpOptions{FirstVersion: 1, LastVersion: 10, StopAfterLegacy: true}, 10, legacy, modern,
+	))
+
+	for _, testCase := range []struct {
+		name    string
+		options dumpOptions
+		latest  int64
+		legacy  []versionRange
+		modern  []versionRange
+		message string
+	}{
+		{
+			name: "partial range", options: dumpOptions{FirstVersion: 2, LastVersion: 10, StopAfterLegacy: true},
+			latest: 10, legacy: legacy, modern: modern, message: "full archive range",
+		},
+		{
+			name: "not latest", options: dumpOptions{FirstVersion: 1, LastVersion: 9, StopAfterLegacy: true},
+			latest: 10, legacy: legacy, modern: modern, message: "full archive range",
+		},
+		{
+			name: "no legacy", options: dumpOptions{FirstVersion: 1, LastVersion: 10, StopAfterLegacy: true},
+			latest: 10, modern: modern, message: "requires legacy versions",
+		},
+		{
+			name: "no modern", options: dumpOptions{FirstVersion: 1, LastVersion: 10, StopAfterLegacy: true},
+			latest: 10, legacy: legacy, message: "requires a modern suffix",
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			err := validateLegacyPreparation(
+				testCase.options, testCase.latest, testCase.legacy, testCase.modern,
+			)
+			require.ErrorContains(t, err, testCase.message)
+		})
+	}
+
+	require.NoError(t, validateLegacyPreparation(dumpOptions{}, 0, nil, nil))
+}
+
 func TestSequentialDumpWriterWritesAndReusesRanges(t *testing.T) {
 	evmDir := t.TempDir()
 	ranges := []versionRange{{First: 1, Last: 2}, {First: 3, Last: 4}}
@@ -147,6 +207,49 @@ func TestSequentialDumpWriterWritesAndReusesRanges(t *testing.T) {
 	require.Equal(t, int64(2), reused.reusedFiles)
 	require.Equal(t, int64(4), reused.reusedRecords)
 	require.Zero(t, reused.generatedFiles)
+}
+
+func TestWriteLegacyDumpRangesSkipsScanWhenAllRangesReusable(t *testing.T) {
+	evmDir := t.TempDir()
+	ranges := []versionRange{{First: 1, Last: 2}, {First: 3, Last: 4}}
+	writer, err := newSequentialDumpWriter(evmDir, ranges, zlib.BestSpeed, 1)
+	require.NoError(t, err)
+	for version := int64(1); version <= 4; version++ {
+		require.NoError(t, writer.write(version, &iavl.ChangeSet{}))
+	}
+	require.NoError(t, writer.finish())
+	stalePartial := dumpRangePath(evmDir, ranges[0]) + ".partial"
+	require.NoError(t, os.WriteFile(stalePartial, []byte("stale"), 0o600))
+
+	source := &failingLegacySource{}
+	result, err := writeLegacyDumpRanges(
+		context.Background(), source,
+		legacyScanOptions{
+			TempDir: t.TempDir(), FirstVersion: 1, LastVersion: 4,
+			SortChunkSize: externalRecordMemoryBytes, MaxSortChunks: 2, MinFree: 1,
+		},
+		evmDir, ranges, zlib.BestSpeed, 1,
+	)
+	require.NoError(t, err)
+	require.Zero(t, source.calls)
+	require.False(t, result.Scanned)
+	require.Equal(t, int64(2), result.ReusedFiles)
+	require.Equal(t, int64(4), result.ReusedRecords)
+	require.Zero(t, result.GeneratedFiles)
+	require.NoFileExists(t, stalePartial)
+
+	require.NoError(t, os.Remove(dumpRangePath(evmDir, ranges[1])))
+	source = &failingLegacySource{}
+	_, err = writeLegacyDumpRanges(
+		context.Background(), source,
+		legacyScanOptions{
+			TempDir: t.TempDir(), FirstVersion: 1, LastVersion: 4,
+			SortChunkSize: externalRecordMemoryBytes, MaxSortChunks: 2, MinFree: 1,
+		},
+		evmDir, ranges, zlib.BestSpeed, 1,
+	)
+	require.ErrorContains(t, err, "legacy source must not be scanned")
+	require.Equal(t, 1, source.calls)
 }
 
 func TestWriteDumpRangeUsesExistingChangeSetFormat(t *testing.T) {
