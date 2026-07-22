@@ -9,6 +9,7 @@
 ### Bug fixes
 
 * [#2115](https://github.com/crypto-org-chain/cronos/pull/2115) fix: add optional `traceReplay` trace-config flag to skip gas deduction during tracing and bypass a legacy bug.
+* [Chaintable/ethermint-cronos#9](https://github.com/Chaintable/ethermint-cronos/pull/9) fix: source DeBank storage diffs from committed IAVL changesets.
 
 ## v1.7.5
 
