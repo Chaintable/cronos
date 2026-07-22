@@ -21,6 +21,16 @@ type fakeLegacyRecordSource struct {
 	orphansErr error
 }
 
+type countingLegacyRecordSource struct {
+	fakeLegacyRecordSource
+	nodeInspections int
+}
+
+func (source *countingLegacyRecordSource) InspectNodes(callback func(iavl.LegacyNodeRecord) error) error {
+	source.nodeInspections++
+	return source.fakeLegacyRecordSource.InspectNodes(callback)
+}
+
 func (source fakeLegacyRecordSource) InspectRoots(callback func(iavl.LegacyRootRecord) error) error {
 	for _, record := range source.roots {
 		if err := callback(record); err != nil {
@@ -131,13 +141,102 @@ func TestScanLegacyChangeSetsReconstructsStorageUpdates(t *testing.T) {
 	require.Equal(t, legacyScanReport{
 		LegacyFirstVersion: 1, LegacyLastVersion: 5, Roots: 5,
 		Nodes: 3, Leaves: 3, StorageLeaves: 3, Orphans: 2, StorageOrphans: 2,
-		GraphNodes: 3, CoverageRecords: 6,
+		GraphNodes: 3, CoverageRecords: 6, Validation: legacyValidationGraph,
 	}, report)
 	require.Empty(t, changes[1].Pairs)
 	require.Equal(t, []*iavl.KVPair{{Key: keyA, Value: []byte{1}}}, changes[2].Pairs)
 	require.Equal(t, []*iavl.KVPair{{Key: keyA, Value: []byte{2}}}, changes[3].Pairs)
 	require.Equal(t, []*iavl.KVPair{{Delete: true, Key: keyA}}, changes[4].Pairs)
 	require.Equal(t, []*iavl.KVPair{{Key: keyC, Value: []byte{4}}}, changes[5].Pairs)
+}
+
+func TestScanLegacyChangeSetsTrustNodeSetSkipsGraphPass(t *testing.T) {
+	keyA, keyC := legacyStorageKey(1), legacyStorageKey(3)
+	roots := legacyRoots(5)
+	roots[1].Hash = legacyHash(1)
+	roots[2].Hash = legacyHash(2)
+	roots[4].Hash = legacyHash(3)
+	fixture := fakeLegacyRecordSource{
+		roots: roots,
+		nodes: []iavl.LegacyNodeRecord{
+			legacyStorageNode(1, 2, 1, 1),
+			legacyStorageNode(2, 3, 1, 2),
+			legacyStorageNode(3, 5, 3, 4),
+		},
+		orphans: []iavl.LegacyOrphanRecord{
+			{Hash: legacyHash(1), FromVersion: 2, ToVersion: 2},
+			{Hash: legacyHash(2), FromVersion: 3, ToVersion: 3},
+		},
+	}
+	run := func(t *testing.T, trust bool) (*countingLegacyRecordSource, legacyScanReport, map[int64]*iavl.ChangeSet) {
+		t.Helper()
+		source := &countingLegacyRecordSource{fakeLegacyRecordSource: fixture}
+		options := testLegacyScanOptions(t, 1, 5)
+		options.TrustNodeSet = trust
+		changes := make(map[int64]*iavl.ChangeSet)
+		report, err := scanLegacyChangeSets(
+			context.Background(), source, options,
+			func(version int64, changeSet *iavl.ChangeSet) error {
+				changes[version] = changeSet
+				return nil
+			},
+		)
+		require.NoError(t, err)
+		return source, report, changes
+	}
+
+	fullSource, fullReport, fullChanges := run(t, false)
+	trustedSource, trustedReport, trustedChanges := run(t, true)
+
+	require.Equal(t, 2, fullSource.nodeInspections)
+	require.Equal(t, legacyValidationGraph, fullReport.Validation)
+	require.NotZero(t, fullReport.GraphNodes)
+	require.Equal(t, 1, trustedSource.nodeInspections)
+	require.Equal(t, legacyValidationTrustedSet, trustedReport.Validation)
+	require.Zero(t, trustedReport.GraphNodes)
+	require.Zero(t, trustedReport.CoverageRecords)
+	require.Equal(t, fullChanges, trustedChanges)
+	require.Equal(t, []*iavl.KVPair{{Key: keyA, Value: []byte{1}}}, trustedChanges[2].Pairs)
+	require.Equal(t, []*iavl.KVPair{{Key: keyA, Value: []byte{2}}}, trustedChanges[3].Pairs)
+	require.Equal(t, []*iavl.KVPair{{Delete: true, Key: keyA}}, trustedChanges[4].Pairs)
+	require.Equal(t, []*iavl.KVPair{{Key: keyC, Value: []byte{4}}}, trustedChanges[5].Pairs)
+}
+
+func TestScanLegacyChangeSetsTrustNodeSetHandlesOrphanedBranch(t *testing.T) {
+	branch := iavl.LegacyNodeRecord{
+		Hash: legacyHash(1), Version: 1, Height: 1, Size: 2, Key: []byte{0x03},
+		LeftHash: legacyHash(3), RightHash: legacyHash(4),
+	}
+	storage := legacyStorageNode(2, 2, 5, 6)
+	source := &countingLegacyRecordSource{fakeLegacyRecordSource: fakeLegacyRecordSource{
+		roots: legacyRootsWithHash(2, storage.Hash),
+		nodes: []iavl.LegacyNodeRecord{branch, storage},
+		orphans: []iavl.LegacyOrphanRecord{
+			{Hash: branch.Hash, FromVersion: 1, ToVersion: 1},
+		},
+	}}
+	options := testLegacyScanOptions(t, 1, 2)
+	options.TrustNodeSet = true
+	changes := make(map[int64]*iavl.ChangeSet)
+
+	report, err := scanLegacyChangeSets(
+		context.Background(), source, options,
+		func(version int64, changeSet *iavl.ChangeSet) error {
+			changes[version] = changeSet
+			return nil
+		},
+	)
+
+	require.NoError(t, err)
+	require.Equal(t, 1, source.nodeInspections)
+	require.Equal(t, int64(1), report.Branches)
+	require.Equal(t, int64(1), report.Leaves)
+	require.Equal(t, int64(1), report.Orphans)
+	require.Zero(t, report.StorageOrphans)
+	require.Zero(t, report.GraphNodes)
+	require.Zero(t, report.CoverageRecords)
+	require.Empty(t, changes[1].Pairs)
+	require.Equal(t, []*iavl.KVPair{{Key: legacyStorageKey(5), Value: []byte{6}}}, changes[2].Pairs)
 }
 
 func TestScanLegacyChangeSetsSupportsSubrangeAndEmptySorts(t *testing.T) {

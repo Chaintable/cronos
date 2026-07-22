@@ -36,6 +36,9 @@ func validateDumpSourceContext(context dumpContext) error {
 	if context.Schema != dumpManifestSchema && context.Schema != pilotDumpManifestSchema {
 		return fmt.Errorf("unsupported dump source schema %q", context.Schema)
 	}
+	if context.LegacyValidation != "" && context.LegacyValidation != legacyValidationTrustedSet {
+		return fmt.Errorf("unsupported legacy validation mode %q", context.LegacyValidation)
+	}
 	if context.FirstVersion < 1 || context.LastVersion < context.FirstVersion {
 		return fmt.Errorf("invalid dump source range %d-%d", context.FirstVersion, context.LastVersion)
 	}

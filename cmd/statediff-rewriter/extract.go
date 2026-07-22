@@ -50,6 +50,7 @@ type dumpOptions struct {
 	SnapshotID             string
 	ImageDigest            string
 	StopAfterLegacy        bool
+	LegacyTrustNodeSet     bool
 }
 
 type dumpReport struct {
@@ -128,6 +129,7 @@ func newDumpCommand() *cobra.Command {
 	command.Flags().StringVar(&options.ImageDigest, "image-digest", "", "immutable rewriter image digest")
 	command.Flags().IntVar(&options.LegacyReferenceSamples, "legacy-reference-samples", options.LegacyReferenceSamples, "evenly spaced legacy versions compared with reference traversal")
 	command.Flags().BoolVar(&options.StopAfterLegacy, "stop-after-legacy", false, "prepare the legacy prefix of a full dump and stop before modern traversal")
+	command.Flags().BoolVar(&options.LegacyTrustNodeSet, "legacy-trust-node-set", false, "trust the frozen legacy node set and skip graph reachability validation")
 	_ = command.MarkFlagRequired("home")
 	_ = command.MarkFlagRequired("output")
 	_ = command.MarkFlagRequired("first-version")
@@ -232,6 +234,9 @@ func runDump(ctx context.Context, options dumpOptions) (dumpReport, error) {
 		CronosCommit: cronosCommit, EthermintCommit: ethermintCommit, IAVLCommit: iavlCommit,
 		ImageDigest: options.ImageDigest, BuildTags: version.BuildTags,
 	}
+	if options.LegacyTrustNodeSet {
+		sourceContext.LegacyValidation = legacyValidationTrustedSet
+	}
 	sourceHash, err := ensureDumpSource(output, sourceContext)
 	if err != nil {
 		return dumpReport{}, err
@@ -255,7 +260,7 @@ func runDump(ctx context.Context, options dumpOptions) (dumpReport, error) {
 				TempDir: tempDir, FirstVersion: legacyRanges[0].First,
 				LastVersion:   legacyRanges[len(legacyRanges)-1].Last,
 				SortChunkSize: options.LegacySortChunkSize, MaxSortChunks: options.LegacyMaxSortChunks,
-				MinFree: options.MinFree,
+				MinFree: options.MinFree, TrustNodeSet: options.LegacyTrustNodeSet,
 			},
 			evmDir, legacyRanges, options.ZlibLevel, options.MinFree,
 		)
@@ -386,6 +391,9 @@ func validateLegacyPreparation(
 	latest int64,
 	legacyRanges, modernRanges []versionRange,
 ) error {
+	if options.LegacyTrustNodeSet && len(legacyRanges) == 0 {
+		return fmt.Errorf("legacy-trust-node-set requires legacy versions")
+	}
 	if !options.StopAfterLegacy {
 		return nil
 	}

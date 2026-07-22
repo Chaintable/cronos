@@ -171,6 +171,9 @@ func TestValidateLegacyPreparation(t *testing.T) {
 	}
 
 	require.NoError(t, validateLegacyPreparation(dumpOptions{}, 0, nil, nil))
+	require.ErrorContains(t, validateLegacyPreparation(
+		dumpOptions{LegacyTrustNodeSet: true}, 10, nil, modern,
+	), "legacy-trust-node-set requires legacy versions")
 }
 
 func TestSequentialDumpWriterWritesAndReusesRanges(t *testing.T) {

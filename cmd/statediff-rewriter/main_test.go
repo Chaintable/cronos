@@ -49,9 +49,13 @@ func TestStopAfterLegacyOnlyAppearsOnDump(t *testing.T) {
 	dump, _, err := root.Find([]string{"dump"})
 	require.NoError(t, err)
 	require.NotNil(t, dump.Flags().Lookup("stop-after-legacy"))
+	trustFlag := dump.Flags().Lookup("legacy-trust-node-set")
+	require.NotNil(t, trustFlag)
+	require.Equal(t, "false", trustFlag.DefValue)
 	for _, name := range []string{"plan", "apply", "verify", "rollback"} {
 		command, _, findErr := root.Find([]string{name})
 		require.NoError(t, findErr)
 		require.Nil(t, command.Flags().Lookup("stop-after-legacy"), name)
+		require.Nil(t, command.Flags().Lookup("legacy-trust-node-set"), name)
 	}
 }

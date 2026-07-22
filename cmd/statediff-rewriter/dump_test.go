@@ -196,6 +196,27 @@ func TestSealDumpAcceptsExactPilotRange(t *testing.T) {
 	require.ErrorContains(t, err, "identity does not match this run: snapshot ID")
 }
 
+func TestSealDumpPreservesTrustedLegacyValidationSource(t *testing.T) {
+	staging := filepath.Join(t.TempDir(), "dump.staging")
+	writeDumpFile(t, staging, "block-100.zz", zlibBody(t, encodeChangeSet(t, 100)))
+	trusted := validTestDumpContext()
+	trusted.LastVersion = 100
+	trusted.LegacyValidation = legacyValidationTrustedSet
+	writeTestDumpSource(t, staging, trusted)
+
+	expected := trusted
+	expected.LegacyValidation = ""
+	sealed, manifest, _, err := sealDump(staging, expected)
+	require.NoError(t, err)
+	require.NotEmpty(t, manifest.SourceManifestSHA256)
+
+	source, sourceHash, found, err := loadDumpSource(filepath.Join(sealed, dumpSourceFileName))
+	require.NoError(t, err)
+	require.True(t, found)
+	require.Equal(t, legacyValidationTrustedSet, source.Context.LegacyValidation)
+	require.Equal(t, manifest.SourceManifestSHA256, sourceHash)
+}
+
 func TestPrepareDumpResumesSealedSibling(t *testing.T) {
 	staging := filepath.Join(t.TempDir(), "dump.staging")
 	writeDumpFile(t, staging, "block-100.zz", zlibBody(t, encodeChangeSet(t, 100)))
