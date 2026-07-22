@@ -19,15 +19,19 @@ const (
 	defaultLegacySortMaxChunks  = 512
 	legacyHashLength            = 32
 	legacyOrphanRecordLength    = legacyHashLength + 8 + 8
+	legacyValidationGraph       = "graph"
+	legacyValidationTrustedSet  = "trusted-node-set"
 )
 
 type legacyScanOptions struct {
-	TempDir       string
-	FirstVersion  int64
-	LastVersion   int64
+	TempDir      string
+	FirstVersion int64
+	LastVersion  int64
+
 	SortChunkSize int64
 	MaxSortChunks int
 	MinFree       uint64
+	TrustNodeSet  bool
 }
 
 type legacyScanReport struct {
@@ -42,6 +46,7 @@ type legacyScanReport struct {
 	Branches           int64
 	GraphNodes         int64
 	CoverageRecords    int64
+	Validation         string
 }
 
 type legacyRecordSource interface {
@@ -139,13 +144,20 @@ func scanLegacyChangeSets(
 		return report, err
 	}
 	defer func() { returnErr = errors.Join(returnErr, orphanSorter.Close()) }()
-	coverageSorter, err := newExternalSorterWithContext(
-		ctx, workDir, options.SortChunkSize, options.MaxSortChunks, options.MinFree, legacyCoverageLess,
-	)
-	if err != nil {
-		return report, err
+	var coverageSorter *externalSorter
+	if !options.TrustNodeSet {
+		coverageSorter, err = newExternalSorterWithContext(
+			ctx, workDir, options.SortChunkSize, options.MaxSortChunks, options.MinFree, legacyCoverageLess,
+		)
+		if err != nil {
+			return report, err
+		}
+		defer func() { returnErr = errors.Join(returnErr, coverageSorter.Close()) }()
 	}
-	defer func() { returnErr = errors.Join(returnErr, coverageSorter.Close()) }()
+	report.Validation = legacyValidationGraph
+	if options.TrustNodeSet {
+		report.Validation = legacyValidationTrustedSet
+	}
 	expectedRoot := int64(1)
 	err = source.InspectRoots(func(root iavl.LegacyRootRecord) error {
 		if err := ctx.Err(); err != nil {
@@ -161,6 +173,12 @@ func scanLegacyChangeSets(
 		report.Roots++
 		expectedRoot++
 		if len(root.Hash) == 0 {
+			return nil
+		}
+		if len(root.Hash) != legacyHashLength {
+			return fmt.Errorf("legacy root %d has hash length %d", root.Version, len(root.Hash))
+		}
+		if coverageSorter == nil {
 			return nil
 		}
 		body, err := encodeLegacyCoverage(legacyCoverageRecord{
@@ -212,16 +230,18 @@ func scanLegacyChangeSets(
 	if err := orphanReader.Close(); err != nil {
 		return report, err
 	}
-	coverageReader, err := coverageSorter.Finalize()
-	if err != nil {
-		return report, fmt.Errorf("finalize legacy reachability sort: %w", err)
-	}
-	report.GraphNodes, err = validateLegacyCoverage(ctx, source, coverageReader, report.Nodes)
-	if err != nil {
-		return report, err
-	}
-	if err := coverageReader.Close(); err != nil {
-		return report, err
+	if coverageSorter != nil {
+		coverageReader, err := coverageSorter.Finalize()
+		if err != nil {
+			return report, fmt.Errorf("finalize legacy reachability sort: %w", err)
+		}
+		report.GraphNodes, err = validateLegacyCoverage(ctx, source, coverageReader, report.Nodes)
+		if err != nil {
+			return report, err
+		}
+		if err := coverageReader.Close(); err != nil {
+			return report, err
+		}
 	}
 
 	deltaReader, err := deltaSorter.Finalize()
@@ -385,19 +405,24 @@ func scanLegacyNodesWithOrphans(
 				}
 			}
 		}
-		self, encodeErr := encodeLegacyCoverage(legacyCoverageRecord{
-			Hash: node.Hash, Kind: legacyCoverageSelf, FromVersion: node.Version, ToVersion: lifetimeEnd,
-		})
-		if encodeErr != nil {
-			return encodeErr
+		if coverage != nil {
+			self, encodeErr := encodeLegacyCoverage(legacyCoverageRecord{
+				Hash: node.Hash, Kind: legacyCoverageSelf, FromVersion: node.Version, ToVersion: lifetimeEnd,
+			})
+			if encodeErr != nil {
+				return encodeErr
+			}
+			if err := coverage.Feed(self); err != nil {
+				return err
+			}
+			report.CoverageRecords++
 		}
-		if err := coverage.Feed(self); err != nil {
-			return err
-		}
-		report.CoverageRecords++
 
 		if !node.IsLeaf() {
 			report.Branches++
+			if coverage == nil {
+				return nil
+			}
 			children := []struct {
 				hash []byte
 				kind byte

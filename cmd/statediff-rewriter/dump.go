@@ -38,16 +38,17 @@ type contextReader struct {
 }
 
 type dumpContext struct {
-	Schema          string          `json:"dump_schema"`
-	FirstVersion    int64           `json:"first_version"`
-	LastVersion     int64           `json:"last_version"`
-	SnapshotID      string          `json:"snapshot_id"`
-	ArchiveIdentity archiveIdentity `json:"archive_identity"`
-	CronosCommit    string          `json:"cronos_commit"`
-	EthermintCommit string          `json:"ethermint_commit"`
-	IAVLCommit      string          `json:"iavl_commit"`
-	ImageDigest     string          `json:"image_digest"`
-	BuildTags       string          `json:"build_tags"`
+	Schema           string          `json:"dump_schema"`
+	FirstVersion     int64           `json:"first_version"`
+	LastVersion      int64           `json:"last_version"`
+	SnapshotID       string          `json:"snapshot_id"`
+	ArchiveIdentity  archiveIdentity `json:"archive_identity"`
+	CronosCommit     string          `json:"cronos_commit"`
+	EthermintCommit  string          `json:"ethermint_commit"`
+	IAVLCommit       string          `json:"iavl_commit"`
+	ImageDigest      string          `json:"image_digest"`
+	BuildTags        string          `json:"build_tags"`
+	LegacyValidation string          `json:"legacy_validation,omitempty"`
 }
 
 func (w *countingWriter) Write(body []byte) (int, error) {
@@ -315,6 +316,9 @@ func sealDumpContext(ctx context.Context, stagingPath string, contexts ...dumpCo
 		}
 		if !found {
 			return "", dumpManifest{}, "", fmt.Errorf("execution dump staging has no source manifest")
+		}
+		if context.LegacyValidation == "" && source.Context.LegacyValidation == legacyValidationTrustedSet {
+			context.LegacyValidation = legacyValidationTrustedSet
 		}
 		if source.Context != context {
 			return "", dumpManifest{}, "", fmt.Errorf("dump source identity differs from plan")

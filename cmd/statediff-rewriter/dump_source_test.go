@@ -35,6 +35,17 @@ func TestEnsureDumpSourcePinsIdentityBeforeOutput(t *testing.T) {
 	context.SnapshotID = "snap-other"
 	_, err = ensureDumpSource(staging, context)
 	require.ErrorContains(t, err, "identity differs")
+
+	context = validTestDumpContext()
+	context.LegacyValidation = legacyValidationTrustedSet
+	_, err = ensureDumpSource(staging, context)
+	require.ErrorContains(t, err, "identity differs")
+}
+
+func TestValidateDumpSourceContextRejectsUnknownLegacyValidation(t *testing.T) {
+	context := validTestDumpContext()
+	context.LegacyValidation = "unchecked"
+	require.ErrorContains(t, validateDumpSourceContext(context), "unsupported legacy validation mode")
 }
 
 func TestEnsureDumpSourceRefusesToRelabelExistingOutput(t *testing.T) {
