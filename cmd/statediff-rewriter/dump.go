@@ -97,9 +97,6 @@ func scanZlibChangeSetsContext(ctx context.Context, path string, fn func(int64, 
 	if err != nil {
 		return dumpFileManifest{}, fmt.Errorf("open zlib %s: %w", path, err)
 	}
-	if multistream, ok := zreader.(interface{ Multistream(bool) }); ok {
-		multistream.Multistream(false)
-	}
 	reader := bufio.NewReader(zreader)
 
 	var first, last, records int64
