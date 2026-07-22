@@ -60,7 +60,7 @@ func buildCommit() string {
 func newPlanCommand() *cobra.Command {
 	options := planOptions{
 		Bucket: defaultBucket, Prefix: defaultPrefix, Region: defaultRegion,
-		Parallel: defaultParallelOptions(),
+		IAVLConcurrency: defaultDirectIAVLConcurrency, Parallel: defaultParallelOptions(),
 	}
 	command := &cobra.Command{
 		Use:   "plan",
@@ -89,7 +89,8 @@ func newPlanCommand() *cobra.Command {
 	}
 	command.Flags().StringVar(&options.DumpStaging, "dump", "", "changeset dump directory ending in .staging or .sealed")
 	command.Flags().BoolVar(&options.Direct, "direct", false, "read changesets directly from the frozen archive IAVL")
-	command.Flags().IntVar(&options.IAVLCacheSize, "iavl-cache-size", defaultDumpCacheSize, "IAVL node-cache entries for direct traversal")
+	command.Flags().IntVar(&options.IAVLCacheSize, "iavl-cache-size", defaultDumpCacheSize, "IAVL node-cache entries per direct traversal worker")
+	command.Flags().IntVar(&options.IAVLConcurrency, "iavl-concurrency", options.IAVLConcurrency, "parallel IAVL shards for direct traversal")
 	command.Flags().StringVar(&options.ArchiveHome, "home", "", "frozen Cronos archive home")
 	command.Flags().StringVar(&options.Output, "output", "", "plan directory ending in .staging")
 	command.Flags().Uint64Var(&options.MinFree, "min-free-bytes", 0, "stop before filesystem free space falls below this value")

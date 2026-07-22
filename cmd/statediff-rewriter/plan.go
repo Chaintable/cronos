@@ -30,6 +30,7 @@ type planOptions struct {
 	DumpStaging      string
 	Direct           bool
 	IAVLCacheSize    int
+	IAVLConcurrency  int
 	ArchiveHome      string
 	Output           string
 	Bucket           string
@@ -190,30 +191,6 @@ func iterateDirectStateChangesContext(
 	}
 }
 
-func iterateArchiveDirectStateChangesContext(
-	ctx context.Context,
-	archive *archiveReader,
-	cacheSize int,
-	first, last int64,
-	callback func(int64, *iavl.ChangeSet) error,
-) error {
-	if archive == nil {
-		return fmt.Errorf("direct archive is required")
-	}
-	legacyLatest, err := archive.evmLegacyLatestVersion()
-	if err != nil {
-		return fmt.Errorf("resolve latest legacy EVM IAVL version: %w", err)
-	}
-	source := archive.evmStateChangeSource(cacheSize)
-	if legacyLatest >= first && legacyLatest < last {
-		if err := iterateDirectStateChangesContext(ctx, source, first, legacyLatest, callback); err != nil {
-			return err
-		}
-		first = legacyLatest + 1
-	}
-	return iterateDirectStateChangesContext(ctx, source, first, last, callback)
-}
-
 func runPlan(ctx context.Context, options planOptions, objects objectStore) (planManifest, string, error) {
 	if err := options.Parallel.validate(true); err != nil {
 		return planManifest{}, "", err
@@ -227,6 +204,12 @@ func runPlan(ctx context.Context, options planOptions, objects objectStore) (pla
 		}
 		if options.IAVLCacheSize < 0 {
 			return planManifest{}, "", fmt.Errorf("iavl-cache-size must not be negative")
+		}
+		if options.IAVLConcurrency < 1 || options.IAVLConcurrency > maximumDirectIAVLConcurrency {
+			return planManifest{}, "", fmt.Errorf("iavl-concurrency must be between 1 and %d", maximumDirectIAVLConcurrency)
+		}
+		if options.Parallel.MaxInFlightBytes < maxObjectOperationBytes+directResultBaseBytes {
+			return planManifest{}, "", fmt.Errorf("direct max-inflight-bytes must be at least %d", maxObjectOperationBytes+directResultBaseBytes)
 		}
 		if !filepath.IsAbs(options.ArchiveHome) {
 			return planManifest{}, "", fmt.Errorf("direct archive home must be absolute")
@@ -452,28 +435,33 @@ func runPlan(ctx context.Context, options planOptions, objects objectStore) (pla
 		firstSequence = resumeFrontier + 1
 	}
 	rootCheckpointMatched := resumeFrontier == 0
-	iteratePlanSource := func(iterCtx context.Context, callback func(int64, *iavl.ChangeSet) error) error {
+	iteratePlanSource := func(iterCtx context.Context, callback func(int64, []dtypes.AccountStorageDiff) error) error {
 		if options.Direct {
-			return iterateArchiveDirectStateChangesContext(
-				iterCtx, archive, options.IAVLCacheSize,
+			return iterateArchiveDirectStorageDiffsContext(
+				iterCtx, archive, options.IAVLCacheSize, options.IAVLConcurrency,
 				scope.FirstHeight, scope.FinalHeight, callback,
 			)
 		}
-		return iterateSealedDumpContext(iterCtx, sealedDump, dumpInfo, callback)
+		return iterateSealedDumpContext(iterCtx, sealedDump, dumpInfo, func(height int64, changeSet *iavl.ChangeSet) error {
+			if height == 1 && scope.FirstHeight == 2 {
+				return callback(height, nil)
+			}
+			canonical, err := statediff.CanonicalStorageDiff(changeSet)
+			if err != nil {
+				return fmt.Errorf("height %d canonical storage: %w", height, err)
+			}
+			return callback(height, canonical)
+		})
 	}
 	err = runOrderedPipeline(ctx, firstSequence, options.Parallel.Concurrency, options.Parallel.Window,
 		func(pipelineCtx context.Context, emit func(uint64, planTask) error) error {
 			rollingDigest := common.Hash{}
-			scanErr := iteratePlanSource(pipelineCtx, func(height int64, changeSet *iavl.ChangeSet) error {
+			scanErr := iteratePlanSource(pipelineCtx, func(height int64, canonical []dtypes.AccountStorageDiff) error {
 				if height == 1 && scope.FirstHeight == 2 {
 					return nil
 				}
 				if height < scope.FirstHeight || height > scope.FinalHeight {
 					return fmt.Errorf("source height %d is outside plan range %d-%d", height, scope.FirstHeight, scope.FinalHeight)
-				}
-				canonical, err := statediff.CanonicalStorageDiff(changeSet)
-				if err != nil {
-					return fmt.Errorf("height %d canonical storage: %w", height, err)
 				}
 				root, parent, err := rootCursor.Next(height)
 				if err != nil {
@@ -505,9 +493,9 @@ func runPlan(ctx context.Context, options planOptions, objects objectStore) (pla
 				if uint64(height) > resumeFrontier && !rootCheckpointMatched {
 					return fmt.Errorf("plan checkpoint height %d was not found", resumeFrontier)
 				}
-				weight := maxObjectOperationBytes
-				if root == parent {
-					weight = 1 << 20
+				weight, err := canonicalObjectOperationBytes(canonical, root == parent)
+				if err != nil {
+					return fmt.Errorf("height %d canonical storage reservation: %w", height, err)
 				}
 				if err := limiter.Acquire(pipelineCtx, weight); err != nil {
 					return err

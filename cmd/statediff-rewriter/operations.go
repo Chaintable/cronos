@@ -1031,6 +1031,9 @@ func runVerifyWithOptions(
 	if err := options.validate(true); err != nil {
 		return verifyReport{}, err
 	}
+	if options.MaxInFlightBytes < maxObjectOperationBytes+directResultBaseBytes {
+		return verifyReport{}, fmt.Errorf("verify max-inflight-bytes must be at least %d", maxObjectOperationBytes+directResultBaseBytes)
+	}
 	planDir, err := requireSealedPlanDirectory(manifestPath)
 	if err != nil {
 		return verifyReport{}, err
@@ -1057,7 +1060,7 @@ func runVerifyWithOptions(
 	}
 	var directArchive *archiveReader
 	var dumpInfo dumpManifest
-	var iterateVerifySource func(context.Context, func(int64, *iavl.ChangeSet) error) error
+	var iterateVerifySource func(context.Context, func(int64, []dtypes.AccountStorageDiff) error) error
 	switch effectivePlanSourceMode(manifest) {
 	case planSourceDumpV1:
 		dumpDir, err := requireSealedDumpDirectory(manifest.DumpPath)
@@ -1089,8 +1092,17 @@ func runVerifyWithOptions(
 		if _, err := requireReadOnlySealedDump(manifest.DumpPath, dumpInfo); err != nil {
 			return verifyReport{}, err
 		}
-		iterateVerifySource = func(iterCtx context.Context, callback func(int64, *iavl.ChangeSet) error) error {
-			return iterateSealedDumpContext(iterCtx, manifest.DumpPath, dumpInfo, callback)
+		iterateVerifySource = func(iterCtx context.Context, callback func(int64, []dtypes.AccountStorageDiff) error) error {
+			return iterateSealedDumpContext(iterCtx, manifest.DumpPath, dumpInfo, func(height int64, changeSet *iavl.ChangeSet) error {
+				if height == 1 {
+					return callback(height, nil)
+				}
+				canonical, err := statediff.CanonicalStorageDiff(changeSet)
+				if err != nil {
+					return fmt.Errorf("height %d canonical storage: %w", height, err)
+				}
+				return callback(height, canonical)
+			})
 		}
 	case planSourceDirectV1:
 		directArchive, err = openArchive(manifest.ArchiveIdentity.Home)
@@ -1105,9 +1117,9 @@ func runVerifyWithOptions(
 		if directIdentity != manifest.ArchiveIdentity {
 			return verifyReport{}, fmt.Errorf("direct IAVL archive identity differs from sealed plan")
 		}
-		iterateVerifySource = func(iterCtx context.Context, callback func(int64, *iavl.ChangeSet) error) error {
-			return iterateArchiveDirectStateChangesContext(
-				iterCtx, directArchive, defaultDumpCacheSize,
+		iterateVerifySource = func(iterCtx context.Context, callback func(int64, []dtypes.AccountStorageDiff) error) error {
+			return iterateArchiveDirectStorageDiffsContext(
+				iterCtx, directArchive, defaultDumpCacheSize, defaultDirectIAVLConcurrency,
 				manifest.FirstHeight, manifest.FinalHeight, callback,
 			)
 		}
@@ -1174,16 +1186,12 @@ func runVerifyWithOptions(
 		func(pipelineCtx context.Context, emit func(uint64, verifyTask) error) error {
 			var previousRoot common.Hash
 			var changedSeen uint64
-			err := iterateVerifySource(pipelineCtx, func(height int64, changeSet *iavl.ChangeSet) error {
+			err := iterateVerifySource(pipelineCtx, func(height int64, canonical []dtypes.AccountStorageDiff) error {
 				if height == 1 {
 					return nil
 				}
 				if height < manifest.FirstHeight || height > manifest.FinalHeight {
 					return fmt.Errorf("source height %d is outside manifest range %d-%d", height, manifest.FirstHeight, manifest.FinalHeight)
-				}
-				canonical, err := statediff.CanonicalStorageDiff(changeSet)
-				if err != nil {
-					return fmt.Errorf("height %d canonical storage: %w", height, err)
 				}
 				rootRecord, err := rootStream.Next()
 				if err != nil {
@@ -1227,9 +1235,9 @@ func runVerifyWithOptions(
 				if uint64(height) > cp.Frontier && !checkpointMatched {
 					return fmt.Errorf("verify checkpoint height %d was not found", cp.Frontier)
 				}
-				weight := maxObjectOperationBytes
-				if rootRecord.Root == parent {
-					weight = 1 << 20
+				weight, err := canonicalObjectOperationBytes(canonical, rootRecord.Root == parent)
+				if err != nil {
+					return fmt.Errorf("height %d canonical storage reservation: %w", height, err)
 				}
 				if err := limiter.Acquire(pipelineCtx, weight); err != nil {
 					return err

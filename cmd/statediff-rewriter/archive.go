@@ -49,10 +49,6 @@ func (a *archiveReader) evmStateChangeSource(cacheSize int) stateChangeSource {
 	return iavl.NewImmutableTree(a.evmIAVLDB(), cacheSize, true, log.NewNopLogger())
 }
 
-func (a *archiveReader) evmLegacyLatestVersion() (int64, error) {
-	return legacyLatestRootVersion(a.evmIAVLDB())
-}
-
 func (a *archiveReader) commitInfo(version int64) (*storetypes.CommitInfo, error) {
 	info, err := a.store.GetCommitInfo(version)
 	if err != nil {
