@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -9,7 +10,6 @@ import (
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/rlp"
-
 	dtypes "github.com/evmos/ethermint/debank/types"
 )
 
@@ -34,18 +34,20 @@ type dumpFileManifest struct {
 }
 
 type dumpManifest struct {
-	Schema          string             `json:"schema"`
-	CreatedAt       string             `json:"created_at"`
-	SnapshotID      string             `json:"snapshot_id,omitempty"`
-	ArchiveIdentity archiveIdentity    `json:"archive_identity,omitempty"`
-	CronosCommit    string             `json:"cronos_commit,omitempty"`
-	EthermintCommit string             `json:"ethermint_commit,omitempty"`
-	ImageDigest     string             `json:"image_digest,omitempty"`
-	BuildTags       string             `json:"build_tags,omitempty"`
-	FirstVersion    int64              `json:"first_version"`
-	LastVersion     int64              `json:"last_version"`
-	Records         int64              `json:"records"`
-	Files           []dumpFileManifest `json:"files"`
+	Schema               string             `json:"schema"`
+	CreatedAt            string             `json:"created_at"`
+	SnapshotID           string             `json:"snapshot_id,omitempty"`
+	ArchiveIdentity      archiveIdentity    `json:"archive_identity,omitempty"`
+	CronosCommit         string             `json:"cronos_commit,omitempty"`
+	EthermintCommit      string             `json:"ethermint_commit,omitempty"`
+	IAVLCommit           string             `json:"iavl_commit,omitempty"`
+	ImageDigest          string             `json:"image_digest,omitempty"`
+	BuildTags            string             `json:"build_tags,omitempty"`
+	SourceManifestSHA256 string             `json:"source_manifest_sha256,omitempty"`
+	FirstVersion         int64              `json:"first_version"`
+	LastVersion          int64              `json:"last_version"`
+	Records              int64              `json:"records"`
+	Files                []dumpFileManifest `json:"files"`
 }
 
 type chunkManifest struct {
@@ -59,53 +61,60 @@ type chunkManifest struct {
 }
 
 type planManifest struct {
-	Schema           string          `json:"schema"`
-	Sealed           bool            `json:"sealed"`
-	RunID            string          `json:"run_id"`
-	CreatedAt        string          `json:"created_at"`
-	Bucket           string          `json:"bucket"`
-	Prefix           string          `json:"prefix"`
-	Region           string          `json:"region"`
-	FirstHeight      int64           `json:"first_height"`
-	FinalHeight      int64           `json:"final_height"`
-	CronosCommit     string          `json:"cronos_commit"`
-	EthermintCommit  string          `json:"ethermint_commit"`
-	SnapshotID       string          `json:"snapshot_id"`
-	ImageDigest      string          `json:"image_digest"`
-	BuildTags        string          `json:"build_tags"`
-	DumpPath         string          `json:"dump_path"`
-	DumpManifestHash string          `json:"dump_manifest_sha256"`
-	ArchiveIdentity  archiveIdentity `json:"archive_identity"`
-	Processed        int64           `json:"processed"`
-	Changed          int64           `json:"changed"`
-	ChangedCanonical int64           `json:"changed_noncanonical"`
-	ChangedConflict  int64           `json:"changed_conflicting_old_values"`
-	Unchanged        int64           `json:"unchanged"`
-	SkippedEqualRoot int64           `json:"skipped_equal_root"`
-	SlotsAdded       uint64          `json:"slots_added"`
-	SlotsRemoved     uint64          `json:"slots_removed"`
-	SlotsChanged     uint64          `json:"slots_changed"`
-	OldBytes         int64           `json:"old_bytes"`
-	NewBytes         int64           `json:"new_bytes"`
-	RootIndex        string          `json:"root_index"`
-	RootIndexSHA256  string          `json:"root_index_sha256"`
-	Chunks           []chunkManifest `json:"chunks"`
+	Schema                string          `json:"schema"`
+	Sealed                bool            `json:"sealed"`
+	RunID                 string          `json:"run_id"`
+	CreatedAt             string          `json:"created_at"`
+	Bucket                string          `json:"bucket"`
+	Prefix                string          `json:"prefix"`
+	Region                string          `json:"region"`
+	FirstHeight           int64           `json:"first_height"`
+	FinalHeight           int64           `json:"final_height"`
+	CronosCommit          string          `json:"cronos_commit"`
+	EthermintCommit       string          `json:"ethermint_commit"`
+	IAVLCommit            string          `json:"iavl_commit"`
+	SnapshotID            string          `json:"snapshot_id"`
+	ImageDigest           string          `json:"image_digest"`
+	BuildTags             string          `json:"build_tags"`
+	DumpPath              string          `json:"dump_path"`
+	DumpManifestHash      string          `json:"dump_manifest_sha256"`
+	ArchiveIdentity       archiveIdentity `json:"archive_identity"`
+	Processed             int64           `json:"processed"`
+	Changed               int64           `json:"changed"`
+	ChangedCanonical      int64           `json:"changed_noncanonical"`
+	ChangedConflict       int64           `json:"changed_conflicting_old_values"`
+	Unchanged             int64           `json:"unchanged"`
+	SkippedEqualRoot      int64           `json:"skipped_equal_root"`
+	SlotsAdded            uint64          `json:"slots_added"`
+	SlotsRemoved          uint64          `json:"slots_removed"`
+	SlotsChanged          uint64          `json:"slots_changed"`
+	OldBytes              int64           `json:"old_bytes"`
+	NewBytes              int64           `json:"new_bytes"`
+	HeightRootIndex       string          `json:"height_root_index"`
+	HeightRootIndexSHA256 string          `json:"height_root_index_sha256"`
+	RootIndex             string          `json:"root_index"`
+	RootIndexSHA256       string          `json:"root_index_sha256"`
+	RootMultisetSHA256    string          `json:"root_multiset_sha256"`
+	Chunks                []chunkManifest `json:"chunks"`
 }
 
 type archiveIdentity struct {
-	Home            string `json:"home"`
-	LatestVersion   int64  `json:"latest_version"`
-	FinalCommitHash string `json:"final_commit_hash"`
+	Home             string `json:"home"`
+	DatabaseIdentity string `json:"database_identity"`
+	LatestVersion    int64  `json:"latest_version"`
+	FinalCommitHash  string `json:"final_commit_hash"`
 }
 
 type objectHeaders struct {
-	Metadata           []byte
-	CacheControl       string
-	ContentDisposition string
-	ContentEncoding    string
-	ContentLanguage    string
-	ContentType        string
-	WebsiteRedirect    string
+	Metadata             []byte
+	CacheControl         string
+	ContentDisposition   string
+	ContentEncoding      string
+	ContentLanguage      string
+	ContentType          string
+	WebsiteRedirect      string
+	StorageClass         string
+	ServerSideEncryption string
 }
 
 type packRecord struct {
@@ -155,7 +164,12 @@ type slotStats struct {
 func normalizeStorage(storage []dtypes.AccountStorageDiff) (normalizedStorage, error) {
 	result := normalizedStorage{Values: make(map[storageKey][32]byte)}
 	addresses := make(map[common.Hash]struct{})
+	var previousAddress common.Hash
 	for accountIndex, account := range storage {
+		if accountIndex > 0 && bytes.Compare(previousAddress[:], account.Address[:]) >= 0 {
+			result.Noncanonical = true
+		}
+		previousAddress = account.Address
 		if len(account.Values) == 0 {
 			result.Noncanonical = true
 		}
@@ -163,7 +177,12 @@ func normalizeStorage(storage []dtypes.AccountStorageDiff) (normalizedStorage, e
 			result.Noncanonical = true
 		}
 		addresses[account.Address] = struct{}{}
+		var previousIndex common.Hash
 		for valueIndex, pair := range account.Values {
+			if valueIndex > 0 && bytes.Compare(previousIndex[:], pair.Index[:]) >= 0 {
+				result.Noncanonical = true
+			}
+			previousIndex = pair.Index
 			if pair.Value == nil {
 				return result, fmt.Errorf("storage account %d value %d is nil", accountIndex, valueIndex)
 			}

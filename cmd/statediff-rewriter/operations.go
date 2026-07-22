@@ -2,48 +2,120 @@ package main
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/hex"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
+	"sync/atomic"
+	"time"
 
 	"github.com/cosmos/iavl"
+	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/rlp"
-
 	"github.com/evmos/ethermint/debank/statediff"
 	dtypes "github.com/evmos/ethermint/debank/types"
+	"golang.org/x/sync/errgroup"
+)
+
+const (
+	backupProofSchema = "statediff-rewriter-backup-proof/v1"
+	applyMode         = "apply"
+	rollbackMode      = "rollback"
+	verifyMode        = "verify"
 )
 
 type backupProof struct {
+	Schema         string `json:"schema"`
 	ManifestSHA256 string `json:"manifest_sha256"`
 	Kind           string `json:"kind"`
+	SnapshotID     string `json:"snapshot_id"`
 	Location       string `json:"location"`
 	Status         string `json:"status"`
+	Independent    bool   `json:"independent_restore"`
 }
 
 type writeReport struct {
-	PlannedChanged int64 `json:"planned_changed"`
-	AppliedChanged int64 `json:"applied_changed"`
-	AlreadyTarget  int64 `json:"already_target"`
-	PUTs           int64 `json:"puts"`
+	PlannedChanged      int64   `json:"planned_changed"`
+	AppliedChanged      int64   `json:"applied_changed"`
+	VerifiedThisRun     int64   `json:"verified_this_run"`
+	AlreadyTarget       int64   `json:"already_target"`
+	PUTs                int64   `json:"put_attempts"`
+	ConfirmedPUTs       int64   `json:"confirmed_puts"`
+	UncertainPUTs       int64   `json:"uncertain_puts_verified"`
+	CumulativePUTs      uint64  `json:"cumulative_put_attempts"`
+	CumulativeAlready   uint64  `json:"cumulative_already_target"`
+	CumulativeUncertain uint64  `json:"cumulative_uncertain_puts_verified"`
+	Concurrency         int     `json:"concurrency"`
+	DurationSeconds     float64 `json:"duration_seconds"`
+	ObjectsPerSecond    float64 `json:"objects_per_second"`
 }
 
-func validateBackupProof(path, manifestPath, manifestHash string) error {
+type preparedWrite struct {
+	record       packRecord
+	needsPUT     bool
+	ifMatch      string
+	observedETag string
+}
+
+type writeOutcome struct {
+	ordinal      uint64
+	postETag     string
+	putOutcome   string
+	putAttempted bool
+}
+
+type writeAudit struct {
+	PUTAttempts   uint64
+	ConfirmedPUTs uint64
+	UncertainPUTs uint64
+	AlreadyTarget uint64
+}
+
+type writeMetrics struct {
+	verified      atomic.Int64
+	alreadyTarget atomic.Int64
+	putAttempts   atomic.Int64
+	confirmedPUTs atomic.Int64
+	uncertainPUTs atomic.Int64
+}
+
+func checkedAddUint64(left, right uint64, label string) (uint64, error) {
+	if left > ^uint64(0)-right {
+		return 0, fmt.Errorf("%s overflows uint64", label)
+	}
+	return left + right, nil
+}
+
+func validateBackupProof(ctx context.Context, path, manifestPath, manifestHash, sourceSnapshotID string, activeFilesystem filesystemStatus) error {
+	if err := requireRegularFile(path, "backup proof"); err != nil {
+		return err
+	}
 	body, err := os.ReadFile(path)
 	if err != nil {
 		return err
 	}
 	var proof backupProof
-	if err := json.Unmarshal(body, &proof); err != nil {
+	if err := decodeStrictJSON(body, &proof, "backup proof"); err != nil {
 		return err
 	}
-	if proof.ManifestSHA256 != manifestHash || proof.Kind == "" || proof.Location == "" || proof.Status != "completed" {
+	if proof.Schema != backupProofSchema || proof.ManifestSHA256 != manifestHash || proof.Kind != "ebs-snapshot-restore" ||
+		proof.SnapshotID == "" || proof.SnapshotID == sourceSnapshotID || proof.Location == "" ||
+		proof.Status != "completed" || !proof.Independent {
 		return fmt.Errorf("backup proof is incomplete or belongs to another manifest")
 	}
 	sourceDir, err := filepath.EvalSymlinks(filepath.Dir(manifestPath))
 	if err != nil {
 		return fmt.Errorf("resolve source plan: %w", err)
+	}
+	backupInfo, err := os.Lstat(proof.Location)
+	if err != nil {
+		return fmt.Errorf("stat restored backup: %w", err)
+	}
+	if !backupInfo.IsDir() || backupInfo.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("restored backup location must be a non-symlink directory")
 	}
 	backupDir, err := filepath.EvalSymlinks(proof.Location)
 	if err != nil {
@@ -52,9 +124,22 @@ func validateBackupProof(path, manifestPath, manifestHash string) error {
 	if sourceDir == backupDir {
 		return fmt.Errorf("backup proof points to the active plan directory")
 	}
-	_, backupHash, err := loadPlanManifest(filepath.Join(backupDir, filepath.Base(manifestPath)))
+	backupFilesystem, err := requireReadOnlyFilesystem(backupDir, "restored backup")
+	if err != nil {
+		return err
+	}
+	if backupFilesystem.Device == activeFilesystem.Device {
+		return fmt.Errorf("restored backup and active plan are on the same filesystem device")
+	}
+	if err := requireReadOnlyPlanManifest(backupDir, backupFilesystem); err != nil {
+		return err
+	}
+	backupManifest, backupHash, err := loadPlanManifestContext(ctx, filepath.Join(backupDir, filepath.Base(manifestPath)))
 	if err != nil {
 		return fmt.Errorf("validate restored backup: %w", err)
+	}
+	if err := requireReadOnlyPlanArtifacts(backupDir, backupManifest, backupFilesystem); err != nil {
+		return fmt.Errorf("validate restored backup artifacts: %w", err)
 	}
 	if backupHash != manifestHash {
 		return fmt.Errorf("restored backup manifest differs from active manifest")
@@ -63,73 +148,709 @@ func validateBackupProof(path, manifestPath, manifestHash string) error {
 }
 
 func runWriteMode(ctx context.Context, manifestPath, checkpointPath, backupPath, mode string, objects objectStore) (writeReport, error) {
-	if mode != "apply" && mode != "rollback" {
+	options := defaultParallelOptions()
+	options.Concurrency, options.Window = 1, 1
+	options.CheckpointEvery = 1
+	return runWriteModeWithOptions(ctx, manifestPath, checkpointPath, backupPath, mode, options, objects)
+}
+
+func runWriteModeWithOptions(
+	ctx context.Context,
+	manifestPath, checkpointPath, backupPath, mode string,
+	options parallelOptions,
+	objects objectStore,
+) (writeReport, error) {
+	started := time.Now()
+	if mode != applyMode && mode != rollbackMode {
 		return writeReport{}, fmt.Errorf("unsupported write mode %q", mode)
 	}
-	manifest, manifestHash, err := loadPlanManifest(manifestPath)
+	if err := options.validate(true); err != nil {
+		return writeReport{}, err
+	}
+	planDir, err := requireSealedPlanDirectory(manifestPath)
+	if err != nil {
+		return writeReport{}, err
+	}
+	activeFilesystem, err := requireReadOnlyFilesystem(planDir, "active sealed plan")
+	if err != nil {
+		return writeReport{}, err
+	}
+	if err := requireReadOnlyPlanManifest(planDir, activeFilesystem); err != nil {
+		return writeReport{}, err
+	}
+	manifest, manifestHash, err := loadPlanManifestContext(ctx, manifestPath)
 	if err != nil {
 		return writeReport{}, err
 	}
 	if err := requireFullPlan(manifest, mode); err != nil {
 		return writeReport{}, err
 	}
-	if mode == "apply" {
-		if err := validateBackupProof(backupPath, manifestPath, manifestHash); err != nil {
+	if err := requireRuntimeBuildIdentity(manifest); err != nil {
+		return writeReport{}, err
+	}
+	if err := requireReadOnlyPlanArtifacts(planDir, manifest, activeFilesystem); err != nil {
+		return writeReport{}, err
+	}
+	if mode == applyMode {
+		if err := validateBackupProof(ctx, backupPath, manifestPath, manifestHash, manifest.SnapshotID, activeFilesystem); err != nil {
 			return writeReport{}, fmt.Errorf("apply requires completed independent backup proof: %w", err)
 		}
+	}
+	checkpointPath, err = canonicalFileInExistingDirectory(checkpointPath, mode+" checkpoint")
+	if err != nil {
+		return writeReport{}, err
+	}
+	locks, err := acquireStagingLocks(checkpointPath, filepath.Join(filepath.Dir(checkpointPath), "statediff-rewriter-write"))
+	if err != nil {
+		return writeReport{}, err
+	}
+	defer func() { _ = releaseStagingLocks(locks) }()
+	if err := syncDir(filepath.Dir(checkpointPath)); err != nil {
+		return writeReport{}, fmt.Errorf("sync %s checkpoint directory: %w", mode, err)
 	}
 	cp, err := loadCheckpoint(checkpointPath, manifest.RunID, manifestHash, mode)
 	if err != nil {
 		return writeReport{}, err
 	}
-	report := writeReport{PlannedChanged: manifest.Changed, AppliedChanged: int64(cp.Frontier)}
-	err = iteratePack(filepath.Dir(manifestPath), manifest, func(record packRecord) error {
-		if record.Ordinal <= cp.Frontier {
-			return nil
+	if cp.Frontier > uint64(manifest.Changed) || (cp.Frontier == 0) != (cp.Height == 0) {
+		return writeReport{}, fmt.Errorf("%s checkpoint frontier/height is outside the manifest", mode)
+	}
+	journalPath := writeJournalPath(checkpointPath)
+	journal, journalFound, err := loadWriteJournal(journalPath, manifest.RunID, manifestHash, mode)
+	if err != nil {
+		return writeReport{}, err
+	}
+	if journalFound && (journal.BatchRecords > uint64(options.Window) || journal.BatchBytes > options.MaxInFlightBytes) {
+		return writeReport{}, fmt.Errorf(
+			"%s write journal batch needs window >= %d and max-inflight-bytes >= %d",
+			mode, journal.BatchRecords, journal.BatchBytes,
+		)
+	}
+	if journalFound && journal.End < cp.Frontier {
+		return writeReport{}, fmt.Errorf("%s write journal end %d is behind checkpoint %d", mode, journal.End, cp.Frontier)
+	}
+	if journalFound && journal.End == cp.Frontier {
+		if journal.State != writeJournalObserved {
+			return writeReport{}, fmt.Errorf("%s checkpoint %d crosses unresolved issued journal %d-%d", mode, cp.Frontier, journal.Start, journal.End)
 		}
-		sourceBody, targetBody := record.OldBody, record.NewBody
-		sourceSHA, targetSHA := record.OldSHA256, record.NewSHA256
-		if mode == "rollback" {
-			sourceBody, targetBody = targetBody, sourceBody
-			sourceSHA, targetSHA = targetSHA, sourceSHA
+		if err := removeWriteJournal(journalPath); err != nil {
+			return writeReport{}, err
 		}
-		current, err := objects.Get(ctx, manifest.Bucket, record.Key)
+		journalFound = false
+	}
+	if manifest.Changed > 0 && cp.Frontier == uint64(manifest.Changed) {
+		return writeReport{}, fmt.Errorf("%s checkpoint is already complete; use a new checkpoint to revalidate current S3 state", mode)
+	}
+	if err := validatePlanForWriteContext(ctx, filepath.Dir(manifestPath), manifest); err != nil {
+		return writeReport{}, fmt.Errorf("%s plan preflight: %w", mode, err)
+	}
+	if err := validatePlanTargetsAgainstDumpContext(ctx, filepath.Dir(manifestPath), manifest); err != nil {
+		return writeReport{}, fmt.Errorf("%s dump cross-check: %w", mode, err)
+	}
+	report := writeReport{
+		PlannedChanged: manifest.Changed, AppliedChanged: int64(cp.Frontier), Concurrency: options.Concurrency,
+		CumulativePUTs: cp.PUTAttempts, CumulativeAlready: cp.AlreadyTarget, CumulativeUncertain: cp.UncertainPUTs,
+	}
+	var metrics writeMetrics
+	stream := newPackStream(filepath.Dir(manifestPath), manifest)
+	defer stream.Close()
+	if cp.Frontier > 0 {
+		if objects == nil {
+			objects, err = newS3ObjectStore(ctx, manifest.Region, options.Concurrency)
+			if err != nil {
+				return writeReport{}, err
+			}
+		}
+		if err := validateWriteCheckpointPrefix(ctx, manifest, mode, cp, stream, options, objects, &metrics); err != nil {
+			report.VerifiedThisRun = metrics.verified.Load()
+			report.AlreadyTarget = metrics.alreadyTarget.Load()
+			report.DurationSeconds = time.Since(started).Seconds()
+			return report, err
+		}
+	}
+
+	for {
+		var batch []packRecord
+		if journalFound {
+			if journal.Start != cp.Frontier+1 || journal.End > uint64(manifest.Changed) {
+				return writeReport{}, fmt.Errorf("%s write journal range %d-%d does not follow checkpoint %d", mode, journal.Start, journal.End, cp.Frontier)
+			}
+			batch, err = readWriteBatch(stream, options, journal.End)
+		} else {
+			batch, err = readWriteBatch(stream, options, 0)
+		}
 		if err != nil {
-			return fmt.Errorf("%s get height %d: %w", mode, record.Height, err)
+			return writeReport{}, err
 		}
-		currentSHA := sha256Hash(current.Body)
-		switch currentSHA {
-		case targetSHA:
-			report.AlreadyTarget++
-		case sourceSHA:
-			if mode == "apply" && current.ETag != record.OldETag {
-				return fmt.Errorf("apply height %d old bytes have changed ETag", record.Height)
-			}
-			if err := objects.Put(ctx, manifest.Bucket, record.Key, targetBody, current.ETag, record.Headers); err != nil {
-				observed, getErr := objects.Get(ctx, manifest.Bucket, record.Key)
-				if getErr != nil || sha256Hash(observed.Body) != targetSHA {
-					return fmt.Errorf("%s PUT height %d failed and target is not visible: %w", mode, record.Height, err)
-				}
-			}
-			report.PUTs++
-		default:
-			return fmt.Errorf("%s height %d has third-party content", mode, record.Height)
+		if len(batch) == 0 {
+			break
 		}
-		verified, err := objects.Get(ctx, manifest.Bucket, record.Key)
+		if journalFound && (batch[0].Ordinal != journal.Start || batch[len(batch)-1].Ordinal != journal.End) {
+			return writeReport{}, fmt.Errorf("%s write journal range does not match pack records", mode)
+		}
+		if journalFound {
+			if err := validateRecoveredBatch(journal, batch); err != nil {
+				return writeReport{}, err
+			}
+		}
+		if objects == nil {
+			objects, err = newS3ObjectStore(ctx, manifest.Region, options.Concurrency)
+			if err != nil {
+				return writeReport{}, err
+			}
+		}
+		audit, err := processWriteBatch(ctx, manifest, manifestHash, mode, journalPath, batch, journal, journalFound, options.Concurrency, objects, &metrics)
+		if err != nil {
+			report.VerifiedThisRun = metrics.verified.Load()
+			report.AlreadyTarget = metrics.alreadyTarget.Load()
+			report.PUTs = metrics.putAttempts.Load()
+			report.ConfirmedPUTs = metrics.confirmedPUTs.Load()
+			report.UncertainPUTs = metrics.uncertainPUTs.Load()
+			report.DurationSeconds = time.Since(started).Seconds()
+			return report, err
+		}
+		last := batch[len(batch)-1]
+		cp.Frontier, cp.Height = last.Ordinal, last.Height
+		if cp.PUTAttempts, err = checkedAddUint64(cp.PUTAttempts, audit.PUTAttempts, "checkpoint PUT attempts"); err != nil {
+			return report, err
+		}
+		if cp.ConfirmedPUTs, err = checkedAddUint64(cp.ConfirmedPUTs, audit.ConfirmedPUTs, "checkpoint confirmed PUTs"); err != nil {
+			return report, err
+		}
+		if cp.UncertainPUTs, err = checkedAddUint64(cp.UncertainPUTs, audit.UncertainPUTs, "checkpoint uncertain PUTs"); err != nil {
+			return report, err
+		}
+		if cp.AlreadyTarget, err = checkedAddUint64(cp.AlreadyTarget, audit.AlreadyTarget, "checkpoint already-target count"); err != nil {
+			return report, err
+		}
+		if err := saveCheckpoint(checkpointPath, cp); err != nil {
+			return report, err
+		}
+		if err := removeWriteJournal(journalPath); err != nil {
+			return report, err
+		}
+		report.AppliedChanged = int64(cp.Frontier)
+		report.CumulativePUTs = cp.PUTAttempts
+		report.CumulativeAlready = cp.AlreadyTarget
+		report.CumulativeUncertain = cp.UncertainPUTs
+		journal, journalFound = writeJournal{}, false
+	}
+	report.VerifiedThisRun = metrics.verified.Load()
+	report.AlreadyTarget = metrics.alreadyTarget.Load()
+	report.PUTs = metrics.putAttempts.Load()
+	report.ConfirmedPUTs = metrics.confirmedPUTs.Load()
+	report.UncertainPUTs = metrics.uncertainPUTs.Load()
+	report.DurationSeconds = time.Since(started).Seconds()
+	if report.DurationSeconds > 0 {
+		report.ObjectsPerSecond = float64(report.VerifiedThisRun) / report.DurationSeconds
+	}
+	if report.AppliedChanged != manifest.Changed {
+		return report, fmt.Errorf("%s continuously verified %d records, want %d", mode, report.AppliedChanged, manifest.Changed)
+	}
+	if report.VerifiedThisRun != manifest.Changed {
+		return report, fmt.Errorf("%s verified %d records this run, want %d", mode, report.VerifiedThisRun, manifest.Changed)
+	}
+	return report, nil
+}
+
+func validateWriteCheckpointPrefix(
+	ctx context.Context,
+	manifest planManifest,
+	mode string,
+	cp checkpoint,
+	stream *packStream,
+	options parallelOptions,
+	objects objectStore,
+	metrics *writeMetrics,
+) error {
+	var last packRecord
+	for last.Ordinal < cp.Frontier {
+		batch, err := readWritePrefixBatch(stream, options, cp.Frontier)
 		if err != nil {
 			return err
 		}
-		if err := verifyRecordTarget(record, verified.Body, targetSHA); err != nil {
-			return fmt.Errorf("%s verify height %d: %w", mode, record.Height, err)
+		if len(batch) == 0 {
+			return fmt.Errorf("%s checkpoint ordinal %d was not found", mode, cp.Frontier)
 		}
-		if !reflect.DeepEqual(verified.Headers, record.Headers) {
-			return fmt.Errorf("%s verify height %d: object metadata changed", mode, record.Height)
+		prepared, err := prepareWriteBatch(ctx, manifest, batch, mode, options.Concurrency, objects)
+		if err != nil {
+			return fmt.Errorf("revalidate %s checkpoint prefix: %w", mode, err)
 		}
-		report.AppliedChanged++
-		cp.Frontier, cp.Height = record.Ordinal, record.Height
-		return saveCheckpoint(checkpointPath, cp)
-	})
-	return report, err
+		for _, item := range prepared {
+			if item.needsPUT {
+				return fmt.Errorf("%s checkpoint prefix height %d no longer contains the target content", mode, item.record.Height)
+			}
+		}
+		metrics.verified.Add(int64(len(prepared)))
+		metrics.alreadyTarget.Add(int64(len(prepared)))
+		last = batch[len(batch)-1]
+	}
+	if last.Ordinal != cp.Frontier {
+		return fmt.Errorf("%s checkpoint ordinal %d was not found", mode, cp.Frontier)
+	}
+	if last.Height != cp.Height {
+		return fmt.Errorf("%s checkpoint ordinal %d maps to height %d, not %d", mode, cp.Frontier, last.Height, cp.Height)
+	}
+	return nil
+}
+
+func readWritePrefixBatch(stream *packStream, options parallelOptions, frontier uint64) ([]packRecord, error) {
+	maxRecords := uint64(options.Window)
+	var batch []packRecord
+	var bytes int64
+	for uint64(len(batch)) < maxRecords {
+		record, ok, err := stream.Peek()
+		if err != nil {
+			return nil, err
+		}
+		if !ok || record.Ordinal > frontier {
+			break
+		}
+		weight := estimatedPackRecordBytes(record)
+		if weight > options.MaxInFlightBytes {
+			return nil, fmt.Errorf("pack record %d needs %d in-flight bytes, limit is %d", record.Ordinal, weight, options.MaxInFlightBytes)
+		}
+		if len(batch) > 0 && bytes > options.MaxInFlightBytes-weight {
+			break
+		}
+		record, _, err = stream.Next()
+		if err != nil {
+			return nil, err
+		}
+		batch = append(batch, record)
+		bytes += weight
+		if record.Ordinal == frontier {
+			break
+		}
+	}
+	return batch, nil
+}
+
+func readWriteBatch(stream *packStream, options parallelOptions, forcedEnd uint64) ([]packRecord, error) {
+	maxRecords := uint64(options.Window)
+	if forcedEnd == 0 && options.CheckpointEvery < maxRecords {
+		maxRecords = options.CheckpointEvery
+	}
+	var batch []packRecord
+	var bytes int64
+	for uint64(len(batch)) < maxRecords {
+		record, ok, err := stream.Peek()
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			break
+		}
+		if forcedEnd != 0 && record.Ordinal > forcedEnd {
+			break
+		}
+		weight := estimatedPackRecordBytes(record)
+		if weight > options.MaxInFlightBytes {
+			return nil, fmt.Errorf("pack record %d needs %d in-flight bytes, limit is %d", record.Ordinal, weight, options.MaxInFlightBytes)
+		}
+		if len(batch) > 0 && bytes > options.MaxInFlightBytes-weight {
+			if forcedEnd != 0 {
+				return nil, fmt.Errorf("recovered write journal exceeds max-inflight-bytes %d", options.MaxInFlightBytes)
+			}
+			break
+		}
+		record, _, err = stream.Next()
+		if err != nil {
+			return nil, err
+		}
+		batch = append(batch, record)
+		bytes += weight
+		if forcedEnd != 0 && record.Ordinal == forcedEnd {
+			break
+		}
+	}
+	if forcedEnd != 0 && (len(batch) == 0 || batch[len(batch)-1].Ordinal != forcedEnd) {
+		return nil, fmt.Errorf("write journal end ordinal %d was not found in pack", forcedEnd)
+	}
+	return batch, nil
+}
+
+func validateRecoveredBatch(journal writeJournal, records []packRecord) error {
+	if uint64(len(records)) != journal.BatchRecords {
+		return fmt.Errorf("recovered batch has %d records, journal has %d", len(records), journal.BatchRecords)
+	}
+	var bytes int64
+	for _, record := range records {
+		weight := estimatedPackRecordBytes(record)
+		if weight <= 0 || weight > journal.BatchBytes-bytes {
+			return fmt.Errorf("recovered batch byte count is invalid")
+		}
+		bytes += weight
+	}
+	if bytes != journal.BatchBytes {
+		return fmt.Errorf("recovered batch has %d estimated bytes, journal has %d", bytes, journal.BatchBytes)
+	}
+	return nil
+}
+
+func processWriteBatch(
+	ctx context.Context,
+	manifest planManifest,
+	manifestHash, mode, journalPath string,
+	records []packRecord,
+	existing writeJournal,
+	recovering bool,
+	concurrency int,
+	objects objectStore,
+	metrics *writeMetrics,
+) (writeAudit, error) {
+	prepared, err := prepareWriteBatch(ctx, manifest, records, mode, concurrency, objects)
+	if err != nil {
+		return writeAudit{}, err
+	}
+	journal := existing
+	if recovering {
+		if err := matchJournalToPrepared(journal, prepared, mode); err != nil {
+			return writeAudit{}, err
+		}
+	} else {
+		journal = newIssuedWriteJournal(manifest, manifestHash, mode, prepared)
+		if len(journal.Intents) > 0 {
+			if err := saveWriteJournal(journalPath, journal); err != nil {
+				return writeAudit{}, fmt.Errorf("persist %s write intents: %w", mode, err)
+			}
+		}
+	}
+	outcomes, writeErr := executeWriteBatch(ctx, manifest, prepared, mode, concurrency, objects, metrics)
+	if len(journal.Intents) == 0 {
+		return writeAudit{AlreadyTarget: uint64(len(prepared))}, writeErr
+	}
+	if err := updateJournalOutcomes(&journal, outcomes, mode); err != nil {
+		return writeAudit{}, err
+	}
+	if writeErr == nil && len(journal.Results) == len(journal.Intents) {
+		journal.State = writeJournalObserved
+	} else {
+		journal.State = writeJournalIssued
+	}
+	journalErr := saveWriteJournal(journalPath, journal)
+	if writeErr != nil || journalErr != nil {
+		return writeAudit{}, errors.Join(writeErr, journalErr)
+	}
+	if journal.State != writeJournalObserved {
+		return writeAudit{}, fmt.Errorf("%s batch %d-%d has unresolved write intents", mode, journal.Start, journal.End)
+	}
+	return journalAudit(journal)
+}
+
+func prepareWriteBatch(
+	ctx context.Context,
+	manifest planManifest,
+	records []packRecord,
+	mode string,
+	concurrency int,
+	objects objectStore,
+) ([]preparedWrite, error) {
+	prepared := make([]preparedWrite, len(records))
+	group, groupCtx := errgroup.WithContext(ctx)
+	group.SetLimit(concurrency)
+	for index := range records {
+		group.Go(func() error {
+			item, err := prepareWriteRecord(groupCtx, manifest, records[index], mode, objects)
+			if err != nil {
+				return err
+			}
+			prepared[index] = item
+			return nil
+		})
+	}
+	if err := group.Wait(); err != nil {
+		return nil, err
+	}
+	return prepared, nil
+}
+
+func prepareWriteRecord(
+	ctx context.Context,
+	manifest planManifest,
+	record packRecord,
+	mode string,
+	objects objectStore,
+) (preparedWrite, error) {
+	sourceSHA, targetSHA := record.OldSHA256, record.NewSHA256
+	if mode == rollbackMode {
+		sourceSHA, targetSHA = targetSHA, sourceSHA
+	}
+	current, err := objects.Get(ctx, manifest.Bucket, record.Key)
+	if err != nil {
+		return preparedWrite{}, fmt.Errorf("%s get height %d: %w", mode, record.Height, err)
+	}
+	switch sha256Hash(current.Body) {
+	case targetSHA:
+		if err := verifyStoredRecordTarget(record, current, targetSHA); err != nil {
+			return preparedWrite{}, fmt.Errorf("%s verify existing target height %d: %w", mode, record.Height, err)
+		}
+		return preparedWrite{record: record, observedETag: current.ETag}, nil
+	case sourceSHA:
+		if !reflect.DeepEqual(current.Headers, record.Headers) {
+			return preparedWrite{}, fmt.Errorf("%s height %d source object metadata changed", mode, record.Height)
+		}
+		if mode == applyMode && current.ETag != record.OldETag {
+			return preparedWrite{}, fmt.Errorf("apply height %d old bytes have changed ETag", record.Height)
+		}
+	default:
+		return preparedWrite{}, fmt.Errorf("%s height %d has third-party content", mode, record.Height)
+	}
+	return preparedWrite{record: record, needsPUT: true, ifMatch: current.ETag}, nil
+}
+
+func executeWriteBatch(
+	ctx context.Context,
+	manifest planManifest,
+	prepared []preparedWrite,
+	mode string,
+	concurrency int,
+	objects objectStore,
+	metrics *writeMetrics,
+) ([]writeOutcome, error) {
+	outcomes := make([]writeOutcome, len(prepared))
+	group, groupCtx := errgroup.WithContext(ctx)
+	group.SetLimit(concurrency)
+	for index := range prepared {
+		if !prepared[index].needsPUT {
+			outcomes[index] = writeOutcome{
+				ordinal:  prepared[index].record.Ordinal,
+				postETag: prepared[index].observedETag, putOutcome: writeOutcomeReconciled,
+			}
+			metrics.alreadyTarget.Add(1)
+			metrics.verified.Add(1)
+			continue
+		}
+		group.Go(func() error {
+			outcome, err := executePreparedWrite(groupCtx, manifest, prepared[index], mode, objects, metrics)
+			outcomes[index] = outcome
+			if err != nil {
+				return err
+			}
+			return nil
+		})
+	}
+	return outcomes, group.Wait()
+}
+
+func executePreparedWrite(
+	ctx context.Context,
+	manifest planManifest,
+	prepared preparedWrite,
+	mode string,
+	objects objectStore,
+	metrics *writeMetrics,
+) (writeOutcome, error) {
+	record := prepared.record
+	targetBody, targetSHA := record.NewBody, record.NewSHA256
+	if mode == rollbackMode {
+		targetBody, targetSHA = record.OldBody, record.OldSHA256
+	}
+
+	metrics.putAttempts.Add(1)
+	putErr := objects.Put(ctx, manifest.Bucket, record.Key, targetBody, prepared.ifMatch, record.Headers)
+	if errors.Is(putErr, errObjectConflict) {
+		return writeOutcome{ordinal: record.Ordinal, putAttempted: true}, fmt.Errorf("%s PUT height %d has a conditional conflict: %w", mode, record.Height, putErr)
+	}
+	if putErr == nil {
+		metrics.confirmedPUTs.Add(1)
+	}
+	verified, getErr := objects.Get(ctx, manifest.Bucket, record.Key)
+	if getErr != nil {
+		outcome := ""
+		if putErr == nil {
+			outcome = writeOutcomeConfirmed
+		}
+		return writeOutcome{ordinal: record.Ordinal, putAttempted: true, putOutcome: outcome}, errors.Join(
+			fmt.Errorf("%s verify GET height %d: %w", mode, record.Height, getErr),
+			putErr,
+		)
+	}
+	if err := verifyStoredRecordTarget(record, verified, targetSHA); err != nil {
+		outcome := ""
+		if putErr == nil {
+			outcome = writeOutcomeConfirmed
+		}
+		return writeOutcome{ordinal: record.Ordinal, putAttempted: true, putOutcome: outcome}, errors.Join(
+			fmt.Errorf("%s verify height %d: %w", mode, record.Height, err),
+			putErr,
+		)
+	}
+	if putErr != nil {
+		metrics.uncertainPUTs.Add(1)
+	}
+	metrics.verified.Add(1)
+	outcome := writeOutcomeConfirmed
+	if putErr != nil {
+		outcome = writeOutcomeUncertain
+	}
+	return writeOutcome{
+		ordinal: record.Ordinal, postETag: verified.ETag, putOutcome: outcome, putAttempted: true,
+	}, nil
+}
+
+func newIssuedWriteJournal(manifest planManifest, manifestHash, mode string, prepared []preparedWrite) writeJournal {
+	journal := writeJournal{
+		Schema: writeJournalSchema, RunID: manifest.RunID, ManifestHash: manifestHash, Operation: mode,
+		Start: prepared[0].record.Ordinal, End: prepared[len(prepared)-1].record.Ordinal, State: writeJournalIssued,
+		BatchRecords: uint64(len(prepared)),
+	}
+	for _, item := range prepared {
+		journal.BatchBytes += estimatedPackRecordBytes(item.record)
+		if !item.needsPUT {
+			journal.AlreadyTarget++
+			continue
+		}
+		journal.Intents = append(journal.Intents, writeIntent{
+			Operation: mode, Ordinal: item.record.Ordinal, Height: item.record.Height, Key: item.record.Key,
+			OldSHA256: hex.EncodeToString(item.record.OldSHA256[:]), NewSHA256: hex.EncodeToString(item.record.NewSHA256[:]),
+			IfMatch: item.ifMatch,
+		})
+	}
+	return journal
+}
+
+func matchJournalToPrepared(journal writeJournal, prepared []preparedWrite, mode string) error {
+	byOrdinal := make(map[uint64]writeIntent, len(journal.Intents))
+	for _, intent := range journal.Intents {
+		byOrdinal[intent.Ordinal] = intent
+	}
+	observed := make(map[uint64]struct{}, len(journal.Results))
+	for _, result := range journal.Results {
+		observed[result.Ordinal] = struct{}{}
+	}
+	for _, item := range prepared {
+		intent, found := byOrdinal[item.record.Ordinal]
+		if !found {
+			if item.needsPUT {
+				return fmt.Errorf("%s recovered source height %d has no persisted write intent", mode, item.record.Height)
+			}
+			continue
+		}
+		if intent.Operation != mode || intent.Height != item.record.Height || intent.Key != item.record.Key ||
+			intent.OldSHA256 != hex.EncodeToString(item.record.OldSHA256[:]) ||
+			intent.NewSHA256 != hex.EncodeToString(item.record.NewSHA256[:]) {
+			return fmt.Errorf("%s write intent %d differs from sealed pack", mode, intent.Ordinal)
+		}
+		if item.needsPUT && intent.IfMatch != item.ifMatch {
+			return fmt.Errorf("%s write intent %d If-Match ETag changed during recovery", mode, intent.Ordinal)
+		}
+		if item.needsPUT {
+			if _, found := observed[intent.Ordinal]; found {
+				return fmt.Errorf("%s write intent %d previously observed its target but now sees source content", mode, intent.Ordinal)
+			}
+			if intent.ConfirmedPUTs != 0 || intent.UncertainPUTs != 0 {
+				return fmt.Errorf("%s write intent %d has a persisted PUT outcome but now sees source content", mode, intent.Ordinal)
+			}
+		}
+		delete(byOrdinal, item.record.Ordinal)
+	}
+	if len(byOrdinal) != 0 {
+		return fmt.Errorf("%s write journal contains intents outside recovered batch", mode)
+	}
+	return nil
+}
+
+func updateJournalOutcomes(journal *writeJournal, outcomes []writeOutcome, mode string) error {
+	byOrdinal := make(map[uint64]writeOutcome, len(outcomes))
+	for _, outcome := range outcomes {
+		if outcome.ordinal != 0 {
+			byOrdinal[outcome.ordinal] = outcome
+		}
+	}
+	existing := make(map[uint64]writeObservedResult, len(journal.Results))
+	for _, result := range journal.Results {
+		existing[result.Ordinal] = result
+	}
+	results := make([]writeObservedResult, 0, len(journal.Intents))
+	for index := range journal.Intents {
+		intent := &journal.Intents[index]
+		outcome, found := byOrdinal[intent.Ordinal]
+		if !found {
+			continue
+		}
+		if result, found := existing[intent.Ordinal]; found {
+			results = append(results, result)
+			continue
+		}
+		if outcome.putAttempted {
+			var err error
+			intent.PUTAttempts, err = checkedAddUint64(intent.PUTAttempts, 1, "write intent PUT attempts")
+			if err != nil {
+				return err
+			}
+			switch outcome.putOutcome {
+			case writeOutcomeConfirmed:
+				intent.ConfirmedPUTs, err = checkedAddUint64(intent.ConfirmedPUTs, 1, "write intent confirmed PUTs")
+			case writeOutcomeUncertain:
+				intent.UncertainPUTs, err = checkedAddUint64(intent.UncertainPUTs, 1, "write intent uncertain PUTs")
+			}
+			if err != nil {
+				return err
+			}
+		}
+		if outcome.postETag == "" {
+			continue
+		}
+		resultOutcome := outcome.putOutcome
+		if resultOutcome == writeOutcomeReconciled {
+			switch {
+			case intent.ConfirmedPUTs > 0:
+				resultOutcome = writeOutcomeConfirmed
+			case intent.UncertainPUTs > 0:
+				resultOutcome = writeOutcomeUncertain
+			default:
+				// The intent was durable before the PUT. Seeing its target without a
+				// durable result proves that an earlier attempt may have committed.
+				if intent.PUTAttempts == 0 {
+					intent.PUTAttempts = 1
+				}
+				var err error
+				intent.UncertainPUTs, err = checkedAddUint64(intent.UncertainPUTs, 1, "write intent uncertain PUTs")
+				if err != nil {
+					return err
+				}
+				resultOutcome = writeOutcomeUncertain
+			}
+		}
+		observedSHA := intent.NewSHA256
+		if mode == rollbackMode {
+			observedSHA = intent.OldSHA256
+		}
+		results = append(results, writeObservedResult{
+			Ordinal: intent.Ordinal, ObservedSHA256: observedSHA,
+			PostPUTETag: outcome.postETag, Outcome: resultOutcome,
+		})
+	}
+	journal.Results = results
+	return nil
+}
+
+func journalAudit(journal writeJournal) (writeAudit, error) {
+	audit := writeAudit{AlreadyTarget: journal.AlreadyTarget}
+	for _, intent := range journal.Intents {
+		var err error
+		if audit.PUTAttempts, err = checkedAddUint64(audit.PUTAttempts, intent.PUTAttempts, "journal PUT attempts"); err != nil {
+			return writeAudit{}, err
+		}
+		if audit.ConfirmedPUTs, err = checkedAddUint64(audit.ConfirmedPUTs, intent.ConfirmedPUTs, "journal confirmed PUTs"); err != nil {
+			return writeAudit{}, err
+		}
+		if audit.UncertainPUTs, err = checkedAddUint64(audit.UncertainPUTs, intent.UncertainPUTs, "journal uncertain PUTs"); err != nil {
+			return writeAudit{}, err
+		}
+	}
+	return audit, nil
+}
+
+func verifyStoredRecordTarget(record packRecord, object storedObject, expectedSHA [32]byte) error {
+	if err := verifyRecordTarget(record, object.Body, expectedSHA); err != nil {
+		return err
+	}
+	if !reflect.DeepEqual(object.Headers, record.Headers) {
+		return fmt.Errorf("object metadata changed")
+	}
+	return nil
 }
 
 func verifyRecordTarget(record packRecord, body []byte, expectedSHA [32]byte) error {
@@ -151,151 +872,353 @@ func verifyRecordTarget(record packRecord, body []byte, expectedSHA [32]byte) er
 }
 
 type verifyReport struct {
-	Processed       int64 `json:"processed"`
-	VerifiedChanged int64 `json:"verified_changed"`
-	SkippedEqual    int64 `json:"skipped_equal_root"`
-	SemanticChanges int64 `json:"semantic_changes_remaining"`
+	Processed        int64   `json:"processed"`
+	VerifiedChanged  int64   `json:"verified_changed"`
+	SkippedEqual     int64   `json:"skipped_equal_root"`
+	SemanticChanges  int64   `json:"semantic_changes_remaining"`
+	S3GETs           int64   `json:"s3_gets_this_run"`
+	Concurrency      int     `json:"concurrency"`
+	DurationSeconds  float64 `json:"duration_seconds"`
+	ObjectsPerSecond float64 `json:"objects_per_second"`
+}
+
+type verifyTask struct {
+	height    uint64
+	root      common.Hash
+	parent    common.Hash
+	key       string
+	canonical []dtypes.AccountStorageDiff
+	planned   *packRecord
+	bytes     int64
+}
+
+type verifyOutcome struct {
+	height  uint64
+	changed bool
+	skipped bool
+	got     bool
+	bytes   int64
 }
 
 func runVerify(ctx context.Context, manifestPath, checkpointDir string, objects objectStore) (verifyReport, error) {
-	manifest, manifestHash, err := loadPlanManifest(manifestPath)
+	options := defaultParallelOptions()
+	options.Concurrency, options.Window = 1, 1
+	options.CheckpointEvery = 1
+	return runVerifyWithOptions(ctx, manifestPath, checkpointDir, options, objects)
+}
+
+func runVerifyWithOptions(
+	ctx context.Context,
+	manifestPath, checkpointDir string,
+	options parallelOptions,
+	objects objectStore,
+) (verifyReport, error) {
+	started := time.Now()
+	if err := options.validate(true); err != nil {
+		return verifyReport{}, err
+	}
+	planDir, err := requireSealedPlanDirectory(manifestPath)
+	if err != nil {
+		return verifyReport{}, err
+	}
+	activeFilesystem, err := requireReadOnlyFilesystem(planDir, "active sealed plan")
+	if err != nil {
+		return verifyReport{}, err
+	}
+	if err := requireReadOnlyPlanManifest(planDir, activeFilesystem); err != nil {
+		return verifyReport{}, err
+	}
+	manifest, manifestHash, err := loadPlanManifestContext(ctx, manifestPath)
 	if err != nil {
 		return verifyReport{}, err
 	}
 	if err := requireFullPlan(manifest, "verify"); err != nil {
 		return verifyReport{}, err
 	}
-	report := verifyReport{}
-	changedCheckpoint := filepath.Join(checkpointDir, "verify-changed.json")
-	changedCP, err := loadCheckpoint(changedCheckpoint, manifest.RunID, manifestHash, "verify-changed")
+	if err := requireRuntimeBuildIdentity(manifest); err != nil {
+		return verifyReport{}, err
+	}
+	if err := requireReadOnlyPlanArtifacts(planDir, manifest, activeFilesystem); err != nil {
+		return verifyReport{}, err
+	}
+	dumpDir, err := requireSealedDumpDirectory(manifest.DumpPath)
 	if err != nil {
-		return report, err
+		return verifyReport{}, err
 	}
-	if changedCP.Frontier > uint64(manifest.Changed) || (changedCP.Height != 0 && (changedCP.Height < uint64(manifest.FirstHeight) || changedCP.Height > uint64(manifest.FinalHeight))) {
-		return report, fmt.Errorf("changed checkpoint is outside manifest range")
+	if _, err := requireReadOnlyFilesystem(dumpDir, "sealed dump"); err != nil {
+		return verifyReport{}, err
 	}
-	report.VerifiedChanged = int64(changedCP.Frontier)
-	if err := iteratePack(filepath.Dir(manifestPath), manifest, func(record packRecord) error {
-		if record.Ordinal <= changedCP.Frontier {
-			return nil
-		}
-		object, err := objects.Get(ctx, manifest.Bucket, record.Key)
-		if err != nil {
-			return err
-		}
-		if err := verifyRecordTarget(record, object.Body, record.NewSHA256); err != nil {
-			return fmt.Errorf("verify planned height %d: %w", record.Height, err)
-		}
-		report.VerifiedChanged++
-		changedCP.Frontier, changedCP.Height = record.Ordinal, record.Height
-		return saveCheckpoint(changedCheckpoint, changedCP)
-	}); err != nil {
-		return report, err
-	}
-
-	dumpBody, err := os.ReadFile(filepath.Join(manifest.DumpPath, "dump-manifest.v1.json"))
+	checkpointDir, err = ensureNonSymlinkDirectory(checkpointDir, "verify checkpoint directory")
 	if err != nil {
-		return report, err
+		return verifyReport{}, err
+	}
+	checkpointPath := filepath.Join(checkpointDir, "verify.json")
+	locks, err := acquireStagingLocks(checkpointPath, filepath.Join(checkpointDir, "statediff-rewriter-write"))
+	if err != nil {
+		return verifyReport{}, err
+	}
+	defer func() { _ = releaseStagingLocks(locks) }()
+	dumpBody, err := readRegularFileNoFollow(filepath.Join(dumpDir, "dump-manifest.v1.json"), "sealed dump manifest")
+	if err != nil {
+		return verifyReport{}, err
 	}
 	if sha256Hex(dumpBody) != manifest.DumpManifestHash {
-		return report, fmt.Errorf("dump manifest hash mismatch")
+		return verifyReport{}, fmt.Errorf("dump manifest hash mismatch")
 	}
 	var dumpInfo dumpManifest
-	if err := json.Unmarshal(dumpBody, &dumpInfo); err != nil {
-		return report, err
-	}
-	dumpSchema, dumpFirst := dumpManifestSchema, int64(1)
-	if manifest.Schema == pilotManifestSchema {
-		dumpSchema, dumpFirst = pilotDumpManifestSchema, manifest.FirstHeight
+	if err := decodeStrictJSON(dumpBody, &dumpInfo, "dump manifest"); err != nil {
+		return verifyReport{}, err
 	}
 	if err := validateDumpContext(dumpInfo, dumpContext{
-		Schema: dumpSchema, FirstVersion: dumpFirst, LastVersion: manifest.FinalHeight,
+		Schema: dumpManifestSchema, FirstVersion: 1, LastVersion: manifest.FinalHeight,
 		SnapshotID: manifest.SnapshotID, ArchiveIdentity: manifest.ArchiveIdentity,
 		CronosCommit: manifest.CronosCommit, EthermintCommit: manifest.EthermintCommit,
+		IAVLCommit:  manifest.IAVLCommit,
 		ImageDigest: manifest.ImageDigest, BuildTags: manifest.BuildTags,
 	}); err != nil {
-		return report, err
+		return verifyReport{}, err
 	}
-	archive, err := openArchive(manifest.ArchiveIdentity.Home)
+	if _, err := requireReadOnlySealedDump(manifest.DumpPath, dumpInfo); err != nil {
+		return verifyReport{}, err
+	}
+	cpPath := checkpointPath
+	cp, err := loadCheckpoint(cpPath, manifest.RunID, manifestHash, "verify")
 	if err != nil {
-		return report, err
+		return verifyReport{}, err
 	}
-	defer archive.Close()
-	identity, err := archive.identity()
+	if cp.Frontier == 0 {
+		if cp.Height != 0 || cp.Changed != 0 {
+			return verifyReport{}, fmt.Errorf("verify checkpoint has a non-zero height or changed frontier at zero")
+		}
+	} else if cp.Frontier < uint64(manifest.FirstHeight) || cp.Frontier > uint64(manifest.FinalHeight) ||
+		cp.Height != cp.Frontier || cp.Changed > uint64(manifest.Changed) {
+		return verifyReport{}, fmt.Errorf("verify checkpoint is outside the manifest")
+	}
+	if cp.Frontier == uint64(manifest.FinalHeight) {
+		return verifyReport{}, fmt.Errorf("verify checkpoint is already complete; use a new checkpoint directory to revalidate current S3 state")
+	}
+	if err := validatePlanForWriteContext(ctx, filepath.Dir(manifestPath), manifest); err != nil {
+		return verifyReport{}, fmt.Errorf("verify plan preflight: %w", err)
+	}
+	batcher, err := newCheckpointBatcher(cpPath, cp, options.CheckpointEvery, options.CheckpointInterval)
 	if err != nil {
-		return report, err
+		return verifyReport{}, err
 	}
-	if identity != manifest.ArchiveIdentity {
-		return report, fmt.Errorf("archive identity differs from sealed manifest")
-	}
-	blockCheckpoint := filepath.Join(checkpointDir, "verify-blocks.json")
-	blockCP, err := loadCheckpoint(blockCheckpoint, manifest.RunID, manifestHash, "verify-blocks")
+	limiter, err := newByteLimiter(options.MaxInFlightBytes)
 	if err != nil {
-		return report, err
+		return verifyReport{}, err
 	}
-	if blockCP.Frontier != 0 && (blockCP.Frontier < uint64(manifest.FirstHeight) || blockCP.Frontier > uint64(manifest.FinalHeight)) {
-		return report, fmt.Errorf("block checkpoint is outside manifest range")
+	rootStream, err := newHeightRootStream(filepath.Join(filepath.Dir(manifestPath), manifest.HeightRootIndex), uint64(manifest.FirstHeight))
+	if err != nil {
+		return verifyReport{}, err
 	}
-	if blockCP.Frontier >= uint64(manifest.FirstHeight) {
-		report.Processed = int64(blockCP.Frontier) - manifest.FirstHeight + 1
-	}
-	err = iterateSealedDump(manifest.DumpPath, dumpInfo, func(height int64, changeSet *iavl.ChangeSet) error {
-		if height == 1 && manifest.FirstHeight == 2 {
-			return nil
-		}
-		if height < manifest.FirstHeight || height > manifest.FinalHeight {
-			return fmt.Errorf("dump height %d is outside manifest range %d-%d", height, manifest.FirstHeight, manifest.FinalHeight)
-		}
-		if uint64(height) <= blockCP.Frontier {
-			return nil
-		}
-		canonical, err := statediff.CanonicalStorageDiff(changeSet)
+	defer rootStream.Close()
+	packStream := newPackStream(filepath.Dir(manifestPath), manifest)
+	defer packStream.Close()
+
+	report := verifyReport{Concurrency: options.Concurrency}
+	var semanticChanges atomic.Int64
+	var changedFrontier uint64
+	checkpointMatched := cp.Frontier == 0
+	firstSequence := uint64(manifest.FirstHeight)
+	if objects == nil {
+		objects, err = newS3ObjectStore(ctx, manifest.Region, options.Concurrency)
 		if err != nil {
-			return err
+			return verifyReport{}, err
 		}
-		root, parent, err := archiveRoots(archive, height)
-		if err != nil {
-			return err
-		}
-		if root == parent {
-			if len(canonical) != 0 {
-				return fmt.Errorf("height %d remains undeliverable behind equal-root short circuit", height)
-			}
-			report.SkippedEqual++
-		} else {
-			key := fmt.Sprintf("%s/%s/stateDiff", manifest.Prefix, root.Hex())
-			object, err := objects.Get(ctx, manifest.Bucket, key)
+	}
+	pipelineErr := runOrderedPipeline(ctx, firstSequence, options.Concurrency, options.Window,
+		func(pipelineCtx context.Context, emit func(uint64, verifyTask) error) error {
+			var previousRoot common.Hash
+			var changedSeen uint64
+			err := iterateSealedDumpContext(pipelineCtx, manifest.DumpPath, dumpInfo, func(height int64, changeSet *iavl.ChangeSet) error {
+				if height == 1 {
+					return nil
+				}
+				if height < manifest.FirstHeight || height > manifest.FinalHeight {
+					return fmt.Errorf("dump height %d is outside manifest range %d-%d", height, manifest.FirstHeight, manifest.FinalHeight)
+				}
+				canonical, err := statediff.CanonicalStorageDiff(changeSet)
+				if err != nil {
+					return fmt.Errorf("height %d canonical storage: %w", height, err)
+				}
+				rootRecord, err := rootStream.Next()
+				if err != nil {
+					return err
+				}
+				parent := previousRoot
+				previousRoot = rootRecord.Root
+				key := fmt.Sprintf("%s/%s/stateDiff", manifest.Prefix, strings.ToLower(rootRecord.Root.Hex()))
+				var planned *packRecord
+				record, ok, err := packStream.Peek()
+				if err != nil {
+					return err
+				}
+				if ok && record.Height < uint64(height) {
+					return fmt.Errorf("pack record height %d precedes dump height %d", record.Height, height)
+				}
+				if ok && record.Height == uint64(height) {
+					record, _, err = packStream.Next()
+					if err != nil {
+						return err
+					}
+					if record.Key != key {
+						return fmt.Errorf("pack key %s does not match height %d root", record.Key, height)
+					}
+					planned = &record
+					changedSeen++
+				}
+				if rootRecord.Root == parent {
+					if len(canonical) != 0 || planned != nil {
+						return fmt.Errorf("height %d has changes behind an equal-root short circuit", height)
+					}
+				}
+				if uint64(height) <= cp.Frontier {
+					if uint64(height) == cp.Frontier {
+						if changedSeen != cp.Changed {
+							return fmt.Errorf("verify checkpoint height %d contains %d changed records, not %d", height, changedSeen, cp.Changed)
+						}
+						checkpointMatched = true
+					}
+				}
+				if uint64(height) > cp.Frontier && !checkpointMatched {
+					return fmt.Errorf("verify checkpoint height %d was not found", cp.Frontier)
+				}
+				weight := maxObjectOperationBytes
+				if rootRecord.Root == parent {
+					weight = 1 << 20
+				}
+				if err := limiter.Acquire(pipelineCtx, weight); err != nil {
+					return err
+				}
+				task := verifyTask{
+					height: uint64(height), root: rootRecord.Root, parent: parent, key: key,
+					canonical: canonical, planned: planned, bytes: weight,
+				}
+				if err := emit(uint64(height), task); err != nil {
+					limiter.Release(weight)
+					return err
+				}
+				return nil
+			})
 			if err != nil {
 				return err
 			}
-			var diff dtypes.BlockStorageDiff
-			if err := rlp.DecodeBytes(object.Body, &diff); err != nil {
+			if !checkpointMatched {
+				return fmt.Errorf("verify checkpoint height %d was not found", cp.Frontier)
+			}
+			if err := rootStream.Finish(uint64(manifest.FinalHeight)); err != nil {
 				return err
 			}
-			if diff.Hash != root || diff.ParentHash != parent {
-				return fmt.Errorf("height %d root mismatch", height)
+			if _, ok, err := packStream.Peek(); err != nil {
+				return err
+			} else if ok {
+				return fmt.Errorf("pack has records after final height")
 			}
-			equal, _, _, _, err := compareStorage(diff.StorageDiff, canonical)
+			if int64(changedSeen) != manifest.Changed {
+				return fmt.Errorf("pack merge saw %d changed records, want %d", changedSeen, manifest.Changed)
+			}
+			return nil
+		},
+		func(workerCtx context.Context, task verifyTask) (verifyOutcome, error) {
+			outcome, err := processVerifyTask(workerCtx, manifest.Bucket, task, objects, &semanticChanges)
 			if err != nil {
-				return err
+				limiter.Release(task.bytes)
+				return verifyOutcome{}, err
 			}
-			if !equal {
-				report.SemanticChanges++
-				return fmt.Errorf("height %d storage is not canonical", height)
+			outcome.bytes = task.bytes
+			return outcome, nil
+		},
+		func(_ uint64, outcome verifyOutcome) error {
+			defer limiter.Release(outcome.bytes)
+			report.Processed++
+			if outcome.skipped {
+				report.SkippedEqual++
 			}
-		}
-		report.Processed++
-		blockCP.Frontier, blockCP.Height = uint64(height), uint64(height)
-		return saveCheckpoint(blockCheckpoint, blockCP)
-	})
-	if err != nil {
-		return report, err
+			if outcome.got {
+				report.S3GETs++
+			}
+			if outcome.changed {
+				changedFrontier++
+				report.VerifiedChanged++
+			}
+			if outcome.height <= cp.Frontier {
+				if outcome.height == cp.Frontier && changedFrontier != cp.Changed {
+					return fmt.Errorf("verify checkpoint height %d contains %d changed records, not %d", cp.Frontier, changedFrontier, cp.Changed)
+				}
+				return nil
+			}
+			batcher.checkpoint.Changed = changedFrontier
+			return batcher.Advance(outcome.height, outcome.height)
+		},
+	)
+	flushErr := batcher.Flush()
+	report.SemanticChanges = semanticChanges.Load()
+	report.DurationSeconds = time.Since(started).Seconds()
+	if report.DurationSeconds > 0 {
+		report.ObjectsPerSecond = float64(report.S3GETs) / report.DurationSeconds
 	}
-	if report.VerifiedChanged != manifest.Changed {
+	if pipelineErr != nil || flushErr != nil {
+		return report, errors.Join(pipelineErr, flushErr)
+	}
+	if report.VerifiedChanged != manifest.Changed || changedFrontier != uint64(manifest.Changed) {
 		return report, fmt.Errorf("verified changed %d, want %d", report.VerifiedChanged, manifest.Changed)
 	}
-	if report.Processed != manifest.Processed {
+	if report.Processed != manifest.Processed || report.SkippedEqual != manifest.SkippedEqualRoot {
 		return report, fmt.Errorf("verified blocks %d, want %d", report.Processed, manifest.Processed)
 	}
 	return report, nil
+}
+
+func processVerifyTask(
+	ctx context.Context,
+	bucket string,
+	task verifyTask,
+	objects objectStore,
+	semanticChanges *atomic.Int64,
+) (verifyOutcome, error) {
+	outcome := verifyOutcome{height: task.height, changed: task.planned != nil}
+	if task.root == task.parent {
+		if len(task.canonical) != 0 || task.planned != nil {
+			return verifyOutcome{}, fmt.Errorf("height %d has changes behind an equal-root short circuit", task.height)
+		}
+		outcome.skipped = true
+		return outcome, nil
+	}
+	object, err := objects.Get(ctx, bucket, task.key)
+	if err != nil {
+		return verifyOutcome{}, fmt.Errorf("verify GET height %d: %w", task.height, err)
+	}
+	outcome.got = true
+	var diff dtypes.BlockStorageDiff
+	if err := rlp.DecodeBytes(object.Body, &diff); err != nil {
+		return verifyOutcome{}, fmt.Errorf("verify decode height %d: %w", task.height, err)
+	}
+	if diff.Hash != task.root || diff.ParentHash != task.parent {
+		return verifyOutcome{}, fmt.Errorf("height %d root mismatch", task.height)
+	}
+	equal, _, _, _, err := compareStorage(diff.StorageDiff, task.canonical)
+	if err != nil {
+		return verifyOutcome{}, err
+	}
+	if !equal {
+		semanticChanges.Add(1)
+		return verifyOutcome{}, fmt.Errorf("height %d storage is not canonical", task.height)
+	}
+	if task.planned != nil {
+		if sha256Hash(object.Body) != task.planned.NewSHA256 {
+			return verifyOutcome{}, fmt.Errorf("height %d body SHA-256 mismatch", task.height)
+		}
+		digest, err := retainedDigest(diff)
+		if err != nil {
+			return verifyOutcome{}, err
+		}
+		if digest != task.planned.RetainedSHA256 {
+			return verifyOutcome{}, fmt.Errorf("height %d retained fields changed", task.height)
+		}
+		if !reflect.DeepEqual(object.Headers, task.planned.Headers) {
+			return verifyOutcome{}, fmt.Errorf("height %d object metadata changed", task.height)
+		}
+	}
+	return outcome, nil
 }

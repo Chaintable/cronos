@@ -1,9 +1,12 @@
 package main
 
 import (
+	"bufio"
 	"context"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime/debug"
@@ -11,14 +14,15 @@ import (
 	"syscall"
 	"time"
 
-	storetypes "cosmossdk.io/store/types"
 	"github.com/cosmos/iavl"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/rlp"
-
-	"github.com/cosmos/cosmos-sdk/version"
 	"github.com/evmos/ethermint/debank/statediff"
 	dtypes "github.com/evmos/ethermint/debank/types"
+
+	storetypes "cosmossdk.io/store/types"
+
+	"github.com/cosmos/cosmos-sdk/version"
 )
 
 type planOptions struct {
@@ -34,7 +38,13 @@ type planOptions struct {
 	Pilot            bool
 	PilotFirstHeight int64
 	PilotFinalHeight int64
+	Parallel         parallelOptions
 }
+
+const (
+	planBufferedWriteReserve = uint64(3 << 20)
+	planInitialWriteReserve  = uint64(4 << 20)
+)
 
 type planRange struct {
 	FirstHeight      int64
@@ -42,6 +52,72 @@ type planRange struct {
 	DumpFirstVersion int64
 	ManifestSchema   string
 	DumpSchema       string
+}
+
+type archiveRootCursor struct {
+	reader     commitInfoReader
+	nextHeight int64
+	previous   common.Hash
+	started    bool
+}
+
+func newArchiveRootCursor(reader commitInfoReader, firstHeight int64) (*archiveRootCursor, error) {
+	if firstHeight < 2 {
+		return nil, fmt.Errorf("first block height must be at least 2")
+	}
+	return &archiveRootCursor{reader: reader, nextHeight: firstHeight}, nil
+}
+
+func (cursor *archiveRootCursor) Next(height int64) (common.Hash, common.Hash, error) {
+	if height != cursor.nextHeight {
+		return common.Hash{}, common.Hash{}, fmt.Errorf("root cursor got height %d, want %d", height, cursor.nextHeight)
+	}
+	rootInfo, err := cursor.reader.commitInfo(height - 1)
+	if err != nil {
+		return common.Hash{}, common.Hash{}, err
+	}
+	root := common.BytesToHash(rootInfo.Hash())
+	parent := cursor.previous
+	if !cursor.started && height > 2 {
+		parentInfo, err := cursor.reader.commitInfo(height - 2)
+		if err != nil {
+			return common.Hash{}, common.Hash{}, err
+		}
+		parent = common.BytesToHash(parentInfo.Hash())
+	}
+	cursor.previous = root
+	cursor.nextHeight++
+	cursor.started = true
+	return root, parent, nil
+}
+
+type planTask struct {
+	height    uint64
+	root      common.Hash
+	parent    common.Hash
+	key       string
+	canonical []dtypes.AccountStorageDiff
+	prefixSHA common.Hash
+	bytes     int64
+}
+
+type planOutcome struct {
+	height    uint64
+	root      common.Hash
+	prefixSHA common.Hash
+	skipped   bool
+	changed   bool
+	oldBytes  int64
+	record    packRecord
+	bytes     int64
+}
+
+type planPrefixRecord struct {
+	Previous     common.Hash
+	Height       uint64
+	Root         common.Hash
+	Parent       common.Hash
+	CanonicalSHA common.Hash
 }
 
 func resolvePlanRange(options planOptions, latestVersion int64) (planRange, error) {
@@ -67,6 +143,36 @@ func resolvePlanRange(options planOptions, latestVersion int64) (planRange, erro
 }
 
 func runPlan(ctx context.Context, options planOptions, objects objectStore) (planManifest, string, error) {
+	if err := options.Parallel.validate(true); err != nil {
+		return planManifest{}, "", err
+	}
+	if options.MinFree == 0 {
+		return planManifest{}, "", fmt.Errorf("min-free-bytes must be greater than zero")
+	}
+	output, sealedPlan, err := resolvePlanOutput(options.Output)
+	if err != nil {
+		return planManifest{}, "", err
+	}
+	options.Output = output
+	dumpPath, err := canonicalDumpArgument(options.DumpStaging)
+	if err != nil {
+		return planManifest{}, "", err
+	}
+	options.DumpStaging = dumpPath
+	lockPaths := []string{options.Output}
+	if strings.HasSuffix(options.DumpStaging, ".staging") {
+		lockPaths = append(lockPaths, options.DumpStaging)
+	}
+	locks, err := acquireStagingLocks(lockPaths...)
+	if err != nil {
+		return planManifest{}, "", err
+	}
+	defer func() { _ = releaseStagingLocks(locks) }()
+	if checkedOutput, checkedSealed, err := resolvePlanOutput(options.Output); err != nil {
+		return planManifest{}, "", err
+	} else if checkedOutput != options.Output || checkedSealed != sealedPlan {
+		return planManifest{}, "", fmt.Errorf("plan output identity changed while acquiring its staging lock")
+	}
 	archive, err := openArchive(options.ArchiveHome)
 	if err != nil {
 		return planManifest{}, "", err
@@ -80,108 +186,308 @@ func runPlan(ctx context.Context, options planOptions, objects objectStore) (pla
 	if err != nil {
 		return planManifest{}, "", err
 	}
-	cronosCommit, ethermintCommit := buildCommits()
-	sealedDump, dumpInfo, dumpHash, err := prepareDump(options.DumpStaging, dumpContext{
+	cronosCommit, ethermintCommit, iavlCommit := buildCommits()
+	if err := requireRuntimeBuild(cronosCommit, ethermintCommit, iavlCommit, options.ImageDigest, version.BuildTags); err != nil {
+		return planManifest{}, "", err
+	}
+	sealedDump, dumpInfo, dumpHash, err := prepareDumpContext(ctx, options.DumpStaging, dumpContext{
 		Schema: scope.DumpSchema, FirstVersion: scope.DumpFirstVersion, LastVersion: scope.FinalHeight,
 		SnapshotID: options.SnapshotID, ArchiveIdentity: identity, CronosCommit: cronosCommit,
-		EthermintCommit: ethermintCommit, ImageDigest: options.ImageDigest, BuildTags: version.BuildTags,
+		EthermintCommit: ethermintCommit, IAVLCommit: iavlCommit,
+		ImageDigest: options.ImageDigest, BuildTags: version.BuildTags,
 	})
 	if err != nil {
 		return planManifest{}, "", err
 	}
-	if !strings.HasSuffix(filepath.Clean(options.Output), ".staging") {
-		return planManifest{}, "", fmt.Errorf("plan output must end in .staging")
-	}
-	if err := os.Mkdir(options.Output, 0o755); err != nil {
-		return planManifest{}, "", err
-	}
-	writer, err := newPackWriter(options.Output, chunkSize)
-	if err != nil {
-		return planManifest{}, "", err
-	}
-	rootIndexPath := filepath.Join(options.Output, "roots.raw.tmp")
-	rootIndex, err := os.OpenFile(rootIndexPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
-	if err != nil {
-		return planManifest{}, "", err
-	}
-
-	manifest := planManifest{
-		Schema: scope.ManifestSchema, Sealed: true, RunID: fmt.Sprintf("bugb-%d", time.Now().UTC().UnixNano()),
-		CreatedAt: time.Now().UTC().Format(time.RFC3339Nano), Bucket: options.Bucket, Prefix: strings.TrimSuffix(options.Prefix, "/"), Region: options.Region,
-		FirstHeight: scope.FirstHeight, FinalHeight: scope.FinalHeight, CronosCommit: cronosCommit, EthermintCommit: ethermintCommit,
+	expectedManifest := planManifest{
+		Schema: scope.ManifestSchema, Sealed: true,
+		Bucket: options.Bucket, Prefix: strings.TrimSuffix(options.Prefix, "/"), Region: options.Region,
+		FirstHeight: scope.FirstHeight, FinalHeight: scope.FinalHeight,
+		CronosCommit: cronosCommit, EthermintCommit: ethermintCommit, IAVLCommit: iavlCommit,
 		DumpPath: sealedDump, DumpManifestHash: dumpHash, ArchiveIdentity: identity,
 		SnapshotID: options.SnapshotID, ImageDigest: options.ImageDigest, BuildTags: version.BuildTags,
 	}
-	var ordinal uint64
-	err = iterateSealedDump(sealedDump, dumpInfo, func(height int64, changeSet *iavl.ChangeSet) error {
-		if height == 1 && scope.FirstHeight == 2 {
-			return nil
+	if existing, manifestPath, found, err := reuseSealedPlanContext(ctx, sealedPlan, expectedManifest); err != nil {
+		return planManifest{}, "", err
+	} else if found {
+		return existing, manifestPath, nil
+	}
+	checkpointPath := filepath.Join(options.Output, "plan.checkpoint.json")
+	rootIndexPath := filepath.Join(options.Output, "roots.by-height.tmp")
+	var manifest planManifest
+	var writer *packWriter
+	var rootIndex *os.File
+	var resumeRootFile *os.File
+	var resumeRootReader *bufio.Reader
+	var resumeFrontier uint64
+	var prefixDigest common.Hash
+	var freshOutput bool
+	outputInfo, outputErr := os.Lstat(options.Output)
+	switch {
+	case errors.Is(outputErr, os.ErrNotExist):
+		initialMinimum, addErr := checkedAddUint64(options.MinFree, planInitialWriteReserve, "initial plan free-space requirement")
+		if addErr != nil {
+			return planManifest{}, "", addErr
 		}
-		if height < scope.FirstHeight || height > scope.FinalHeight {
-			return fmt.Errorf("dump height %d is outside plan range %d-%d", height, scope.FirstHeight, scope.FinalHeight)
+		if err := ensureFreeSpace(filepath.Dir(options.Output), initialMinimum); err != nil {
+			return planManifest{}, "", fmt.Errorf("initialize plan staging: %w", err)
 		}
-		if err := ensureFreeSpace(options.Output, options.MinFree); err != nil {
-			return err
-		}
-		canonical, err := statediff.CanonicalStorageDiff(changeSet)
-		if err != nil {
-			return fmt.Errorf("height %d canonical storage: %w", height, err)
-		}
-		root, parent, err := archiveRoots(archive, height)
-		if err != nil {
-			return err
-		}
-		if err := writeRootRecord(rootIndex, root, uint64(height)); err != nil {
-			return err
-		}
-		manifest.Processed++
-		if root == parent {
-			if len(canonical) != 0 {
-				return fmt.Errorf("height %d has storage changes behind an equal-root short circuit", height)
+		if objects == nil {
+			objects, err = newS3ObjectStore(ctx, options.Region, options.Parallel.Concurrency)
+			if err != nil {
+				return planManifest{}, "", err
 			}
-			manifest.SkippedEqualRoot++
-			return nil
 		}
-		key := fmt.Sprintf("%s/%s/stateDiff", manifest.Prefix, strings.ToLower(root.Hex()))
-		object, err := objects.Get(ctx, manifest.Bucket, key)
+		if err := os.Mkdir(options.Output, 0o755); err != nil {
+			return planManifest{}, "", err
+		}
+		freshOutput = true
+		defer func() {
+			if freshOutput {
+				_ = os.RemoveAll(options.Output)
+			}
+		}()
+		now := time.Now().UTC()
+		manifest = expectedManifest
+		manifest.RunID = fmt.Sprintf("bugb-%d", now.UnixNano())
+		manifest.CreatedAt = now.Format(time.RFC3339Nano)
+		writer, err = newPackWriterContext(ctx, options.Output, chunkSize)
 		if err != nil {
-			return fmt.Errorf("get height %d key %s: %w", height, key, err)
+			return planManifest{}, "", err
 		}
-		manifest.OldBytes += int64(len(object.Body))
-		record, changed, err := makePackRecord(uint64(height), key, object, root, parent, canonical)
+		rootIndex, err = os.OpenFile(rootIndexPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 		if err != nil {
-			return fmt.Errorf("analyze height %d: %w", height, err)
+			_ = writer.Abort()
+			return planManifest{}, "", err
 		}
-		if !changed {
-			manifest.Unchanged++
-			return nil
+	case outputErr == nil:
+		if !outputInfo.IsDir() || outputInfo.Mode()&os.ModeSymlink != 0 {
+			return planManifest{}, "", fmt.Errorf("plan staging must be a non-symlink directory: %s", options.Output)
 		}
-		ordinal++
-		record.Ordinal = ordinal
-		if err := writer.Write(record); err != nil {
-			return err
+		if err := requireRegularFile(checkpointPath, "plan checkpoint"); err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return planManifest{}, "", fmt.Errorf("plan staging directory exists without a resumable checkpoint: %s", options.Output)
+			}
+			return planManifest{}, "", err
 		}
-		manifest.Changed++
-		manifest.SlotsAdded += record.SlotsAdded
-		manifest.SlotsRemoved += record.SlotsRemoved
-		manifest.SlotsChanged += record.SlotsChanged
-		manifest.NewBytes += int64(len(record.NewBody))
-		if record.NoncanonicalOld {
-			manifest.ChangedCanonical++
+		checkpoint, found, loadErr := loadPlanCheckpoint(checkpointPath, expectedManifest)
+		if loadErr != nil {
+			return planManifest{}, "", loadErr
 		}
-		if record.ConflictingOld {
-			manifest.ChangedConflict++
+		if !found {
+			return planManifest{}, "", fmt.Errorf("plan staging directory exists without a resumable checkpoint: %s", options.Output)
 		}
-		return nil
-	})
+		manifest = checkpoint.Manifest
+		resumeFrontier = checkpoint.Frontier
+		prefixBytes, decodeErr := hex.DecodeString(checkpoint.PrefixSHA)
+		if decodeErr != nil || len(prefixBytes) != common.HashLength {
+			return planManifest{}, "", fmt.Errorf("decode plan checkpoint prefix hash")
+		}
+		copy(prefixDigest[:], prefixBytes)
+		rootIndexPath, err = restorePlanRootIndex(options.Output, checkpoint.RootBytes)
+		if err != nil {
+			return planManifest{}, "", err
+		}
+		resumeRootFile, err = os.Open(rootIndexPath)
+		if err != nil {
+			return planManifest{}, "", err
+		}
+		resumeRootReader = bufio.NewReaderSize(resumeRootFile, 1<<20)
+		writer, err = resumePackWriterContext(ctx, options.Output, chunkSize, checkpoint.Pack, manifest)
+		if err != nil {
+			_ = resumeRootFile.Close()
+			return planManifest{}, "", err
+		}
+		rootIndex, err = os.OpenFile(rootIndexPath, os.O_WRONLY|os.O_APPEND|syscall.O_NOFOLLOW, 0o600)
+		if err != nil {
+			_ = writer.Abort()
+			_ = resumeRootFile.Close()
+			return planManifest{}, "", err
+		}
+	default:
+		return planManifest{}, "", outputErr
+	}
+	writerOpen := true
+	defer func() {
+		if writerOpen {
+			_ = writer.Abort()
+		}
+	}()
+	rootOpen := true
+	defer func() {
+		if rootOpen {
+			_ = rootIndex.Close()
+		}
+		if resumeRootFile != nil {
+			_ = resumeRootFile.Close()
+		}
+	}()
+	rootBuffer := bufio.NewWriterSize(rootIndex, 1<<20)
+	rootCursor, err := newArchiveRootCursor(archive, scope.FirstHeight)
 	if err != nil {
 		_ = rootIndex.Close()
 		return planManifest{}, "", err
+	}
+	limiter, err := newByteLimiter(options.Parallel.MaxInFlightBytes)
+	if err != nil {
+		_ = rootIndex.Close()
+		return planManifest{}, "", err
+	}
+	saver, err := newPlanCheckpointSaver(
+		checkpointPath, rootBuffer, rootIndex, writer, options.MinFree,
+		options.Parallel.CheckpointEvery, options.Parallel.CheckpointInterval,
+	)
+	if err != nil {
+		return planManifest{}, "", err
+	}
+	saver.prefixSHA = prefixDigest
+	if freshOutput {
+		if err := saver.Initialize(manifest); err != nil {
+			return planManifest{}, "", fmt.Errorf("persist initial plan checkpoint: %w", err)
+		}
+		freshOutput = false
+	}
+	if objects == nil {
+		objects, err = newS3ObjectStore(ctx, manifest.Region, options.Parallel.Concurrency)
+		if err != nil {
+			return planManifest{}, "", err
+		}
+	}
+	ordinal := uint64(manifest.Changed)
+	firstSequence := uint64(scope.FirstHeight)
+	if resumeFrontier != 0 {
+		firstSequence = resumeFrontier + 1
+	}
+	rootCheckpointMatched := resumeFrontier == 0
+	err = runOrderedPipeline(ctx, firstSequence, options.Parallel.Concurrency, options.Parallel.Window,
+		func(pipelineCtx context.Context, emit func(uint64, planTask) error) error {
+			rollingDigest := common.Hash{}
+			scanErr := iterateSealedDumpContext(pipelineCtx, sealedDump, dumpInfo, func(height int64, changeSet *iavl.ChangeSet) error {
+				if height == 1 && scope.FirstHeight == 2 {
+					return nil
+				}
+				if height < scope.FirstHeight || height > scope.FinalHeight {
+					return fmt.Errorf("dump height %d is outside plan range %d-%d", height, scope.FirstHeight, scope.FinalHeight)
+				}
+				canonical, err := statediff.CanonicalStorageDiff(changeSet)
+				if err != nil {
+					return fmt.Errorf("height %d canonical storage: %w", height, err)
+				}
+				root, parent, err := rootCursor.Next(height)
+				if err != nil {
+					return err
+				}
+				if root == parent && len(canonical) != 0 {
+					return fmt.Errorf("height %d has storage changes behind an equal-root short circuit", height)
+				}
+				rollingDigest, err = extendPlanPrefixDigest(rollingDigest, uint64(height), root, parent, canonical)
+				if err != nil {
+					return fmt.Errorf("hash plan dump prefix at height %d: %w", height, err)
+				}
+				if uint64(height) <= resumeFrontier {
+					record, err := readRootRecord(resumeRootReader)
+					if err != nil {
+						return fmt.Errorf("read resumable root height %d: %w", height, err)
+					}
+					if record.Height != uint64(height) || record.Root != root {
+						return fmt.Errorf("resumable root index differs at height %d", height)
+					}
+					if uint64(height) == resumeFrontier {
+						if rollingDigest != prefixDigest {
+							return fmt.Errorf("plan checkpoint prefix differs from current dump at height %d", resumeFrontier)
+						}
+						rootCheckpointMatched = true
+					}
+					return nil
+				}
+				if uint64(height) > resumeFrontier && !rootCheckpointMatched {
+					return fmt.Errorf("plan checkpoint height %d was not found", resumeFrontier)
+				}
+				weight := maxObjectOperationBytes
+				if root == parent {
+					weight = 1 << 20
+				}
+				if err := limiter.Acquire(pipelineCtx, weight); err != nil {
+					return err
+				}
+				task := planTask{
+					height: uint64(height), root: root, parent: parent,
+					key:       fmt.Sprintf("%s/%s/stateDiff", manifest.Prefix, strings.ToLower(root.Hex())),
+					canonical: canonical, prefixSHA: rollingDigest, bytes: weight,
+				}
+				if err := emit(uint64(height), task); err != nil {
+					limiter.Release(weight)
+					return err
+				}
+				return nil
+			})
+			if scanErr != nil {
+				return scanErr
+			}
+			if !rootCheckpointMatched {
+				return fmt.Errorf("plan checkpoint height %d was not found", resumeFrontier)
+			}
+			if resumeRootReader != nil {
+				if _, err := resumeRootReader.Peek(1); !errors.Is(err, io.EOF) {
+					if err == nil {
+						return fmt.Errorf("resumable root index has records after checkpoint height %d", resumeFrontier)
+					}
+					return err
+				}
+			}
+			return nil
+		},
+		func(workerCtx context.Context, task planTask) (planOutcome, error) {
+			outcome, err := processPlanTask(workerCtx, manifest.Bucket, task, objects)
+			if err != nil {
+				limiter.Release(task.bytes)
+				return planOutcome{}, err
+			}
+			outcome.bytes = task.bytes
+			return outcome, nil
+		},
+		func(_ uint64, outcome planOutcome) error {
+			defer limiter.Release(outcome.bytes)
+			writeReserve := planBufferedWriteReserve + uint64(rootRecordSize)
+			if outcome.changed {
+				recordBytes := estimatedPackRecordBytes(outcome.record)
+				if recordBytes <= 0 || uint64(recordBytes) > ^uint64(0)-writeReserve {
+					return fmt.Errorf("plan record write reservation overflows uint64")
+				}
+				writeReserve += uint64(recordBytes)
+			}
+			if options.MinFree > ^uint64(0)-writeReserve {
+				return fmt.Errorf("plan free-space requirement overflows uint64")
+			}
+			if err := ensureFreeSpace(options.Output, options.MinFree+writeReserve); err != nil {
+				return err
+			}
+			if err := writeRootRecord(rootBuffer, outcome.root, outcome.height); err != nil {
+				return err
+			}
+			if outcome.changed {
+				ordinal++
+				outcome.record.Ordinal = ordinal
+				if err := writer.Write(outcome.record); err != nil {
+					return err
+				}
+			}
+			accumulatePlanOutcome(&manifest, outcome)
+			return saver.Advance(outcome.height, manifest, outcome.prefixSHA)
+		},
+	)
+	flushErr := saver.Flush()
+	if err != nil || flushErr != nil {
+		return planManifest{}, "", errors.Join(err, flushErr)
 	}
 	expectedProcessed := scope.FinalHeight - scope.FirstHeight + 1
 	if manifest.Processed != expectedProcessed {
 		_ = rootIndex.Close()
 		return planManifest{}, "", fmt.Errorf("processed %d heights, want %d", manifest.Processed, expectedProcessed)
+	}
+	if err := rootBuffer.Flush(); err != nil {
+		_ = rootIndex.Close()
+		return planManifest{}, "", err
 	}
 	if err := rootIndex.Sync(); err != nil {
 		_ = rootIndex.Close()
@@ -190,21 +496,60 @@ func runPlan(ctx context.Context, options planOptions, objects objectStore) (pla
 	if err := rootIndex.Close(); err != nil {
 		return planManifest{}, "", err
 	}
-	rootStat, err := os.Stat(rootIndexPath)
+	rootOpen = false
+	if resumeRootFile != nil {
+		if err := resumeRootFile.Close(); err != nil {
+			return planManifest{}, "", err
+		}
+		resumeRootFile = nil
+	}
+	heightRootName := "roots.by-height"
+	heightRootPath := filepath.Join(options.Output, heightRootName)
+	if err := commitFileNoReplace(rootIndexPath, heightRootPath); err != nil {
+		return planManifest{}, "", err
+	}
+	manifest.HeightRootIndex = heightRootName
+	manifest.HeightRootIndexSHA256, _, err = hashFileContext(ctx, heightRootPath)
 	if err != nil {
 		return planManifest{}, "", err
 	}
-	if err := ensureFreeSpace(options.Output, options.MinFree+uint64(rootStat.Size())*2); err != nil {
+	rootStat, err := os.Stat(heightRootPath)
+	if err != nil {
+		return planManifest{}, "", err
+	}
+	if rootStat.Size() < 0 || uint64(rootStat.Size()) > ^uint64(0)/2 {
+		return planManifest{}, "", fmt.Errorf("root index external sort reservation overflows uint64")
+	}
+	sortReserver, err := newFreeSpaceReserver(options.Output, options.MinFree)
+	if err != nil {
+		return planManifest{}, "", err
+	}
+	releaseSort, err := sortReserver.reserve(uint64(rootStat.Size()) * 2)
+	if err != nil {
 		return planManifest{}, "", fmt.Errorf("root index external sort: %w", err)
 	}
-	manifest.RootIndex, manifest.RootIndexSHA256, err = checkDuplicateRoots(rootIndexPath, options.Output)
+	manifest.RootIndex, manifest.RootIndexSHA256, err = checkDuplicateRootsContext(ctx, heightRootPath, options.Output)
+	releaseSort()
 	if err != nil {
 		return planManifest{}, "", err
 	}
+	heightMultiset, heightCount, err := rootMultisetSHA256Context(ctx, heightRootPath)
+	if err != nil {
+		return planManifest{}, "", err
+	}
+	sortedMultiset, sortedCount, err := rootMultisetSHA256Context(ctx, filepath.Join(options.Output, manifest.RootIndex))
+	if err != nil {
+		return planManifest{}, "", err
+	}
+	if heightCount != manifest.Processed || sortedCount != manifest.Processed || heightMultiset != sortedMultiset {
+		return planManifest{}, "", fmt.Errorf("root indexes do not contain the same multiset")
+	}
+	manifest.RootMultisetSHA256 = heightMultiset
 	manifest.Chunks, err = writer.Close()
 	if err != nil {
 		return planManifest{}, "", err
 	}
+	writerOpen = false
 	finalIdentity, err := archive.identity()
 	if err != nil {
 		return planManifest{}, "", err
@@ -212,13 +557,19 @@ func runPlan(ctx context.Context, options planOptions, objects objectStore) (pla
 	if finalIdentity != identity {
 		return planManifest{}, "", fmt.Errorf("archive identity changed during plan")
 	}
-	body, err := atomicJSON(filepath.Join(options.Output, "manifest.v1.json"), manifest)
-	if err != nil {
+	if err := validateSealedDumpManifest(sealedDump, dumpInfo, dumpHash); err != nil {
 		return planManifest{}, "", err
 	}
-	manifestHash := sha256Hex(body)
-	sealedPlan := strings.TrimSuffix(filepath.Clean(options.Output), ".staging") + ".sealed"
-	if _, err := os.Stat(sealedPlan); err == nil {
+	if err := validateSealedDumpArtifactsContext(ctx, sealedDump, dumpInfo); err != nil {
+		return planManifest{}, "", fmt.Errorf("sealed dump changed during plan: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return planManifest{}, "", err
+	}
+	if _, err := atomicJSONWithMinFree(filepath.Join(options.Output, "manifest.v1.json"), manifest, options.MinFree); err != nil {
+		return planManifest{}, "", err
+	}
+	if _, err := os.Lstat(sealedPlan); err == nil {
 		return planManifest{}, "", fmt.Errorf("sealed plan already exists: %s", sealedPlan)
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return planManifest{}, "", err
@@ -226,13 +577,163 @@ func runPlan(ctx context.Context, options planOptions, objects objectStore) (pla
 	if err := syncDir(options.Output); err != nil {
 		return planManifest{}, "", err
 	}
-	if err := os.Rename(options.Output, sealedPlan); err != nil {
+	if err := ctx.Err(); err != nil {
+		return planManifest{}, "", err
+	}
+	if err := renameNoReplace(options.Output, sealedPlan); err != nil {
 		return planManifest{}, "", err
 	}
 	if err := syncDir(filepath.Dir(sealedPlan)); err != nil {
 		return planManifest{}, "", err
 	}
-	return manifest, filepath.Join(sealedPlan, "manifest.v1.json") + "#sha256=" + manifestHash, nil
+	return manifest, filepath.Join(sealedPlan, "manifest.v1.json"), nil
+}
+
+func reuseSealedPlanContext(ctx context.Context, sealedPath string, expected planManifest) (planManifest, string, bool, error) {
+	if ctx == nil {
+		return planManifest{}, "", false, fmt.Errorf("reuse sealed plan context is required")
+	}
+	if _, err := os.Lstat(sealedPath); errors.Is(err, os.ErrNotExist) {
+		return planManifest{}, "", false, nil
+	} else if err != nil {
+		return planManifest{}, "", false, err
+	}
+	manifestPath := filepath.Join(sealedPath, "manifest.v1.json")
+	manifest, _, err := loadPlanManifestContext(ctx, manifestPath)
+	if err != nil {
+		return planManifest{}, "", false, fmt.Errorf("validate existing sealed plan: %w", err)
+	}
+	if !samePlanIdentity(manifest, expected) {
+		return planManifest{}, "", false, fmt.Errorf("existing sealed plan identity differs from this run")
+	}
+	return manifest, manifestPath, true, nil
+}
+
+func resolvePlanOutput(path string) (string, string, error) {
+	path = filepath.Clean(path)
+	if !strings.HasSuffix(path, ".staging") {
+		return "", "", fmt.Errorf("plan output must end in .staging")
+	}
+	absolute, err := filepath.Abs(path)
+	if err != nil {
+		return "", "", err
+	}
+	parent, err := filepath.EvalSymlinks(filepath.Dir(absolute))
+	if err != nil {
+		return "", "", fmt.Errorf("resolve plan output parent: %w", err)
+	}
+	staging := filepath.Join(parent, filepath.Base(absolute))
+	sealed := strings.TrimSuffix(staging, ".staging") + ".sealed"
+	sealedInfo, sealedErr := os.Lstat(sealed)
+	if sealedErr != nil && !errors.Is(sealedErr, os.ErrNotExist) {
+		return "", "", sealedErr
+	}
+	stagingInfo, stagingErr := os.Lstat(staging)
+	if stagingErr != nil && !errors.Is(stagingErr, os.ErrNotExist) {
+		return "", "", stagingErr
+	}
+	if sealedErr == nil && stagingErr == nil {
+		return "", "", fmt.Errorf("both staging and sealed plans exist: %s and %s", staging, sealed)
+	}
+	if sealedErr == nil && (!sealedInfo.IsDir() || sealedInfo.Mode()&os.ModeSymlink != 0) {
+		return "", "", fmt.Errorf("sealed plan must be a non-symlink directory: %s", sealed)
+	}
+	if stagingErr == nil {
+		if !stagingInfo.IsDir() || stagingInfo.Mode()&os.ModeSymlink != 0 {
+			return "", "", fmt.Errorf("plan staging must be a non-symlink directory: %s", staging)
+		}
+		checkpointPath := filepath.Join(staging, "plan.checkpoint.json")
+		if err := requireRegularFile(checkpointPath, "plan checkpoint"); err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return "", "", fmt.Errorf("plan staging directory exists without a resumable checkpoint: %s", staging)
+			}
+			return "", "", err
+		}
+	}
+	return staging, sealed, nil
+}
+
+func canonicalDumpArgument(path string) (string, error) {
+	path = filepath.Clean(path)
+	if !strings.HasSuffix(path, ".staging") && !strings.HasSuffix(path, ".sealed") {
+		return "", fmt.Errorf("dump path must end in .staging or .sealed")
+	}
+	absolute, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	parent, err := filepath.EvalSymlinks(filepath.Dir(absolute))
+	if err != nil {
+		return "", fmt.Errorf("resolve dump parent: %w", err)
+	}
+	return filepath.Join(parent, filepath.Base(absolute)), nil
+}
+
+func processPlanTask(ctx context.Context, bucket string, task planTask, objects objectStore) (planOutcome, error) {
+	outcome := planOutcome{height: task.height, root: task.root, prefixSHA: task.prefixSHA}
+	if task.root == task.parent {
+		if len(task.canonical) != 0 {
+			return planOutcome{}, fmt.Errorf("height %d has storage changes behind an equal-root short circuit", task.height)
+		}
+		outcome.skipped = true
+		return outcome, nil
+	}
+	object, err := objects.Get(ctx, bucket, task.key)
+	if err != nil {
+		return planOutcome{}, fmt.Errorf("get height %d key %s: %w", task.height, task.key, err)
+	}
+	record, changed, err := makePackRecord(task.height, task.key, object, task.root, task.parent, task.canonical)
+	if err != nil {
+		return planOutcome{}, fmt.Errorf("analyze height %d: %w", task.height, err)
+	}
+	outcome.changed = changed
+	outcome.oldBytes = int64(len(object.Body))
+	outcome.record = record
+	return outcome, nil
+}
+
+func extendPlanPrefixDigest(
+	previous common.Hash,
+	height uint64,
+	root, parent common.Hash,
+	canonical []dtypes.AccountStorageDiff,
+) (common.Hash, error) {
+	canonicalBody, err := rlp.EncodeToBytes(canonical)
+	if err != nil {
+		return common.Hash{}, err
+	}
+	record := planPrefixRecord{
+		Previous: previous, Height: height, Root: root, Parent: parent, CanonicalSHA: sha256Hash(canonicalBody),
+	}
+	body, err := rlp.EncodeToBytes(record)
+	if err != nil {
+		return common.Hash{}, err
+	}
+	return sha256Hash(body), nil
+}
+
+func accumulatePlanOutcome(manifest *planManifest, outcome planOutcome) {
+	manifest.Processed++
+	if outcome.skipped {
+		manifest.SkippedEqualRoot++
+		return
+	}
+	manifest.OldBytes += outcome.oldBytes
+	if !outcome.changed {
+		manifest.Unchanged++
+		return
+	}
+	manifest.Changed++
+	manifest.SlotsAdded += outcome.record.SlotsAdded
+	manifest.SlotsRemoved += outcome.record.SlotsRemoved
+	manifest.SlotsChanged += outcome.record.SlotsChanged
+	manifest.NewBytes += int64(len(outcome.record.NewBody))
+	if outcome.record.NoncanonicalOld {
+		manifest.ChangedCanonical++
+	}
+	if outcome.record.ConflictingOld {
+		manifest.ChangedConflict++
+	}
 }
 
 func makePackRecord(height uint64, key string, object storedObject, root, parent common.Hash, canonical []dtypes.AccountStorageDiff) (packRecord, bool, error) {
@@ -250,13 +751,14 @@ func makePackRecord(height uint64, key string, object storedObject, root, parent
 	if equal {
 		return packRecord{}, false, nil
 	}
-	newDiff := old
-	newDiff.StorageDiff = canonical
-	newBody, err := rlp.EncodeToBytes(newDiff)
+	newBody, err := replaceStorageDiffRLP(object.Body, canonical)
 	if err != nil {
 		return packRecord{}, false, err
 	}
 	if err := verifyReencoded(old, canonical, newBody); err != nil {
+		return packRecord{}, false, err
+	}
+	if err := verifyRawRetainedFields(object.Body, newBody); err != nil {
 		return packRecord{}, false, err
 	}
 	retained, err := retainedDigest(old)
@@ -321,20 +823,19 @@ func ensureFreeSpace(path string, minimum uint64) error {
 	if minimum == 0 {
 		return fmt.Errorf("min-free-bytes must be greater than zero")
 	}
-	var stat syscall.Statfs_t
-	if err := syscall.Statfs(path, &stat); err != nil {
+	available, _, err := filesystemSpace(path)
+	if err != nil {
 		return err
 	}
-	available := stat.Bavail * uint64(stat.Bsize)
 	if available < minimum {
 		return fmt.Errorf("filesystem free space %d is below min-free-bytes %d", available, minimum)
 	}
 	return nil
 }
 
-func buildCommits() (string, string) {
+func buildCommits() (string, string, string) {
 	cronosCommit := version.Commit
-	ethermintCommit := "unknown"
+	ethermintCommit, iavlCommit := unknownBuildIdentity, unknownBuildIdentity
 	if info, ok := debug.ReadBuildInfo(); ok {
 		for _, setting := range info.Settings {
 			if setting.Key == "vcs.revision" && cronosCommit == "" {
@@ -342,16 +843,31 @@ func buildCommits() (string, string) {
 			}
 		}
 		for _, dependency := range info.Deps {
-			if dependency.Path == "github.com/evmos/ethermint" && dependency.Replace != nil {
-				parts := strings.Split(dependency.Replace.Version, "-")
-				if len(parts) > 0 {
-					ethermintCommit = parts[len(parts)-1]
-				}
+			switch dependency.Path {
+			case "github.com/evmos/ethermint":
+				ethermintCommit = moduleVersionCommit(dependency)
+			case "github.com/cosmos/iavl":
+				iavlCommit = moduleVersionCommit(dependency)
 			}
 		}
 	}
 	if cronosCommit == "" {
-		cronosCommit = "unknown"
+		cronosCommit = unknownBuildIdentity
 	}
-	return cronosCommit, ethermintCommit
+	return cronosCommit, ethermintCommit, iavlCommit
+}
+
+func moduleVersionCommit(dependency *debug.Module) string {
+	if dependency == nil {
+		return unknownBuildIdentity
+	}
+	version := dependency.Version
+	if dependency.Replace != nil {
+		version = dependency.Replace.Version
+	}
+	parts := strings.Split(version, "-")
+	if len(parts) < 3 || parts[len(parts)-1] == "" {
+		return unknownBuildIdentity
+	}
+	return parts[len(parts)-1]
 }

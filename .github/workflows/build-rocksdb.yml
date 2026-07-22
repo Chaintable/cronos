@@ -41,11 +41,18 @@ jobs:
           file: Dockerfile.statediff-rewriter
           context: .
           push: false
+          load: true
           platforms: linux/amd64
           tags: cronos-statediff-rewriter:pr-${{ github.event.pull_request.number }}
           build-args: |
             GIT_COMMIT=${{ github.sha }}
           provenance: false
+      - name: Verify rewriter runtime and provenance
+        run: |
+          image="cronos-statediff-rewriter:pr-${{ github.event.pull_request.number }}"
+          test "$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' "${image}")" = "${{ github.sha }}"
+          test "$(docker run --rm "${image}" --version)" = "${{ github.sha }}"
+          docker run --rm "${image}" --help
 
   build-rocksdb:
     strategy:

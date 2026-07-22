@@ -15,9 +15,12 @@ WORKDIR /code
 COPY . /code/
 ARG GIT_COMMIT
 RUN test -n "${GIT_COMMIT}" && \
-    GOPRIVATE='github.com/Chaintable/*' make build-statediff-rewriter COSMOS_BUILD_OPTIONS=rocksdb COMMIT="${GIT_COMMIT}"
+    GOPRIVATE='github.com/Chaintable/*' make build-statediff-rewriter COMMIT="${GIT_COMMIT}"
 
 FROM ubuntu:22.04
+
+ARG GIT_COMMIT
+LABEL org.opencontainers.image.revision="${GIT_COMMIT}"
 
 RUN apt-get update && \
     apt-get install -y libsnappy1v5 libgflags2.2 zlib1g libbz2-1.0 liblz4-1 libzstd1 ca-certificates && \

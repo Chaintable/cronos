@@ -93,13 +93,16 @@ build_tags_comma_sep := $(subst $(whitespace),$(comma),$(build_tags))
 ldflags += -X github.com/cosmos/cosmos-sdk/version.Name=cronos \
 	-X github.com/cosmos/cosmos-sdk/version.AppName=cronosd \
 	-X github.com/cosmos/cosmos-sdk/version.Version=$(VERSION) \
-	-X github.com/cosmos/cosmos-sdk/version.Commit=$(COMMIT) \
-	-X github.com/cosmos/cosmos-sdk/version.BuildTags=$(build_tags_comma_sep)
+	-X github.com/cosmos/cosmos-sdk/version.Commit=$(COMMIT)
 
-BUILD_FLAGS := -tags "$(build_tags)" -ldflags '$(ldflags)'
+BUILD_FLAGS := -tags "$(build_tags)" -ldflags '$(ldflags) -X github.com/cosmos/cosmos-sdk/version.BuildTags=$(build_tags_comma_sep)'
+statediff_rewriter_build_tags := $(strip $(filter-out rocksdb grocksdb_clean_link,$(build_tags)) rocksdb grocksdb_clean_link)
+statediff_rewriter_build_tags_comma_sep := $(subst $(whitespace),$(comma),$(statediff_rewriter_build_tags))
+STATEDIFF_REWRITER_BUILD_FLAGS := -tags "$(statediff_rewriter_build_tags)" -ldflags '$(ldflags) -X github.com/cosmos/cosmos-sdk/version.BuildTags=$(statediff_rewriter_build_tags_comma_sep)'
 # check for nostrip option
 ifeq (,$(findstring nostrip,$(COSMOS_BUILD_OPTIONS)))
   BUILD_FLAGS += -trimpath
+  STATEDIFF_REWRITER_BUILD_FLAGS += -trimpath
 endif
 
 all: build
@@ -107,7 +110,7 @@ build: check-network print-ledger go.sum
 	@go build -mod=readonly $(BUILD_FLAGS) -o $(BUILDDIR)/cronosd ./cmd/cronosd
 
 build-statediff-rewriter: check-network go.sum
-	@go build -mod=readonly $(BUILD_FLAGS) -o $(BUILDDIR)/statediff-rewriter ./cmd/statediff-rewriter
+	@CGO_ENABLED=1 go build -mod=readonly $(STATEDIFF_REWRITER_BUILD_FLAGS) -o $(BUILDDIR)/statediff-rewriter ./cmd/statediff-rewriter
 
 install: check-network print-ledger go.sum
 	@go install -mod=readonly $(BUILD_FLAGS) ./cmd/cronosd

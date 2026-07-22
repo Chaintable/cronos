@@ -2,14 +2,17 @@ package main
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+
+	dbm "github.com/cosmos/cosmos-db"
+	"github.com/crypto-org-chain/cronos/cmd/cronosd/opendb"
 
 	"cosmossdk.io/log"
 	"cosmossdk.io/store/metrics"
 	"cosmossdk.io/store/rootmulti"
 	storetypes "cosmossdk.io/store/types"
-	dbm "github.com/cosmos/cosmos-db"
-
-	"github.com/crypto-org-chain/cronos/cmd/cronosd/opendb"
 )
 
 type archiveReader struct {
@@ -21,6 +24,10 @@ type archiveReader struct {
 func openArchive(home string) (*archiveReader, error) {
 	if !rocksDBBuild {
 		return nil, fmt.Errorf("statediff-rewriter requires build tags rocksdb and grocksdb_clean_link")
+	}
+	databasePath := filepath.Join(home, "data", "application.db")
+	if _, err := requireReadOnlyFilesystem(databasePath, "archive database"); err != nil {
+		return nil, err
 	}
 	db, err := opendb.OpenReadOnlyDB(home, dbm.RocksDBBackend)
 	if err != nil {
@@ -43,12 +50,32 @@ func (a *archiveReader) commitInfo(version int64) (*storetypes.CommitInfo, error
 }
 
 func (a *archiveReader) identity() (archiveIdentity, error) {
+	databaseIdentity, err := readRocksDBIdentity(a.home)
+	if err != nil {
+		return archiveIdentity{}, err
+	}
 	latest := rootmulti.GetLatestVersion(a.db)
 	info, err := a.commitInfo(latest)
 	if err != nil {
 		return archiveIdentity{}, err
 	}
-	return archiveIdentity{Home: a.home, LatestVersion: latest, FinalCommitHash: commonHash(info.Hash())}, nil
+	return archiveIdentity{
+		Home: a.home, DatabaseIdentity: databaseIdentity,
+		LatestVersion: latest, FinalCommitHash: commonHash(info.Hash()),
+	}, nil
+}
+
+func readRocksDBIdentity(home string) (string, error) {
+	path := filepath.Join(home, "data", "application.db", "IDENTITY")
+	body, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("read RocksDB identity %s: %w", path, err)
+	}
+	fields := strings.Fields(string(body))
+	if len(fields) != 1 {
+		return "", fmt.Errorf("RocksDB identity %s must contain exactly one value", path)
+	}
+	return fields[0], nil
 }
 
 func commonHash(body []byte) string {

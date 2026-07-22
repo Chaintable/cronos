@@ -4,17 +4,19 @@ import (
 	"bufio"
 	"bytes"
 	"compress/zlib"
+	"context"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/cosmos/iavl"
@@ -30,16 +32,22 @@ const maxChangeSetPayload = uint64(256 << 20)
 
 type countingWriter struct{ n int64 }
 
+type contextReader struct {
+	ctx    context.Context
+	reader *bufio.Reader
+}
+
 type dumpContext struct {
-	Schema          string
-	FirstVersion    int64
-	LastVersion     int64
-	SnapshotID      string
-	ArchiveIdentity archiveIdentity
-	CronosCommit    string
-	EthermintCommit string
-	ImageDigest     string
-	BuildTags       string
+	Schema          string          `json:"dump_schema"`
+	FirstVersion    int64           `json:"first_version"`
+	LastVersion     int64           `json:"last_version"`
+	SnapshotID      string          `json:"snapshot_id"`
+	ArchiveIdentity archiveIdentity `json:"archive_identity"`
+	CronosCommit    string          `json:"cronos_commit"`
+	EthermintCommit string          `json:"ethermint_commit"`
+	IAVLCommit      string          `json:"iavl_commit"`
+	ImageDigest     string          `json:"image_digest"`
+	BuildTags       string          `json:"build_tags"`
 }
 
 func (w *countingWriter) Write(body []byte) (int, error) {
@@ -47,8 +55,29 @@ func (w *countingWriter) Write(body []byte) (int, error) {
 	return len(body), nil
 }
 
+func (reader contextReader) Read(body []byte) (int, error) {
+	if err := reader.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return reader.reader.Read(body)
+}
+
+func (reader contextReader) ReadByte() (byte, error) {
+	if err := reader.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return reader.reader.ReadByte()
+}
+
 func scanZlibChangeSets(path string, fn func(int64, *iavl.ChangeSet) error) (dumpFileManifest, error) {
-	file, err := os.Open(path)
+	return scanZlibChangeSetsContext(context.Background(), path, fn)
+}
+
+func scanZlibChangeSetsContext(ctx context.Context, path string, fn func(int64, *iavl.ChangeSet) error) (dumpFileManifest, error) {
+	if ctx == nil {
+		return dumpFileManifest{}, fmt.Errorf("scan changesets context is required")
+	}
+	file, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
 	if err != nil {
 		return dumpFileManifest{}, err
 	}
@@ -57,11 +86,14 @@ func scanZlibChangeSets(path string, fn func(int64, *iavl.ChangeSet) error) (dum
 	if err != nil {
 		return dumpFileManifest{}, err
 	}
+	if !stat.Mode().IsRegular() {
+		return dumpFileManifest{}, fmt.Errorf("changeset dump must be a regular non-symlink file: %s", path)
+	}
 
 	hasher := sha256.New()
 	counter := &countingWriter{}
 	compressed := bufio.NewReader(io.TeeReader(file, io.MultiWriter(hasher, counter)))
-	zreader, err := zlib.NewReader(compressed)
+	zreader, err := zlib.NewReader(contextReader{ctx: ctx, reader: compressed})
 	if err != nil {
 		return dumpFileManifest{}, fmt.Errorf("open zlib %s: %w", path, err)
 	}
@@ -72,6 +104,10 @@ func scanZlibChangeSets(path string, fn func(int64, *iavl.ChangeSet) error) (dum
 
 	var first, last, records int64
 	for {
+		if err := ctx.Err(); err != nil {
+			_ = zreader.Close()
+			return dumpFileManifest{}, err
+		}
 		_, peekErr := reader.Peek(1)
 		if errors.Is(peekErr, io.EOF) {
 			break
@@ -174,9 +210,89 @@ func readChangeSet(reader *bufio.Reader) (int64, *iavl.ChangeSet, error) {
 	return version, changeSet, nil
 }
 
+func writeChangeSet(writer io.Writer, version int64, changeSet *iavl.ChangeSet) error {
+	var payloadSize uint64
+	for _, pair := range changeSet.Pairs {
+		if pair == nil {
+			return fmt.Errorf("nil changeset pair")
+		}
+		pairSize := uint64(1 + uvarintLength(uint64(len(pair.Key))) + len(pair.Key))
+		if !pair.Delete {
+			pairSize += uint64(uvarintLength(uint64(len(pair.Value))) + len(pair.Value))
+		}
+		if pairSize > maxChangeSetPayload-payloadSize {
+			return fmt.Errorf("changeset payload exceeds limit %d", maxChangeSetPayload)
+		}
+		payloadSize += pairSize
+	}
+
+	var header [16]byte
+	binary.LittleEndian.PutUint64(header[:8], uint64(version))
+	binary.LittleEndian.PutUint64(header[8:], payloadSize)
+	if err := writeBytes(writer, header[:]); err != nil {
+		return err
+	}
+	var scratch [binary.MaxVarintLen64]byte
+	for _, pair := range changeSet.Pairs {
+		deletion := byte(0)
+		if pair.Delete {
+			deletion = 1
+		}
+		if err := writeBytes(writer, []byte{deletion}); err != nil {
+			return err
+		}
+		n := binary.PutUvarint(scratch[:], uint64(len(pair.Key)))
+		if err := writeBytes(writer, scratch[:n]); err != nil {
+			return err
+		}
+		if err := writeBytes(writer, pair.Key); err != nil {
+			return err
+		}
+		if pair.Delete {
+			continue
+		}
+		n = binary.PutUvarint(scratch[:], uint64(len(pair.Value)))
+		if err := writeBytes(writer, scratch[:n]); err != nil {
+			return err
+		}
+		if err := writeBytes(writer, pair.Value); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func uvarintLength(value uint64) int {
+	var scratch [binary.MaxVarintLen64]byte
+	return binary.PutUvarint(scratch[:], value)
+}
+
+func writeBytes(writer io.Writer, body []byte) error {
+	for len(body) > 0 {
+		written, err := writer.Write(body)
+		if err != nil {
+			return err
+		}
+		if written == 0 {
+			return io.ErrShortWrite
+		}
+		body = body[written:]
+	}
+	return nil
+}
+
 func sealDump(stagingPath string, contexts ...dumpContext) (string, dumpManifest, string, error) {
-	if !strings.HasSuffix(filepath.Clean(stagingPath), ".staging") {
-		return "", dumpManifest{}, "", fmt.Errorf("dump path must end in .staging")
+	return sealDumpContext(context.Background(), stagingPath, contexts...)
+}
+
+func sealDumpContext(ctx context.Context, stagingPath string, contexts ...dumpContext) (string, dumpManifest, string, error) {
+	if ctx == nil {
+		return "", dumpManifest{}, "", fmt.Errorf("seal dump context is required")
+	}
+	var err error
+	stagingPath, err = requireDumpDirectory(stagingPath, ".staging", "dump staging")
+	if err != nil {
+		return "", dumpManifest{}, "", err
 	}
 	files, err := filepath.Glob(filepath.Join(stagingPath, "evm", "*.zz"))
 	if err != nil {
@@ -192,13 +308,32 @@ func sealDump(stagingPath string, contexts ...dumpContext) (string, dumpManifest
 	}
 	if len(contexts) == 1 {
 		context := contexts[0]
+		sourcePath := filepath.Join(stagingPath, dumpSourceFileName)
+		if err := requireRegularFile(sourcePath, "dump source manifest"); err != nil {
+			return "", dumpManifest{}, "", err
+		}
+		source, sourceHash, found, err := loadDumpSource(sourcePath)
+		if err != nil {
+			return "", dumpManifest{}, "", err
+		}
+		if !found {
+			return "", dumpManifest{}, "", fmt.Errorf("execution dump staging has no source manifest")
+		}
+		if source.Context != context {
+			return "", dumpManifest{}, "", fmt.Errorf("dump source identity differs from plan")
+		}
 		manifest.Schema = context.Schema
 		manifest.SnapshotID, manifest.ArchiveIdentity = context.SnapshotID, context.ArchiveIdentity
 		manifest.CronosCommit, manifest.EthermintCommit = context.CronosCommit, context.EthermintCommit
+		manifest.IAVLCommit = context.IAVLCommit
 		manifest.ImageDigest, manifest.BuildTags = context.ImageDigest, context.BuildTags
+		manifest.SourceManifestSHA256 = sourceHash
 	}
 	for _, path := range files {
-		entry, err := scanZlibChangeSets(path, func(version int64, changeSet *iavl.ChangeSet) error {
+		if err := requireRegularFile(path, "dump staging file"); err != nil {
+			return "", dumpManifest{}, "", err
+		}
+		entry, err := scanZlibChangeSetsContext(ctx, path, func(version int64, changeSet *iavl.ChangeSet) error {
 			if version != 1 {
 				return nil
 			}
@@ -247,13 +382,19 @@ func sealDump(stagingPath string, contexts ...dumpContext) (string, dumpManifest
 			return "", dumpManifest{}, "", err
 		}
 	}
+	if err := ctx.Err(); err != nil {
+		return "", dumpManifest{}, "", err
+	}
 
 	body, err := atomicJSON(filepath.Join(stagingPath, "dump-manifest.v1.json"), manifest)
 	if err != nil {
 		return "", dumpManifest{}, "", err
 	}
+	if err := validateDumpArtifactSet(stagingPath, manifest); err != nil {
+		return "", dumpManifest{}, "", err
+	}
 	sealedPath := strings.TrimSuffix(filepath.Clean(stagingPath), ".staging") + ".sealed"
-	if _, err := os.Stat(sealedPath); err == nil {
+	if _, err := os.Lstat(sealedPath); err == nil {
 		return "", dumpManifest{}, "", fmt.Errorf("sealed dump already exists: %s", sealedPath)
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return "", dumpManifest{}, "", err
@@ -261,7 +402,10 @@ func sealDump(stagingPath string, contexts ...dumpContext) (string, dumpManifest
 	if err := syncDir(stagingPath); err != nil {
 		return "", dumpManifest{}, "", err
 	}
-	if err := os.Rename(stagingPath, sealedPath); err != nil {
+	if err := ctx.Err(); err != nil {
+		return "", dumpManifest{}, "", err
+	}
+	if err := renameNoReplace(stagingPath, sealedPath); err != nil {
 		return "", dumpManifest{}, "", err
 	}
 	if err := syncDir(filepath.Dir(sealedPath)); err != nil {
@@ -270,36 +414,99 @@ func sealDump(stagingPath string, contexts ...dumpContext) (string, dumpManifest
 	return sealedPath, manifest, sha256Hex(body), nil
 }
 
-func prepareDump(path string, context dumpContext) (string, dumpManifest, string, error) {
+func prepareDump(path string, expected dumpContext) (string, dumpManifest, string, error) {
+	return prepareDumpContext(context.Background(), path, expected)
+}
+
+func prepareDumpContext(ctx context.Context, path string, expected dumpContext) (string, dumpManifest, string, error) {
+	if ctx == nil {
+		return "", dumpManifest{}, "", fmt.Errorf("prepare dump context is required")
+	}
 	cleanPath := filepath.Clean(path)
 	if strings.HasSuffix(cleanPath, ".staging") {
-		return sealDump(cleanPath, context)
+		sealedPath := strings.TrimSuffix(cleanPath, ".staging") + ".sealed"
+		_, stagingErr := os.Lstat(cleanPath)
+		_, sealedErr := os.Lstat(sealedPath)
+		if stagingErr != nil && !errors.Is(stagingErr, os.ErrNotExist) {
+			return "", dumpManifest{}, "", fmt.Errorf("stat staging dump %s: %w", cleanPath, stagingErr)
+		}
+		if sealedErr != nil && !errors.Is(sealedErr, os.ErrNotExist) {
+			return "", dumpManifest{}, "", fmt.Errorf("stat sealed dump %s: %w", sealedPath, sealedErr)
+		}
+		switch {
+		case stagingErr == nil && sealedErr == nil:
+			return "", dumpManifest{}, "", fmt.Errorf("both staging and sealed dumps exist: %s and %s", cleanPath, sealedPath)
+		case stagingErr == nil:
+			return sealDumpContext(ctx, cleanPath, expected)
+		case sealedErr == nil:
+			cleanPath = sealedPath
+		default:
+			return "", dumpManifest{}, "", fmt.Errorf("dump does not exist: %s or %s", cleanPath, sealedPath)
+		}
 	}
 	if !strings.HasSuffix(cleanPath, ".sealed") {
 		return "", dumpManifest{}, "", fmt.Errorf("dump path must end in .staging or .sealed")
 	}
-	body, err := os.ReadFile(filepath.Join(cleanPath, "dump-manifest.v1.json"))
+	cleanPath, err := requireSealedDumpDirectory(cleanPath)
+	if err != nil {
+		return "", dumpManifest{}, "", err
+	}
+	body, err := readRegularFileNoFollow(filepath.Join(cleanPath, "dump-manifest.v1.json"), "sealed dump manifest")
 	if err != nil {
 		return "", dumpManifest{}, "", err
 	}
 	var manifest dumpManifest
-	if err := json.Unmarshal(body, &manifest); err != nil {
+	if err := decodeStrictJSON(body, &manifest, "dump manifest"); err != nil {
 		return "", dumpManifest{}, "", err
 	}
-	if err := validateDumpContext(manifest, context); err != nil {
+	if err := validateDumpContext(manifest, expected); err != nil {
 		return "", dumpManifest{}, "", err
 	}
-	if err := iterateSealedDump(cleanPath, manifest, func(int64, *iavl.ChangeSet) error { return nil }); err != nil {
+	if err := validateDumpArtifactSet(cleanPath, manifest); err != nil {
+		return "", dumpManifest{}, "", err
+	}
+	if err := iterateSealedDumpContext(ctx, cleanPath, manifest, func(int64, *iavl.ChangeSet) error { return nil }); err != nil {
 		return "", dumpManifest{}, "", err
 	}
 	return cleanPath, manifest, sha256Hex(body), nil
 }
 
 func iterateSealedDump(path string, manifest dumpManifest, fn func(int64, *iavl.ChangeSet) error) error {
+	return iterateSealedDumpContext(context.Background(), path, manifest, fn)
+}
+
+func iterateSealedDumpContext(ctx context.Context, path string, manifest dumpManifest, fn func(int64, *iavl.ChangeSet) error) error {
+	if ctx == nil {
+		return fmt.Errorf("iterate sealed dump context is required")
+	}
+	path, err := requireSealedDumpDirectory(path)
+	if err != nil {
+		return err
+	}
+	if err := validateDumpArtifactSet(path, manifest); err != nil {
+		return err
+	}
+	if manifest.SourceManifestSHA256 != "" {
+		sourcePath := filepath.Join(path, dumpSourceFileName)
+		if err := requireRegularFile(sourcePath, "sealed dump source manifest"); err != nil {
+			return err
+		}
+		_, sourceHash, found, err := loadDumpSource(sourcePath)
+		if err != nil {
+			return err
+		}
+		if !found || sourceHash != manifest.SourceManifestSHA256 {
+			return fmt.Errorf("sealed dump source manifest changed")
+		}
+	}
 	expected := manifest.FirstVersion
 	var records int64
 	for _, file := range manifest.Files {
-		entry, err := scanZlibChangeSets(filepath.Join(path, file.Path), func(version int64, changeSet *iavl.ChangeSet) error {
+		filePath, err := requireDumpArtifact(path, file.Path)
+		if err != nil {
+			return err
+		}
+		entry, err := scanZlibChangeSetsContext(ctx, filePath, func(version int64, changeSet *iavl.ChangeSet) error {
 			if version != expected {
 				return fmt.Errorf("dump version %d, want %d", version, expected)
 			}
@@ -324,21 +531,168 @@ func iterateSealedDump(path string, manifest dumpManifest, fn func(int64, *iavl.
 	return nil
 }
 
+func validateSealedDumpArtifactsContext(ctx context.Context, path string, manifest dumpManifest) error {
+	if ctx == nil {
+		return fmt.Errorf("validate sealed dump context is required")
+	}
+	path, err := requireSealedDumpDirectory(path)
+	if err != nil {
+		return err
+	}
+	if manifest.FirstVersion < 1 || manifest.LastVersion < manifest.FirstVersion ||
+		manifest.Records != manifest.LastVersion-manifest.FirstVersion+1 {
+		return fmt.Errorf("sealed dump range or record count is invalid")
+	}
+	if err := validateDumpArtifactSet(path, manifest); err != nil {
+		return err
+	}
+	if manifest.SourceManifestSHA256 != "" {
+		sourcePath := filepath.Join(path, dumpSourceFileName)
+		if err := requireRegularFile(sourcePath, "sealed dump source manifest"); err != nil {
+			return err
+		}
+		_, sourceHash, found, err := loadDumpSource(sourcePath)
+		if err != nil {
+			return err
+		}
+		if !found || sourceHash != manifest.SourceManifestSHA256 {
+			return fmt.Errorf("sealed dump source manifest changed")
+		}
+	}
+	seen := make(map[string]struct{}, len(manifest.Files))
+	expected := manifest.FirstVersion
+	var records int64
+	for _, file := range manifest.Files {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if _, found := seen[file.Path]; found {
+			return fmt.Errorf("duplicate sealed dump file %q", file.Path)
+		}
+		seen[file.Path] = struct{}{}
+		filePath, err := requireDumpArtifact(path, file.Path)
+		if err != nil {
+			return err
+		}
+		if file.FirstVersion != expected || file.LastVersion < file.FirstVersion ||
+			file.Records != file.LastVersion-file.FirstVersion+1 || file.Size < 1 || !validSHA256Hex(file.SHA256) {
+			return fmt.Errorf("sealed dump file metadata is invalid: %s", file.Path)
+		}
+		hash, size, err := hashFileContext(ctx, filePath)
+		if err != nil {
+			return err
+		}
+		if hash != file.SHA256 || size != file.Size {
+			return fmt.Errorf("sealed dump file changed: %s", file.Path)
+		}
+		if file.Records > manifest.Records-records {
+			return fmt.Errorf("sealed dump file records exceed manifest: %s", file.Path)
+		}
+		expected = file.LastVersion + 1
+		records += file.Records
+	}
+	if len(manifest.Files) == 0 || expected != manifest.LastVersion+1 || records != manifest.Records ||
+		records != manifest.LastVersion-manifest.FirstVersion+1 {
+		return fmt.Errorf("sealed dump file coverage differs from manifest")
+	}
+	return nil
+}
+
+func validateDumpArtifactSet(path string, manifest dumpManifest) error {
+	rootEntries, err := os.ReadDir(path)
+	if err != nil {
+		return err
+	}
+	allowedRoot := map[string]struct{}{"evm": {}, "dump-manifest.v1.json": {}}
+	if manifest.SourceManifestSHA256 != "" {
+		allowedRoot[dumpSourceFileName] = struct{}{}
+	}
+	for _, entry := range rootEntries {
+		if _, ok := allowedRoot[entry.Name()]; !ok {
+			return fmt.Errorf("unexpected dump artifact: %s", entry.Name())
+		}
+	}
+	wantFiles := make(map[string]struct{}, len(manifest.Files))
+	for _, file := range manifest.Files {
+		if _, err := requireDumpArtifact(path, file.Path); err != nil {
+			return err
+		}
+		if _, found := wantFiles[file.Path]; found {
+			return fmt.Errorf("duplicate dump file %q", file.Path)
+		}
+		wantFiles[file.Path] = struct{}{}
+	}
+	evmEntries, err := os.ReadDir(filepath.Join(path, "evm"))
+	if err != nil {
+		return err
+	}
+	if len(evmEntries) != len(wantFiles) {
+		return fmt.Errorf("dump EVM artifact set differs from manifest")
+	}
+	for _, entry := range evmEntries {
+		name := filepath.Join("evm", entry.Name())
+		if _, ok := wantFiles[name]; !ok {
+			return fmt.Errorf("unexpected dump EVM artifact: %s", entry.Name())
+		}
+		if err := requireRegularFile(filepath.Join(path, name), "dump EVM artifact"); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateSealedDumpManifest(path string, expected dumpManifest, expectedHash string) error {
+	body, err := readRegularFileNoFollow(filepath.Join(path, "dump-manifest.v1.json"), "sealed dump manifest")
+	if err != nil {
+		return err
+	}
+	if sha256Hex(body) != expectedHash {
+		return fmt.Errorf("sealed dump manifest changed")
+	}
+	var current dumpManifest
+	if err := decodeStrictJSON(body, &current, "dump manifest"); err != nil {
+		return err
+	}
+	if !reflect.DeepEqual(current, expected) {
+		return fmt.Errorf("sealed dump manifest identity changed")
+	}
+	return nil
+}
+
 func validateDumpContext(manifest dumpManifest, context dumpContext) error {
-	if context.Schema != dumpManifestSchema && context.Schema != pilotDumpManifestSchema {
-		return fmt.Errorf("unsupported dump schema %q", context.Schema)
+	if err := validateDumpSourceContext(context); err != nil {
+		return err
 	}
-	if context.FirstVersion < 1 || context.LastVersion < context.FirstVersion {
-		return fmt.Errorf("invalid expected dump range %d-%d", context.FirstVersion, context.LastVersion)
+	if !validCreatedAt(manifest.CreatedAt) {
+		return fmt.Errorf("dump manifest creation time is missing or malformed")
 	}
-	if manifest.Schema != context.Schema || manifest.FirstVersion != context.FirstVersion || manifest.LastVersion != context.LastVersion ||
-		manifest.SnapshotID != context.SnapshotID || manifest.ArchiveIdentity != context.ArchiveIdentity ||
-		manifest.CronosCommit != context.CronosCommit || manifest.EthermintCommit != context.EthermintCommit ||
-		manifest.ImageDigest != context.ImageDigest || manifest.BuildTags != context.BuildTags {
-		return fmt.Errorf("sealed dump identity does not match this run")
+	checks := []struct {
+		name  string
+		equal bool
+		got   any
+		want  any
+	}{
+		{"schema", manifest.Schema == context.Schema, manifest.Schema, context.Schema},
+		{"first version", manifest.FirstVersion == context.FirstVersion, manifest.FirstVersion, context.FirstVersion},
+		{"last version", manifest.LastVersion == context.LastVersion, manifest.LastVersion, context.LastVersion},
+		{"snapshot ID", manifest.SnapshotID == context.SnapshotID, manifest.SnapshotID, context.SnapshotID},
+		{"archive identity", manifest.ArchiveIdentity == context.ArchiveIdentity, manifest.ArchiveIdentity, context.ArchiveIdentity},
+		{"Cronos commit", manifest.CronosCommit == context.CronosCommit, manifest.CronosCommit, context.CronosCommit},
+		{"Ethermint commit", manifest.EthermintCommit == context.EthermintCommit, manifest.EthermintCommit, context.EthermintCommit},
+		{"IAVL commit", manifest.IAVLCommit == context.IAVLCommit, manifest.IAVLCommit, context.IAVLCommit},
+		{"image digest", manifest.ImageDigest == context.ImageDigest, manifest.ImageDigest, context.ImageDigest},
+		{"build tags", manifest.BuildTags == context.BuildTags, manifest.BuildTags, context.BuildTags},
+	}
+	for _, check := range checks {
+		if !check.equal {
+			return fmt.Errorf("sealed dump identity does not match this run: %s is %v, want %v", check.name, check.got, check.want)
+		}
 	}
 	if manifest.SnapshotID == "" || manifest.ImageDigest == "" {
 		return fmt.Errorf("snapshot ID and image digest are required to seal an execution dump")
+	}
+	if manifest.SourceManifestSHA256 == "" {
+		return fmt.Errorf("execution dump has no source manifest hash")
 	}
 	if manifest.Schema == dumpManifestSchema && manifest.ArchiveIdentity.LatestVersion != manifest.LastVersion {
 		return fmt.Errorf("dump final version %d differs from archive %d", manifest.LastVersion, manifest.ArchiveIdentity.LatestVersion)

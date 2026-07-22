@@ -54,7 +54,17 @@ func zlibBody(t *testing.T, body []byte) []byte {
 func writeDumpFile(t *testing.T, staging, name string, body []byte) {
 	t.Helper()
 	require.NoError(t, os.MkdirAll(filepath.Join(staging, "evm"), 0o755))
-	require.NoError(t, os.WriteFile(filepath.Join(staging, "evm", name), body, 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(staging, "evm", name), body, 0o600))
+}
+
+func writeTestDumpSource(t *testing.T, staging string, context dumpContext) {
+	t.Helper()
+	source := dumpSourceManifest{Schema: dumpSourceSchema, CreatedAt: "2026-07-22T00:00:00Z", Context: context}
+	checksum, err := dumpSourceChecksum(source)
+	require.NoError(t, err)
+	source.Checksum = checksum
+	_, err = atomicJSON(filepath.Join(staging, dumpSourceFileName), source)
+	require.NoError(t, err)
 }
 
 func TestSealDumpSortsByFirstVersion(t *testing.T) {
@@ -83,7 +93,7 @@ func TestScanZlibChangeSetsRejectsTruncationAndCorruption(t *testing.T) {
 	for length := 1; length <= 15; length++ {
 		t.Run("partial-header-"+strconv.Itoa(length), func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "partial.zz")
-			require.NoError(t, os.WriteFile(path, zlibBody(t, make([]byte, length)), 0o644))
+			require.NoError(t, os.WriteFile(path, zlibBody(t, make([]byte, length)), 0o600))
 			_, err := scanZlibChangeSets(path, nil)
 			require.Error(t, err)
 		})
@@ -94,7 +104,7 @@ func TestScanZlibChangeSetsRejectsTruncationAndCorruption(t *testing.T) {
 		binary.LittleEndian.PutUint64(header[:8], 1)
 		binary.LittleEndian.PutUint64(header[8:], 10)
 		path := filepath.Join(t.TempDir(), "short.zz")
-		require.NoError(t, os.WriteFile(path, zlibBody(t, append(header[:], 1)), 0o644))
+		require.NoError(t, os.WriteFile(path, zlibBody(t, append(header[:], 1)), 0o600))
 		_, err := scanZlibChangeSets(path, nil)
 		require.Error(t, err)
 	})
@@ -103,7 +113,7 @@ func TestScanZlibChangeSetsRejectsTruncationAndCorruption(t *testing.T) {
 		body := zlibBody(t, encodeChangeSet(t, 1))
 		body[len(body)-1] ^= 0xff
 		path := filepath.Join(t.TempDir(), "checksum.zz")
-		require.NoError(t, os.WriteFile(path, body, 0o644))
+		require.NoError(t, os.WriteFile(path, body, 0o600))
 		_, err := scanZlibChangeSets(path, nil)
 		require.Error(t, err)
 	})
@@ -111,7 +121,7 @@ func TestScanZlibChangeSetsRejectsTruncationAndCorruption(t *testing.T) {
 	t.Run("missing trailer", func(t *testing.T) {
 		body := zlibBody(t, encodeChangeSet(t, 1))
 		path := filepath.Join(t.TempDir(), "truncated.zz")
-		require.NoError(t, os.WriteFile(path, body[:len(body)-2], 0o644))
+		require.NoError(t, os.WriteFile(path, body[:len(body)-2], 0o600))
 		_, err := scanZlibChangeSets(path, nil)
 		require.Error(t, err)
 	})
@@ -119,7 +129,23 @@ func TestScanZlibChangeSetsRejectsTruncationAndCorruption(t *testing.T) {
 	t.Run("trailing data", func(t *testing.T) {
 		body := append(zlibBody(t, encodeChangeSet(t, 1)), []byte("garbage")...)
 		path := filepath.Join(t.TempDir(), "trailing.zz")
-		require.NoError(t, os.WriteFile(path, body, 0o644))
+		require.NoError(t, os.WriteFile(path, body, 0o600))
+		_, err := scanZlibChangeSets(path, nil)
+		require.ErrorContains(t, err, "trailing data")
+	})
+
+	t.Run("large trailing data", func(t *testing.T) {
+		body := append(zlibBody(t, encodeChangeSet(t, 1)), bytes.Repeat([]byte{0x5a}, 2<<20)...)
+		path := filepath.Join(t.TempDir(), "large-trailing.zz")
+		require.NoError(t, os.WriteFile(path, body, 0o600))
+		_, err := scanZlibChangeSets(path, nil)
+		require.ErrorContains(t, err, "trailing data")
+	})
+
+	t.Run("concatenated stream", func(t *testing.T) {
+		body := append(zlibBody(t, encodeChangeSet(t, 1)), zlibBody(t, encodeChangeSet(t, 2))...)
+		path := filepath.Join(t.TempDir(), "concatenated.zz")
+		require.NoError(t, os.WriteFile(path, body, 0o600))
 		_, err := scanZlibChangeSets(path, nil)
 		require.ErrorContains(t, err, "trailing data")
 	})
@@ -143,9 +169,13 @@ func TestSealDumpAcceptsExactPilotRange(t *testing.T) {
 	writeDumpFile(t, staging, "block-100.zz", zlibBody(t, body))
 	context := dumpContext{
 		Schema: pilotDumpManifestSchema, FirstVersion: 100, LastVersion: 109,
-		SnapshotID: "snap-test", ArchiveIdentity: archiveIdentity{Home: "/archive", LatestVersion: 200, FinalCommitHash: "0x200"},
-		CronosCommit: "cronos", EthermintCommit: "ethermint", ImageDigest: "sha256:test", BuildTags: "rocksdb",
+		SnapshotID: "snap-test", ArchiveIdentity: archiveIdentity{
+			Home: "/archive", DatabaseIdentity: "db-test", LatestVersion: 200, FinalCommitHash: "0x200",
+		},
+		CronosCommit: testCronosCommit, EthermintCommit: testEthermintCommit, IAVLCommit: testIAVLCommit,
+		ImageDigest: testImageDigest, BuildTags: testBuildTags,
 	}
+	writeTestDumpSource(t, staging, context)
 
 	sealed, manifest, _, err := sealDump(staging, context)
 	require.NoError(t, err)
@@ -163,7 +193,68 @@ func TestSealDumpAcceptsExactPilotRange(t *testing.T) {
 
 	context.SnapshotID = "snap-other"
 	_, _, _, err = prepareDump(sealed, context)
-	require.ErrorContains(t, err, "identity does not match")
+	require.ErrorContains(t, err, "identity does not match this run: snapshot ID")
+}
+
+func TestPrepareDumpResumesSealedSibling(t *testing.T) {
+	staging := filepath.Join(t.TempDir(), "dump.staging")
+	writeDumpFile(t, staging, "block-100.zz", zlibBody(t, encodeChangeSet(t, 100)))
+	context := dumpContext{
+		Schema: pilotDumpManifestSchema, FirstVersion: 100, LastVersion: 100,
+		SnapshotID: "snap-test", ArchiveIdentity: archiveIdentity{
+			Home: "/archive", DatabaseIdentity: "db-test", LatestVersion: 200, FinalCommitHash: "0x200",
+		},
+		CronosCommit: testCronosCommit, EthermintCommit: testEthermintCommit, IAVLCommit: testIAVLCommit,
+		ImageDigest: testImageDigest, BuildTags: testBuildTags,
+	}
+	writeTestDumpSource(t, staging, context)
+
+	sealed, wantManifest, wantHash, err := sealDump(staging, context)
+	require.NoError(t, err)
+	gotPath, gotManifest, gotHash, err := prepareDump(staging, context)
+	require.NoError(t, err)
+	require.Equal(t, sealed, gotPath)
+	require.Equal(t, wantManifest, gotManifest)
+	require.Equal(t, wantHash, gotHash)
+}
+
+func TestPrepareDumpRejectsAmbiguousOrInvalidSealedSibling(t *testing.T) {
+	newSealedDump := func(t *testing.T) (string, string, dumpContext) {
+		t.Helper()
+		staging := filepath.Join(t.TempDir(), "dump.staging")
+		writeDumpFile(t, staging, "block-100.zz", zlibBody(t, encodeChangeSet(t, 100)))
+		context := dumpContext{
+			Schema: pilotDumpManifestSchema, FirstVersion: 100, LastVersion: 100,
+			SnapshotID: "snap-test", ArchiveIdentity: archiveIdentity{
+				Home: "/archive", DatabaseIdentity: "db-test", LatestVersion: 200, FinalCommitHash: "0x200",
+			},
+			CronosCommit: testCronosCommit, EthermintCommit: testEthermintCommit, IAVLCommit: testIAVLCommit,
+			ImageDigest: testImageDigest, BuildTags: testBuildTags,
+		}
+		writeTestDumpSource(t, staging, context)
+		sealed, _, _, err := sealDump(staging, context)
+		require.NoError(t, err)
+		return staging, sealed, context
+	}
+
+	t.Run("both staging and sealed exist", func(t *testing.T) {
+		staging, sealed, context := newSealedDump(t)
+		require.NoError(t, os.MkdirAll(staging, 0o755))
+
+		_, _, _, err := prepareDump(staging, context)
+		require.ErrorContains(t, err, "both staging and sealed dumps exist")
+		require.DirExists(t, staging)
+		require.DirExists(t, sealed)
+	})
+
+	t.Run("sealed sibling is corrupt", func(t *testing.T) {
+		staging, sealed, context := newSealedDump(t)
+		file := filepath.Join(sealed, "evm", "block-100.zz")
+		require.NoError(t, os.WriteFile(file, []byte("not zlib"), 0o600))
+
+		_, _, _, err := prepareDump(staging, context)
+		require.Error(t, err)
+	})
 }
 
 func TestSealDumpRejectsPilotRangeMismatch(t *testing.T) {
@@ -184,11 +275,16 @@ func TestSealDumpRejectsPilotRangeMismatch(t *testing.T) {
 				body = append(body, encodeChangeSet(t, version)...)
 			}
 			writeDumpFile(t, staging, "block.zz", zlibBody(t, body))
-			_, _, _, err := sealDump(staging, dumpContext{
+			context := dumpContext{
 				Schema: pilotDumpManifestSchema, FirstVersion: 100, LastVersion: 109,
-				SnapshotID: "snap-test", ArchiveIdentity: archiveIdentity{Home: "/archive", LatestVersion: 200, FinalCommitHash: "0x200"},
-				ImageDigest: "sha256:test",
-			})
+				SnapshotID: "snap-test", ArchiveIdentity: archiveIdentity{
+					Home: "/archive", DatabaseIdentity: "db-test", LatestVersion: 200, FinalCommitHash: "0x200",
+				},
+				CronosCommit: testCronosCommit, EthermintCommit: testEthermintCommit, IAVLCommit: testIAVLCommit,
+				ImageDigest: testImageDigest, BuildTags: testBuildTags,
+			}
+			writeTestDumpSource(t, staging, context)
+			_, _, _, err := sealDump(staging, context)
 			require.Error(t, err)
 		})
 	}
