@@ -1031,8 +1031,8 @@ func runVerifyWithOptions(
 	if err := options.validate(true); err != nil {
 		return verifyReport{}, err
 	}
-	if options.MaxInFlightBytes < maxObjectOperationBytes+directResultBaseBytes {
-		return verifyReport{}, fmt.Errorf("verify max-inflight-bytes must be at least %d", maxObjectOperationBytes+directResultBaseBytes)
+	if options.MaxInFlightBytes < maxObjectOperationBytes+maxObjectSize {
+		return verifyReport{}, fmt.Errorf("verify max-inflight-bytes must be at least %d", maxObjectOperationBytes+maxObjectSize)
 	}
 	planDir, err := requireSealedPlanDirectory(manifestPath)
 	if err != nil {

@@ -198,6 +198,9 @@ func runPlan(ctx context.Context, options planOptions, objects objectStore) (pla
 	if options.MinFree == 0 {
 		return planManifest{}, "", fmt.Errorf("min-free-bytes must be greater than zero")
 	}
+	if options.Parallel.MaxInFlightBytes < maxObjectOperationBytes+maxObjectSize {
+		return planManifest{}, "", fmt.Errorf("plan max-inflight-bytes must be at least %d", maxObjectOperationBytes+maxObjectSize)
+	}
 	if options.Direct {
 		if options.DumpStaging != "" {
 			return planManifest{}, "", fmt.Errorf("direct and dump sources are mutually exclusive")
@@ -207,9 +210,6 @@ func runPlan(ctx context.Context, options planOptions, objects objectStore) (pla
 		}
 		if options.IAVLConcurrency < 1 || options.IAVLConcurrency > maximumDirectIAVLConcurrency {
 			return planManifest{}, "", fmt.Errorf("iavl-concurrency must be between 1 and %d", maximumDirectIAVLConcurrency)
-		}
-		if options.Parallel.MaxInFlightBytes < maxObjectOperationBytes+directResultBaseBytes {
-			return planManifest{}, "", fmt.Errorf("direct max-inflight-bytes must be at least %d", maxObjectOperationBytes+directResultBaseBytes)
 		}
 		if !filepath.IsAbs(options.ArchiveHome) {
 			return planManifest{}, "", fmt.Errorf("direct archive home must be absolute")
