@@ -13,7 +13,7 @@ import (
 const (
 	defaultDirectIAVLConcurrency = 8
 	maximumDirectIAVLConcurrency = 64
-	directIAVLShardSize          = int64(1)
+	directIAVLShardSize          = int64(64)
 	directResultBaseBytes        = int64(1 << 20)
 	directResultItemBytes        = int64(128)
 )
@@ -44,16 +44,21 @@ func iterateArchiveDirectStorageDiffsContext(
 	if archive == nil {
 		return fmt.Errorf("direct archive is required")
 	}
+	legacyLatest, err := archive.evmLegacyLatestVersion()
+	if err != nil {
+		return fmt.Errorf("resolve latest legacy EVM IAVL version: %w", err)
+	}
 	return iterateParallelDirectStorageDiffsContext(
 		ctx,
 		func() stateChangeSource { return archive.evmStateChangeSource(cacheSize) },
-		concurrency, first, last, callback,
+		legacyLatest, concurrency, first, last, callback,
 	)
 }
 
 func iterateParallelDirectStorageDiffsContext(
 	ctx context.Context,
 	newSource func() stateChangeSource,
+	legacyLatest int64,
 	concurrency int,
 	first, last int64,
 	callback func(int64, []dtypes.AccountStorageDiff) error,
@@ -63,6 +68,9 @@ func iterateParallelDirectStorageDiffsContext(
 	}
 	if concurrency < 1 || concurrency > maximumDirectIAVLConcurrency {
 		return fmt.Errorf("iavl-concurrency must be between 1 and %d", maximumDirectIAVLConcurrency)
+	}
+	if legacyLatest < 0 {
+		return fmt.Errorf("invalid latest legacy version %d", legacyLatest)
 	}
 	if first < 2 || last < first {
 		return fmt.Errorf("invalid parallel direct traversal range %d-%d", first, last)
@@ -82,6 +90,9 @@ func iterateParallelDirectStorageDiffsContext(
 			shardLast := shardFirst + directIAVLShardSize - 1
 			if shardLast < shardFirst || shardLast > last {
 				shardLast = last
+			}
+			if legacyLatest >= shardFirst && legacyLatest < shardLast {
+				shardLast = legacyLatest
 			}
 			task := directShardTask{ordinal: ordinal, first: shardFirst, last: shardLast}
 			select {
@@ -109,6 +120,7 @@ func iterateParallelDirectStorageDiffsContext(
 				return fmt.Errorf("direct state change source factory returned nil")
 			}
 			for task := range jobs {
+				retainedBytes := int64(0)
 				result := directShardResult{
 					directShardTask: task,
 					changes:         make([]directStorageChange, 0, task.last-task.first+1),
@@ -118,7 +130,8 @@ func iterateParallelDirectStorageDiffsContext(
 					if err != nil {
 						return fmt.Errorf("height %d canonical storage: %w", height, err)
 					}
-					if _, err := estimatedCanonicalStorageBytes(canonical); err != nil {
+					retainedBytes, err = addDirectShardRetainedBytes(retainedBytes, canonical)
+					if err != nil {
 						return fmt.Errorf("height %d canonical storage: %w", height, err)
 					}
 					result.changes = append(result.changes, directStorageChange{height: height, canonical: canonical})
@@ -204,6 +217,26 @@ func iterateParallelDirectStorageDiffsContext(
 		return fmt.Errorf("parallel direct traversal ended at height %d, want %d", expectedHeight-1, last)
 	}
 	return nil
+}
+
+func addDirectShardRetainedBytes(current int64, storage []dtypes.AccountStorageDiff) (int64, error) {
+	if current < 0 || current > maxObjectSize {
+		return 0, fmt.Errorf("invalid retained canonical shard bytes %d", current)
+	}
+	estimated, err := estimatedCanonicalStorageBytes(storage)
+	if err != nil {
+		return 0, err
+	}
+	// The 1 MiB base belongs to the outer object task. A buffered shard retains
+	// only this height entry and the canonical account/slot values.
+	retained := directResultItemBytes
+	if estimated != 0 {
+		retained += estimated - directResultBaseBytes
+	}
+	if retained > maxObjectSize-current {
+		return 0, fmt.Errorf("retained canonical shard exceeds %d bytes", maxObjectSize)
+	}
+	return current + retained, nil
 }
 
 func estimatedCanonicalStorageBytes(storage []dtypes.AccountStorageDiff) (int64, error) {

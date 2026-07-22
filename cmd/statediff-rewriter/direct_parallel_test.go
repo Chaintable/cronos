@@ -103,11 +103,12 @@ func (fake *parallelDirectFake) snapshot() (ranges, completed [][2]int64, maxAct
 	return append([][2]int64(nil), fake.ranges...), append([][2]int64(nil), fake.completed...), fake.maxActive
 }
 
-func TestIterateParallelDirectStorageDiffsContextOrdersHeights(t *testing.T) {
+func TestIterateParallelDirectStorageDiffsContextOrdersShardsAndSplitsLegacyBoundary(t *testing.T) {
 	const (
-		first       = int64(2)
-		last        = int64(6)
-		concurrency = 3
+		first        = int64(2)
+		legacyLatest = int64(100)
+		last         = int64(228)
+		concurrency  = 3
 	)
 	fake := &parallelDirectFake{
 		holdFirst: first,
@@ -116,7 +117,7 @@ func TestIterateParallelDirectStorageDiffsContextOrdersHeights(t *testing.T) {
 	var heights []int64
 
 	err := iterateParallelDirectStorageDiffsContext(
-		context.Background(), fake.source, concurrency, first, last,
+		context.Background(), fake.source, legacyLatest, concurrency, first, last,
 		func(height int64, storage []dtypes.AccountStorageDiff) error {
 			heights = append(heights, height)
 			require.Empty(t, storage)
@@ -132,11 +133,10 @@ func TestIterateParallelDirectStorageDiffsContextOrdersHeights(t *testing.T) {
 	ranges, completed, maxActive := fake.snapshot()
 	sort.Slice(ranges, func(i, j int) bool { return ranges[i][0] < ranges[j][0] })
 	require.Equal(t, [][2]int64{
-		{2, 2},
-		{3, 3},
-		{4, 4},
-		{5, 5},
-		{6, 6},
+		{2, 65},
+		{66, legacyLatest},
+		{legacyLatest + 1, 164},
+		{165, last},
 	}, ranges)
 	require.NotEmpty(t, completed)
 	require.NotEqual(t, first, completed[0][0], "the held first shard must complete out of order")
@@ -151,7 +151,7 @@ func TestIterateParallelDirectStorageDiffsContextBoundsConcurrency(t *testing.T)
 	}
 
 	err := iterateParallelDirectStorageDiffsContext(
-		context.Background(), fake.source, concurrency, 2, 2+directIAVLShardSize*4-1,
+		context.Background(), fake.source, 0, concurrency, 2, 2+directIAVLShardSize*4-1,
 		func(int64, []dtypes.AccountStorageDiff) error { return nil },
 	)
 	require.NoError(t, err)
@@ -161,7 +161,7 @@ func TestIterateParallelDirectStorageDiffsContextBoundsConcurrency(t *testing.T)
 
 func TestIterateParallelDirectStorageDiffsContextRejectsNilFactoryResult(t *testing.T) {
 	err := iterateParallelDirectStorageDiffsContext(
-		context.Background(), func() stateChangeSource { return nil }, 1, 2, 2,
+		context.Background(), func() stateChangeSource { return nil }, 0, 1, 2, 2,
 		func(int64, []dtypes.AccountStorageDiff) error { return nil },
 	)
 	require.ErrorContains(t, err, "direct state change source factory returned nil")
@@ -172,11 +172,11 @@ func TestIterateParallelDirectStorageDiffsContextPropagatesWorkerError(t *testin
 	fake := &parallelDirectFake{workerError: wantErr, errorFirst: 2}
 
 	err := iterateParallelDirectStorageDiffsContext(
-		context.Background(), fake.source, 2, 2, 129,
+		context.Background(), fake.source, 0, 2, 2, 129,
 		func(int64, []dtypes.AccountStorageDiff) error { return nil },
 	)
 	require.ErrorIs(t, err, wantErr)
-	require.ErrorContains(t, err, "direct shard 1 versions 2-2")
+	require.ErrorContains(t, err, "direct shard 1 versions 2-65")
 }
 
 func TestIterateParallelDirectStorageDiffsContextPropagatesCallbackError(t *testing.T) {
@@ -184,7 +184,7 @@ func TestIterateParallelDirectStorageDiffsContextPropagatesCallbackError(t *test
 	fake := &parallelDirectFake{}
 
 	err := iterateParallelDirectStorageDiffsContext(
-		context.Background(), fake.source, 2, 2, 129,
+		context.Background(), fake.source, 0, 2, 2, 129,
 		func(height int64, _ []dtypes.AccountStorageDiff) error {
 			if height == 7 {
 				return wantErr
@@ -201,10 +201,59 @@ func TestIterateParallelDirectStorageDiffsContextHonorsCancellation(t *testing.T
 	fake := &parallelDirectFake{}
 
 	err := iterateParallelDirectStorageDiffsContext(
-		ctx, fake.source, 2, 2, 129,
+		ctx, fake.source, 0, 2, 2, 129,
 		func(int64, []dtypes.AccountStorageDiff) error { return nil },
 	)
 	require.ErrorIs(t, err, context.Canceled)
+}
+
+type postCheckMismatchSource struct {
+	traversed bool
+}
+
+func (source *postCheckMismatchSource) VersionHash(version int64) ([]byte, error) {
+	value := byte(version)
+	if source.traversed {
+		value++
+	}
+	return bytes.Repeat([]byte{value}, legacyHashLength), nil
+}
+
+func (source *postCheckMismatchSource) TraverseStateChanges(
+	first, last int64,
+	callback func(int64, *iavl.ChangeSet) error,
+) error {
+	for version := first; version <= last; version++ {
+		if err := callback(version, &iavl.ChangeSet{}); err != nil {
+			return err
+		}
+	}
+	source.traversed = true
+	return nil
+}
+
+func TestIterateParallelDirectStorageDiffsContextPublishesOnlyPostCheckedShards(t *testing.T) {
+	callbacks := 0
+	err := iterateParallelDirectStorageDiffsContext(
+		context.Background(),
+		func() stateChangeSource { return &postCheckMismatchSource{} },
+		0, 1, 2, 2+directIAVLShardSize-1,
+		func(int64, []dtypes.AccountStorageDiff) error {
+			callbacks++
+			return nil
+		},
+	)
+	require.ErrorContains(t, err, "root changed during traversal")
+	require.Zero(t, callbacks)
+}
+
+func TestIterateParallelDirectStorageDiffsContextRejectsInvalidLegacyBoundary(t *testing.T) {
+	fake := &parallelDirectFake{}
+	err := iterateParallelDirectStorageDiffsContext(
+		context.Background(), fake.source, -1, 1, 2, 2,
+		func(int64, []dtypes.AccountStorageDiff) error { return nil },
+	)
+	require.ErrorContains(t, err, "invalid latest legacy version -1")
 }
 
 func TestEstimatedCanonicalStorageBytesBoundsRetainedMemory(t *testing.T) {
@@ -234,4 +283,23 @@ func TestEstimatedCanonicalStorageBytesBoundsRetainedMemory(t *testing.T) {
 	weight, err = canonicalObjectOperationBytes(nil, true)
 	require.NoError(t, err)
 	require.Equal(t, int64(1<<20), weight)
+}
+
+func TestAddDirectShardRetainedBytesEnforcesCumulativeLimit(t *testing.T) {
+	one := []dtypes.AccountStorageDiff{{Values: []dtypes.IndexValuePair{{}}}}
+	retained, err := addDirectShardRetainedBytes(0, nil)
+	require.NoError(t, err)
+	require.Equal(t, directResultItemBytes, retained)
+
+	retained, err = addDirectShardRetainedBytes(retained, one)
+	require.NoError(t, err)
+	require.Equal(t, 4*directResultItemBytes, retained)
+
+	oneBytes := int64(3) * directResultItemBytes
+	retained, err = addDirectShardRetainedBytes(maxObjectSize-oneBytes, one)
+	require.NoError(t, err)
+	require.Equal(t, maxObjectSize, retained)
+
+	_, err = addDirectShardRetainedBytes(maxObjectSize-oneBytes+1, one)
+	require.ErrorContains(t, err, "retained canonical shard exceeds")
 }
