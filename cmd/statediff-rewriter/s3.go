@@ -3,8 +3,11 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"net/http"
 
@@ -16,7 +19,11 @@ import (
 	smithyhttp "github.com/aws/smithy-go/transport/http"
 )
 
-var errObjectConflict = errors.New("object precondition conflict")
+var (
+	errObjectConflict       = errors.New("object precondition conflict")
+	errObjectWriteUncertain = errors.New("object write result is uncertain")
+	crc32cTable             = crc32.MakeTable(crc32.Castagnoli)
+)
 
 type storedObject struct {
 	Body    []byte
@@ -24,9 +31,13 @@ type storedObject struct {
 	Headers objectHeaders
 }
 
+type putResult struct {
+	ETag string
+}
+
 type objectStore interface {
 	Get(context.Context, string, string) (storedObject, error)
-	Put(context.Context, string, string, []byte, string, objectHeaders) error
+	Put(context.Context, string, string, []byte, string, objectHeaders) (putResult, error)
 }
 
 type s3ObjectStore struct {
@@ -113,14 +124,15 @@ func validateS3ExpressObject(output *s3.GetObjectOutput) error {
 	return nil
 }
 
-func (s *s3ObjectStore) Put(ctx context.Context, bucket, key string, body []byte, ifMatch string, headers objectHeaders) error {
+func (s *s3ObjectStore) Put(ctx context.Context, bucket, key string, body []byte, ifMatch string, headers objectHeaders) (putResult, error) {
 	metadata, err := decodeMetadata(headers.Metadata)
 	if err != nil {
-		return err
+		return putResult{}, err
 	}
+	checksum := crc32cBase64(body)
 	input := &s3.PutObjectInput{
 		Bucket: aws.String(bucket), Key: aws.String(key), Body: bytes.NewReader(body), IfMatch: aws.String(ifMatch),
-		ChecksumAlgorithm: s3types.ChecksumAlgorithmCrc32c, Metadata: metadata,
+		ChecksumAlgorithm: s3types.ChecksumAlgorithmCrc32c, ChecksumCRC32C: aws.String(checksum), Metadata: metadata,
 		StorageClass:         s3types.StorageClass(headers.StorageClass),
 		ServerSideEncryption: s3types.ServerSideEncryption(headers.ServerSideEncryption),
 	}
@@ -135,13 +147,48 @@ func (s *s3ObjectStore) Put(ctx context.Context, bucket, key string, body []byte
 	setOptionalString(headers.ContentLanguage, &input.ContentLanguage)
 	setOptionalString(headers.ContentType, &input.ContentType)
 	setOptionalString(headers.WebsiteRedirect, &input.WebsiteRedirectLocation)
-	_, err = s.writeClient.PutObject(ctx, input)
+	output, err := s.writeClient.PutObject(ctx, input)
 	if err == nil {
-		return nil
+		result, validateErr := validatePutObjectResult(output, checksum)
+		if validateErr != nil {
+			return putResult{}, fmt.Errorf("%w: %w", errObjectWriteUncertain, validateErr)
+		}
+		return result, nil
 	}
+	return putResult{}, classifyPutObjectError(err)
+}
+
+func classifyPutObjectError(err error) error {
 	var responseError *smithyhttp.ResponseError
-	if errors.As(err, &responseError) && (responseError.HTTPStatusCode() == http.StatusConflict || responseError.HTTPStatusCode() == http.StatusPreconditionFailed) {
-		return fmt.Errorf("%w: HTTP %d: %w", errObjectConflict, responseError.HTTPStatusCode(), err)
+	if errors.As(err, &responseError) {
+		status := responseError.HTTPStatusCode()
+		switch {
+		case status == http.StatusConflict || status == http.StatusPreconditionFailed:
+			return fmt.Errorf("%w: HTTP %d: %w", errObjectConflict, status, err)
+		case status == http.StatusRequestTimeout || status == http.StatusTooManyRequests || status >= http.StatusInternalServerError:
+			return fmt.Errorf("%w: HTTP %d: %w", errObjectWriteUncertain, status, err)
+		default:
+			return err
+		}
 	}
-	return err
+	return fmt.Errorf("%w: %w", errObjectWriteUncertain, err)
+}
+
+func crc32cBase64(body []byte) string {
+	var encoded [4]byte
+	binary.BigEndian.PutUint32(encoded[:], crc32.Checksum(body, crc32cTable))
+	return base64.StdEncoding.EncodeToString(encoded[:])
+}
+
+func validatePutObjectResult(output *s3.PutObjectOutput, expectedChecksum string) (putResult, error) {
+	if output == nil {
+		return putResult{}, fmt.Errorf("PUT response is empty")
+	}
+	if aws.ToString(output.ChecksumCRC32C) != expectedChecksum {
+		return putResult{}, fmt.Errorf("PUT response CRC32C is %q, want %q", aws.ToString(output.ChecksumCRC32C), expectedChecksum)
+	}
+	if aws.ToString(output.ETag) == "" {
+		return putResult{}, fmt.Errorf("PUT response has no ETag")
+	}
+	return putResult{ETag: aws.ToString(output.ETag)}, nil
 }

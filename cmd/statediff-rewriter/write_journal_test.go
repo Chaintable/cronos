@@ -57,3 +57,19 @@ func TestWriteJournalRejectsMutationAndWrongObservedTarget(t *testing.T) {
 	require.True(t, found)
 	require.Equal(t, writeJournalIssued, loaded.State)
 }
+
+func TestWriteJournalRejectsReconciledRollbackResult(t *testing.T) {
+	journal := testWriteJournal()
+	journal.Operation = rollbackMode
+	journal.Intents[0].Operation = rollbackMode
+	journal.Intents[0].PUTAttempts = 1
+	journal.Intents[0].Conflicts = 1
+	journal.State = writeJournalObserved
+	journal.Results = []writeObservedResult{{
+		Ordinal: 1, ObservedSHA256: journal.Intents[0].OldSHA256,
+		PostPUTETag: "etag-old", Outcome: writeOutcomeReconciled,
+	}}
+
+	err := saveWriteJournal(filepath.Join(t.TempDir(), "rollback-journal.json"), journal)
+	require.ErrorContains(t, err, "invalid reconciled result for rollback")
+}

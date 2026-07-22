@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"os"
@@ -11,6 +12,7 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/rlp"
 	dtypes "github.com/evmos/ethermint/debank/types"
+	"github.com/holiman/uint256"
 	"github.com/stretchr/testify/require"
 
 	storetypes "cosmossdk.io/store/types"
@@ -165,27 +167,137 @@ func TestArchiveRootCursorPilotReadsOnePredecessorThenSequentialVersions(t *test
 	require.Equal(t, []int64{99, 98, 100}, reader.calls)
 }
 
-func TestMakePackRecord(t *testing.T) {
+func planTestBlockStorageDiff(root, parent common.Hash, storage []dtypes.AccountStorageDiff) dtypes.BlockStorageDiff {
+	return dtypes.BlockStorageDiff{
+		Hash: root, ParentHash: parent,
+		NewAccounts: []dtypes.NewAccount{{
+			Address: common.BytesToHash([]byte{10}), Balance: uint256.NewInt(11), Nonce: 12,
+			CodeHash: common.BytesToHash([]byte{13}),
+		}},
+		DeletedAccounts: []common.Hash{common.BytesToHash([]byte{14})},
+		StorageDiff:     storage,
+		NewCodes: []dtypes.NewCode{{
+			CodeHash: common.BytesToHash([]byte{15}), Code: []byte{0x60, 0x00},
+		}},
+	}
+}
+
+func requireChangedPackRecord(
+	t *testing.T,
+	old dtypes.BlockStorageDiff,
+	object storedObject,
+	record packRecord,
+	canonical []dtypes.AccountStorageDiff,
+) {
+	t.Helper()
+	require.Equal(t, packSchema, record.Schema)
+	require.Equal(t, uint64(2), record.Height)
+	require.Equal(t, "key", record.Key)
+	require.Equal(t, object.ETag, record.OldETag)
+	require.Equal(t, object.Body, record.OldBody)
+	require.Equal(t, object.Headers, record.Headers)
+	expectedNewBody, err := replaceStorageDiffRLP(object.Body, canonical)
+	require.NoError(t, err)
+	require.Equal(t, expectedNewBody, record.NewBody)
+	require.False(t, bytes.Equal(record.OldBody, record.NewBody))
+	require.Equal(t, sha256Hash(record.OldBody), record.OldSHA256)
+	require.Equal(t, sha256Hash(record.NewBody), record.NewSHA256)
+	retained, err := retainedDigest(old)
+	require.NoError(t, err)
+	require.Equal(t, retained, record.RetainedSHA256)
+	require.Zero(t, record.SlotsAdded)
+	require.Zero(t, record.SlotsRemoved)
+	require.Zero(t, record.SlotsChanged)
+	require.False(t, record.NoncanonicalOld)
+	require.False(t, record.ConflictingOld)
+
+	oldFields, err := blockStorageDiffRawFields(record.OldBody)
+	require.NoError(t, err)
+	newFields, err := blockStorageDiffRawFields(record.NewBody)
+	require.NoError(t, err)
+	for index := range oldFields {
+		if index == storageDiffFieldIndex {
+			require.False(t, bytes.Equal(oldFields[index], newFields[index]))
+			continue
+		}
+		require.True(t, bytes.Equal(oldFields[index], newFields[index]), "raw RLP field %d changed", index)
+	}
+
+	var decoded dtypes.BlockStorageDiff
+	require.NoError(t, rlp.DecodeBytes(record.NewBody, &decoded))
+	decodedStorage, err := rlp.EncodeToBytes(decoded.StorageDiff)
+	require.NoError(t, err)
+	canonicalStorage, err := rlp.EncodeToBytes(canonical)
+	require.NoError(t, err)
+	require.Equal(t, canonicalStorage, decodedStorage)
+}
+
+func TestMakePackRecordReplacesStorageWithoutSemanticComparison(t *testing.T) {
 	root := common.BytesToHash([]byte{2})
 	parent := common.BytesToHash([]byte{1})
-	old := dtypes.BlockStorageDiff{
-		Hash: root, ParentHash: parent, NewAccounts: []dtypes.NewAccount{}, DeletedAccounts: []common.Hash{},
-		StorageDiff: []dtypes.AccountStorageDiff{testStorage(1, 1, 1)}, NewCodes: []dtypes.NewCode{},
+	canonical := []dtypes.AccountStorageDiff{testStorage(1, 1, 2), testStorage(2, 2, 3)}
+	tests := []struct {
+		name string
+		old  []dtypes.AccountStorageDiff
+	}{
+		{name: "missing", old: []dtypes.AccountStorageDiff{testStorage(1, 1, 2)}},
+		{name: "extra", old: []dtypes.AccountStorageDiff{testStorage(1, 1, 2), testStorage(2, 2, 3), testStorage(3, 3, 4)}},
+		{name: "wrong", old: []dtypes.AccountStorageDiff{testStorage(1, 1, 99), testStorage(2, 2, 3)}},
+		{name: "duplicate", old: []dtypes.AccountStorageDiff{testStorage(1, 1, 2), testStorage(1, 1, 99), testStorage(2, 2, 3)}},
+		{name: "same slots different order", old: []dtypes.AccountStorageDiff{testStorage(2, 2, 3), testStorage(1, 1, 2)}},
 	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			old := planTestBlockStorageDiff(root, parent, test.old)
+			body, err := rlp.EncodeToBytes(old)
+			require.NoError(t, err)
+			object := storedObject{
+				Body: body, ETag: "etag",
+				Headers: objectHeaders{ContentType: "application/octet-stream", Metadata: []byte(`{"source":"test"}`)},
+			}
+			record, changed, err := makePackRecord(2, "key", object, root, parent, canonical)
+			require.NoError(t, err)
+			require.True(t, changed)
+			requireChangedPackRecord(t, old, object, record, canonical)
+		})
+	}
+}
+
+func TestMakePackRecordNoopRequiresIdenticalBody(t *testing.T) {
+	root := common.BytesToHash([]byte{2})
+	parent := common.BytesToHash([]byte{1})
+	canonical := []dtypes.AccountStorageDiff{testStorage(1, 1, 2), testStorage(2, 2, 3)}
+	old := planTestBlockStorageDiff(root, parent, canonical)
 	body, err := rlp.EncodeToBytes(old)
 	require.NoError(t, err)
-	object := storedObject{Body: body, ETag: "etag"}
-	canonical := []dtypes.AccountStorageDiff{testStorage(1, 1, 2)}
-	record, changed, err := makePackRecord(2, "key", object, root, parent, canonical)
-	require.NoError(t, err)
-	require.True(t, changed)
-	require.Equal(t, sha256Hash(body), record.OldSHA256)
-	require.NotEqual(t, record.OldSHA256, record.NewSHA256)
-	require.NoError(t, verifyRecordTarget(record, record.NewBody, record.NewSHA256))
-
-	_, changed, err = makePackRecord(2, "key", storedObject{Body: record.NewBody}, root, parent, canonical)
+	record, changed, err := makePackRecord(2, "key", storedObject{Body: body}, root, parent, canonical)
 	require.NoError(t, err)
 	require.False(t, changed)
+	require.Equal(t, packRecord{}, record)
+}
+
+func TestMakePackRecordTreatsNilAndEmptyStorageAsSameRLP(t *testing.T) {
+	root := common.BytesToHash([]byte{2})
+	parent := common.BytesToHash([]byte{1})
+	tests := []struct {
+		name      string
+		old       []dtypes.AccountStorageDiff
+		canonical []dtypes.AccountStorageDiff
+	}{
+		{name: "nil old empty canonical", old: nil, canonical: []dtypes.AccountStorageDiff{}},
+		{name: "empty old nil canonical", old: []dtypes.AccountStorageDiff{}, canonical: nil},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			old := planTestBlockStorageDiff(root, parent, test.old)
+			body, err := rlp.EncodeToBytes(old)
+			require.NoError(t, err)
+			record, changed, err := makePackRecord(2, "key", storedObject{Body: body}, root, parent, test.canonical)
+			require.NoError(t, err)
+			require.False(t, changed)
+			require.Equal(t, packRecord{}, record)
+		})
+	}
 }
 
 func TestMakePackRecordRejectsInvalidObject(t *testing.T) {

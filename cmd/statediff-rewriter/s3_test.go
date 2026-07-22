@@ -1,11 +1,14 @@
 package main
 
 import (
+	"errors"
+	"net/http"
 	"testing"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
+	smithyhttp "github.com/aws/smithy-go/transport/http"
 	"github.com/stretchr/testify/require"
 )
 
@@ -35,4 +38,47 @@ func TestValidateS3ExpressObject(t *testing.T) {
 	withExpiration := validS3ExpressGetOutput()
 	withExpiration.Expiration = aws.String("expiry-date=tomorrow")
 	require.ErrorContains(t, validateS3ExpressObject(withExpiration), "object expiration")
+}
+
+func TestCRC32CBase64(t *testing.T) {
+	require.Equal(t, "4waSgw==", crc32cBase64([]byte("123456789")))
+}
+
+func TestValidatePutObjectResult(t *testing.T) {
+	checksum := crc32cBase64([]byte("body"))
+	result, err := validatePutObjectResult(&s3.PutObjectOutput{
+		ChecksumCRC32C: aws.String(checksum),
+		ETag:           aws.String("etag-new"),
+	}, checksum)
+	require.NoError(t, err)
+	require.Equal(t, "etag-new", result.ETag)
+
+	_, err = validatePutObjectResult(nil, checksum)
+	require.ErrorContains(t, err, "empty")
+	_, err = validatePutObjectResult(&s3.PutObjectOutput{ETag: aws.String("etag-new")}, checksum)
+	require.ErrorContains(t, err, "CRC32C")
+	_, err = validatePutObjectResult(&s3.PutObjectOutput{
+		ChecksumCRC32C: aws.String("different"), ETag: aws.String("etag-new"),
+	}, checksum)
+	require.ErrorContains(t, err, "CRC32C")
+	_, err = validatePutObjectResult(&s3.PutObjectOutput{ChecksumCRC32C: aws.String(checksum)}, checksum)
+	require.ErrorContains(t, err, "ETag")
+}
+
+func TestClassifyPutObjectError(t *testing.T) {
+	responseError := func(status int) error {
+		return &smithyhttp.ResponseError{
+			Response: &smithyhttp.Response{Response: &http.Response{StatusCode: status}},
+			Err:      errors.New("request failed"),
+		}
+	}
+	for _, status := range []int{http.StatusConflict, http.StatusPreconditionFailed} {
+		require.ErrorIs(t, classifyPutObjectError(responseError(status)), errObjectConflict)
+	}
+	for _, status := range []int{http.StatusRequestTimeout, http.StatusTooManyRequests, http.StatusInternalServerError, http.StatusServiceUnavailable} {
+		require.ErrorIs(t, classifyPutObjectError(responseError(status)), errObjectWriteUncertain)
+	}
+	definite := responseError(http.StatusForbidden)
+	require.Same(t, definite, classifyPutObjectError(definite))
+	require.ErrorIs(t, classifyPutObjectError(errors.New("connection reset")), errObjectWriteUncertain)
 }

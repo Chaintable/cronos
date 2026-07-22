@@ -39,15 +39,17 @@ type backupProof struct {
 
 type writeReport struct {
 	PlannedChanged      int64   `json:"planned_changed"`
-	AppliedChanged      int64   `json:"applied_changed"`
-	VerifiedThisRun     int64   `json:"verified_this_run"`
+	CheckpointFrontier  int64   `json:"checkpoint_frontier"`
+	CompletedThisRun    int64   `json:"completed_this_run"`
 	AlreadyTarget       int64   `json:"already_target"`
 	PUTs                int64   `json:"put_attempts"`
 	ConfirmedPUTs       int64   `json:"confirmed_puts"`
-	UncertainPUTs       int64   `json:"uncertain_puts_verified"`
+	UncertainPUTs       int64   `json:"uncertain_puts_reconciled"`
+	Conflicts           int64   `json:"conditional_conflicts_observed_this_run"`
 	CumulativePUTs      uint64  `json:"cumulative_put_attempts"`
 	CumulativeAlready   uint64  `json:"cumulative_already_target"`
-	CumulativeUncertain uint64  `json:"cumulative_uncertain_puts_verified"`
+	CumulativeUncertain uint64  `json:"cumulative_uncertain_puts_reconciled"`
+	CumulativeConflicts uint64  `json:"cumulative_conditional_conflicts_observed"`
 	Concurrency         int     `json:"concurrency"`
 	DurationSeconds     float64 `json:"duration_seconds"`
 	ObjectsPerSecond    float64 `json:"objects_per_second"`
@@ -65,6 +67,7 @@ type writeOutcome struct {
 	postETag     string
 	putOutcome   string
 	putAttempted bool
+	conflict     bool
 }
 
 type writeAudit struct {
@@ -72,14 +75,16 @@ type writeAudit struct {
 	ConfirmedPUTs uint64
 	UncertainPUTs uint64
 	AlreadyTarget uint64
+	Conflicts     uint64
 }
 
 type writeMetrics struct {
-	verified      atomic.Int64
+	completed     atomic.Int64
 	alreadyTarget atomic.Int64
 	putAttempts   atomic.Int64
 	confirmedPUTs atomic.Int64
 	uncertainPUTs atomic.Int64
+	conflicts     atomic.Int64
 }
 
 func checkedAddUint64(left, right uint64, label string) (uint64, error) {
@@ -215,6 +220,12 @@ func runWriteModeWithOptions(
 	if cp.Frontier > uint64(manifest.Changed) || (cp.Frontier == 0) != (cp.Height == 0) {
 		return writeReport{}, fmt.Errorf("%s checkpoint frontier/height is outside the manifest", mode)
 	}
+	checkpointReport := writeReport{
+		PlannedChanged: manifest.Changed, CheckpointFrontier: int64(cp.Frontier), Concurrency: options.Concurrency,
+		CumulativePUTs: cp.PUTAttempts, CumulativeAlready: cp.AlreadyTarget, CumulativeUncertain: cp.UncertainPUTs,
+		CumulativeConflicts: cp.Conflicts,
+	}
+	initialFrontier := cp.Frontier
 	journalPath := writeJournalPath(checkpointPath)
 	journal, journalFound, err := loadWriteJournal(journalPath, manifest.RunID, manifestHash, mode)
 	if err != nil {
@@ -239,30 +250,18 @@ func runWriteModeWithOptions(
 		journalFound = false
 	}
 	if manifest.Changed > 0 && cp.Frontier == uint64(manifest.Changed) {
-		return writeReport{}, fmt.Errorf("%s checkpoint is already complete; use a new checkpoint to revalidate current S3 state", mode)
+		return checkpointReport, fmt.Errorf("%s checkpoint is already complete", mode)
 	}
 	if err := validatePlanForWriteContext(ctx, filepath.Dir(manifestPath), manifest); err != nil {
 		return writeReport{}, fmt.Errorf("%s plan preflight: %w", mode, err)
 	}
-	if err := validatePlanTargetsAgainstDumpContext(ctx, filepath.Dir(manifestPath), manifest); err != nil {
-		return writeReport{}, fmt.Errorf("%s dump cross-check: %w", mode, err)
-	}
-	report := writeReport{
-		PlannedChanged: manifest.Changed, AppliedChanged: int64(cp.Frontier), Concurrency: options.Concurrency,
-		CumulativePUTs: cp.PUTAttempts, CumulativeAlready: cp.AlreadyTarget, CumulativeUncertain: cp.UncertainPUTs,
-	}
+	report := checkpointReport
 	var metrics writeMetrics
 	stream := newPackStream(filepath.Dir(manifestPath), manifest)
 	defer stream.Close()
 	if cp.Frontier > 0 {
-		if objects == nil {
-			objects, err = newS3ObjectStore(ctx, manifest.Region, options.Concurrency)
-			if err != nil {
-				return writeReport{}, err
-			}
-		}
-		if err := validateWriteCheckpointPrefix(ctx, manifest, mode, cp, stream, options, objects, &metrics); err != nil {
-			report.VerifiedThisRun = metrics.verified.Load()
+		if err := advanceWriteCheckpointPrefix(mode, cp, stream, options); err != nil {
+			report.CompletedThisRun = metrics.completed.Load()
 			report.AlreadyTarget = metrics.alreadyTarget.Load()
 			report.DurationSeconds = time.Since(started).Seconds()
 			return report, err
@@ -301,11 +300,12 @@ func runWriteModeWithOptions(
 		}
 		audit, err := processWriteBatch(ctx, manifest, manifestHash, mode, journalPath, batch, journal, journalFound, options.Concurrency, objects, &metrics)
 		if err != nil {
-			report.VerifiedThisRun = metrics.verified.Load()
+			report.CompletedThisRun = metrics.completed.Load()
 			report.AlreadyTarget = metrics.alreadyTarget.Load()
 			report.PUTs = metrics.putAttempts.Load()
 			report.ConfirmedPUTs = metrics.confirmedPUTs.Load()
 			report.UncertainPUTs = metrics.uncertainPUTs.Load()
+			report.Conflicts = metrics.conflicts.Load()
 			report.DurationSeconds = time.Since(started).Seconds()
 			return report, err
 		}
@@ -323,45 +323,47 @@ func runWriteModeWithOptions(
 		if cp.AlreadyTarget, err = checkedAddUint64(cp.AlreadyTarget, audit.AlreadyTarget, "checkpoint already-target count"); err != nil {
 			return report, err
 		}
+		if cp.Conflicts, err = checkedAddUint64(cp.Conflicts, audit.Conflicts, "checkpoint conditional conflict count"); err != nil {
+			return report, err
+		}
 		if err := saveCheckpoint(checkpointPath, cp); err != nil {
 			return report, err
 		}
 		if err := removeWriteJournal(journalPath); err != nil {
 			return report, err
 		}
-		report.AppliedChanged = int64(cp.Frontier)
+		report.CheckpointFrontier = int64(cp.Frontier)
 		report.CumulativePUTs = cp.PUTAttempts
 		report.CumulativeAlready = cp.AlreadyTarget
 		report.CumulativeUncertain = cp.UncertainPUTs
+		report.CumulativeConflicts = cp.Conflicts
 		journal, journalFound = writeJournal{}, false
 	}
-	report.VerifiedThisRun = metrics.verified.Load()
+	report.CompletedThisRun = metrics.completed.Load()
 	report.AlreadyTarget = metrics.alreadyTarget.Load()
 	report.PUTs = metrics.putAttempts.Load()
 	report.ConfirmedPUTs = metrics.confirmedPUTs.Load()
 	report.UncertainPUTs = metrics.uncertainPUTs.Load()
+	report.Conflicts = metrics.conflicts.Load()
 	report.DurationSeconds = time.Since(started).Seconds()
 	if report.DurationSeconds > 0 {
-		report.ObjectsPerSecond = float64(report.VerifiedThisRun) / report.DurationSeconds
+		report.ObjectsPerSecond = float64(report.CompletedThisRun) / report.DurationSeconds
 	}
-	if report.AppliedChanged != manifest.Changed {
-		return report, fmt.Errorf("%s continuously verified %d records, want %d", mode, report.AppliedChanged, manifest.Changed)
+	if report.CheckpointFrontier != manifest.Changed {
+		return report, fmt.Errorf("%s continuous checkpoint covers %d records, want %d", mode, report.CheckpointFrontier, manifest.Changed)
 	}
-	if report.VerifiedThisRun != manifest.Changed {
-		return report, fmt.Errorf("%s verified %d records this run, want %d", mode, report.VerifiedThisRun, manifest.Changed)
+	expectedThisRun := manifest.Changed - int64(initialFrontier)
+	if report.CompletedThisRun != expectedThisRun {
+		return report, fmt.Errorf("%s completed %d records this run, want %d", mode, report.CompletedThisRun, expectedThisRun)
 	}
 	return report, nil
 }
 
-func validateWriteCheckpointPrefix(
-	ctx context.Context,
-	manifest planManifest,
+func advanceWriteCheckpointPrefix(
 	mode string,
 	cp checkpoint,
 	stream *packStream,
 	options parallelOptions,
-	objects objectStore,
-	metrics *writeMetrics,
 ) error {
 	var last packRecord
 	for last.Ordinal < cp.Frontier {
@@ -372,17 +374,6 @@ func validateWriteCheckpointPrefix(
 		if len(batch) == 0 {
 			return fmt.Errorf("%s checkpoint ordinal %d was not found", mode, cp.Frontier)
 		}
-		prepared, err := prepareWriteBatch(ctx, manifest, batch, mode, options.Concurrency, objects)
-		if err != nil {
-			return fmt.Errorf("revalidate %s checkpoint prefix: %w", mode, err)
-		}
-		for _, item := range prepared {
-			if item.needsPUT {
-				return fmt.Errorf("%s checkpoint prefix height %d no longer contains the target content", mode, item.record.Height)
-			}
-		}
-		metrics.verified.Add(int64(len(prepared)))
-		metrics.alreadyTarget.Add(int64(len(prepared)))
 		last = batch[len(batch)-1]
 	}
 	if last.Ordinal != cp.Frontier {
@@ -499,7 +490,13 @@ func processWriteBatch(
 	objects objectStore,
 	metrics *writeMetrics,
 ) (writeAudit, error) {
-	prepared, err := prepareWriteBatch(ctx, manifest, records, mode, concurrency, objects)
+	var prepared []preparedWrite
+	var err error
+	if mode == applyMode && !recovering {
+		prepared, err = prepareFreshApplyBatch(records)
+	} else {
+		prepared, err = prepareWriteBatch(ctx, manifest, records, mode, concurrency, objects)
+	}
 	if err != nil {
 		return writeAudit{}, err
 	}
@@ -536,6 +533,17 @@ func processWriteBatch(
 		return writeAudit{}, fmt.Errorf("%s batch %d-%d has unresolved write intents", mode, journal.Start, journal.End)
 	}
 	return journalAudit(journal)
+}
+
+func prepareFreshApplyBatch(records []packRecord) ([]preparedWrite, error) {
+	prepared := make([]preparedWrite, len(records))
+	for index, record := range records {
+		if record.OldETag == "" {
+			return nil, fmt.Errorf("apply height %d has no sealed old ETag", record.Height)
+		}
+		prepared[index] = preparedWrite{record: record, needsPUT: true, ifMatch: record.OldETag}
+	}
+	return prepared, nil
 }
 
 func prepareWriteBatch(
@@ -618,7 +626,7 @@ func executeWriteBatch(
 				postETag: prepared[index].observedETag, putOutcome: writeOutcomeReconciled,
 			}
 			metrics.alreadyTarget.Add(1)
-			metrics.verified.Add(1)
+			metrics.completed.Add(1)
 			continue
 		}
 		group.Go(func() error {
@@ -648,14 +656,18 @@ func executePreparedWrite(
 	}
 
 	metrics.putAttempts.Add(1)
-	putErr := objects.Put(ctx, manifest.Bucket, record.Key, targetBody, prepared.ifMatch, record.Headers)
+	putResult, putErr := objects.Put(ctx, manifest.Bucket, record.Key, targetBody, prepared.ifMatch, record.Headers)
+	if mode == applyMode {
+		return resolveApplyPut(ctx, manifest, prepared, putResult, putErr, objects, metrics)
+	}
 	if errors.Is(putErr, errObjectConflict) {
-		return writeOutcome{ordinal: record.Ordinal, putAttempted: true}, fmt.Errorf("%s PUT height %d has a conditional conflict: %w", mode, record.Height, putErr)
+		metrics.conflicts.Add(1)
+		return writeOutcome{ordinal: record.Ordinal, putAttempted: true, conflict: true}, fmt.Errorf("%s PUT height %d has a conditional conflict: %w", mode, record.Height, putErr)
 	}
 	if putErr == nil {
 		metrics.confirmedPUTs.Add(1)
 	}
-	verified, getErr := objects.Get(ctx, manifest.Bucket, record.Key)
+	observed, getErr := objects.Get(ctx, manifest.Bucket, record.Key)
 	if getErr != nil {
 		outcome := ""
 		if putErr == nil {
@@ -666,7 +678,7 @@ func executePreparedWrite(
 			putErr,
 		)
 	}
-	if err := verifyStoredRecordTarget(record, verified, targetSHA); err != nil {
+	if err := verifyStoredRecordTarget(record, observed, targetSHA); err != nil {
 		outcome := ""
 		if putErr == nil {
 			outcome = writeOutcomeConfirmed
@@ -679,14 +691,94 @@ func executePreparedWrite(
 	if putErr != nil {
 		metrics.uncertainPUTs.Add(1)
 	}
-	metrics.verified.Add(1)
+	metrics.completed.Add(1)
 	outcome := writeOutcomeConfirmed
 	if putErr != nil {
 		outcome = writeOutcomeUncertain
 	}
 	return writeOutcome{
-		ordinal: record.Ordinal, postETag: verified.ETag, putOutcome: outcome, putAttempted: true,
+		ordinal: record.Ordinal, postETag: observed.ETag, putOutcome: outcome, putAttempted: true,
 	}, nil
+}
+
+func resolveApplyPut(
+	ctx context.Context,
+	manifest planManifest,
+	prepared preparedWrite,
+	result putResult,
+	putErr error,
+	objects objectStore,
+	metrics *writeMetrics,
+) (writeOutcome, error) {
+	record := prepared.record
+	if putErr == nil {
+		if result.ETag == "" {
+			putErr = fmt.Errorf("%w: PUT response has no ETag", errObjectWriteUncertain)
+		} else {
+			metrics.confirmedPUTs.Add(1)
+			metrics.completed.Add(1)
+			return writeOutcome{
+				ordinal: record.Ordinal, postETag: result.ETag, putOutcome: writeOutcomeConfirmed, putAttempted: true,
+			}, nil
+		}
+	}
+	if !errors.Is(putErr, errObjectConflict) && !errors.Is(putErr, errObjectWriteUncertain) {
+		return writeOutcome{ordinal: record.Ordinal, putAttempted: true}, fmt.Errorf("apply PUT height %d: %w", record.Height, putErr)
+	}
+	if errors.Is(putErr, errObjectConflict) {
+		metrics.conflicts.Add(1)
+	}
+	conflict := errors.Is(putErr, errObjectConflict)
+
+	current, getErr := objects.Get(ctx, manifest.Bucket, record.Key)
+	if getErr != nil {
+		return writeOutcome{ordinal: record.Ordinal, putAttempted: true, conflict: conflict}, errors.Join(
+			fmt.Errorf("apply classify GET height %d: %w", record.Height, getErr),
+			putErr,
+		)
+	}
+	switch sha256Hash(current.Body) {
+	case record.NewSHA256:
+		if err := verifyStoredRecordTarget(record, current, record.NewSHA256); err != nil {
+			return writeOutcome{ordinal: record.Ordinal, putAttempted: true, conflict: conflict}, errors.Join(
+				fmt.Errorf("apply classify target height %d: %w", record.Height, err),
+				putErr,
+			)
+		}
+		outcome := writeOutcomeUncertain
+		if errors.Is(putErr, errObjectConflict) {
+			metrics.alreadyTarget.Add(1)
+			outcome = writeOutcomeReconciled
+		} else {
+			metrics.uncertainPUTs.Add(1)
+		}
+		metrics.completed.Add(1)
+		return writeOutcome{
+			ordinal: record.Ordinal, postETag: current.ETag, putOutcome: outcome, putAttempted: true, conflict: conflict,
+		}, nil
+	case record.OldSHA256:
+		if err := verifyStoredRecordTarget(record, current, record.OldSHA256); err != nil {
+			return writeOutcome{ordinal: record.Ordinal, putAttempted: true, conflict: conflict}, errors.Join(
+				fmt.Errorf("apply classify source height %d: %w", record.Height, err),
+				putErr,
+			)
+		}
+		if current.ETag != prepared.ifMatch {
+			return writeOutcome{ordinal: record.Ordinal, putAttempted: true, conflict: conflict}, errors.Join(
+				fmt.Errorf("apply height %d source ETag changed after conditional PUT", record.Height),
+				putErr,
+			)
+		}
+		return writeOutcome{ordinal: record.Ordinal, putAttempted: true, conflict: conflict}, errors.Join(
+			fmt.Errorf("apply PUT height %d left source content; resume can safely retry", record.Height),
+			putErr,
+		)
+	default:
+		return writeOutcome{ordinal: record.Ordinal, putAttempted: true, conflict: conflict}, errors.Join(
+			fmt.Errorf("apply height %d has third-party content after PUT", record.Height),
+			putErr,
+		)
+	}
 }
 
 func newIssuedWriteJournal(manifest planManifest, manifestHash, mode string, prepared []preparedWrite) writeJournal {
@@ -788,6 +880,12 @@ func updateJournalOutcomes(journal *writeJournal, outcomes []writeOutcome, mode 
 			if err != nil {
 				return err
 			}
+			if outcome.conflict {
+				intent.Conflicts, err = checkedAddUint64(intent.Conflicts, 1, "write intent conditional conflicts")
+			}
+			if err != nil {
+				return err
+			}
 		}
 		if outcome.postETag == "" {
 			continue
@@ -799,6 +897,9 @@ func updateJournalOutcomes(journal *writeJournal, outcomes []writeOutcome, mode 
 				resultOutcome = writeOutcomeConfirmed
 			case intent.UncertainPUTs > 0:
 				resultOutcome = writeOutcomeUncertain
+			case outcome.putAttempted:
+				// A conditional conflict is a definite non-write. Seeing the target
+				// afterwards means this object was already complete.
 			default:
 				// The intent was durable before the PUT. Seeing its target without a
 				// durable result proves that an earlier attempt may have committed.
@@ -837,6 +938,19 @@ func journalAudit(journal writeJournal) (writeAudit, error) {
 			return writeAudit{}, err
 		}
 		if audit.UncertainPUTs, err = checkedAddUint64(audit.UncertainPUTs, intent.UncertainPUTs, "journal uncertain PUTs"); err != nil {
+			return writeAudit{}, err
+		}
+		if audit.Conflicts, err = checkedAddUint64(audit.Conflicts, intent.Conflicts, "journal conditional conflicts"); err != nil {
+			return writeAudit{}, err
+		}
+	}
+	for _, result := range journal.Results {
+		if result.Outcome != writeOutcomeReconciled {
+			continue
+		}
+		var err error
+		audit.AlreadyTarget, err = checkedAddUint64(audit.AlreadyTarget, 1, "journal already-target count")
+		if err != nil {
 			return writeAudit{}, err
 		}
 	}

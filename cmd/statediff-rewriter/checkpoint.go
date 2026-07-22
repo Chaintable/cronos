@@ -27,6 +27,7 @@ type checkpoint struct {
 	ConfirmedPUTs uint64 `json:"confirmed_puts,omitempty"`
 	UncertainPUTs uint64 `json:"uncertain_puts_verified,omitempty"`
 	AlreadyTarget uint64 `json:"already_target,omitempty"`
+	Conflicts     uint64 `json:"conditional_conflicts,omitempty"`
 }
 
 func checkpointChecksum(cp checkpoint) (string, error) {
@@ -104,13 +105,14 @@ func validateCheckpoint(cp checkpoint) error {
 		return fmt.Errorf("checkpoint frontier and height are inconsistent")
 	}
 	if cp.Mode == verifyMode {
-		if cp.PUTAttempts != 0 || cp.ConfirmedPUTs != 0 || cp.UncertainPUTs != 0 || cp.AlreadyTarget != 0 {
+		if cp.PUTAttempts != 0 || cp.ConfirmedPUTs != 0 || cp.UncertainPUTs != 0 || cp.AlreadyTarget != 0 || cp.Conflicts != 0 {
 			return fmt.Errorf("verify checkpoint contains write audit counters")
 		}
 		return nil
 	}
 	if cp.Changed != 0 || cp.ConfirmedPUTs > cp.PUTAttempts ||
 		cp.UncertainPUTs > cp.PUTAttempts-cp.ConfirmedPUTs ||
+		cp.Conflicts > cp.PUTAttempts ||
 		cp.ConfirmedPUTs > cp.Frontier || cp.UncertainPUTs > cp.Frontier-cp.ConfirmedPUTs ||
 		cp.AlreadyTarget != cp.Frontier-cp.ConfirmedPUTs-cp.UncertainPUTs {
 		return fmt.Errorf("checkpoint write audit counters are inconsistent")

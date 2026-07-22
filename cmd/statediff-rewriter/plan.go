@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/hex"
 	"errors"
@@ -744,13 +745,6 @@ func makePackRecord(height uint64, key string, object storedObject, root, parent
 	if old.Hash != root || old.ParentHash != parent {
 		return packRecord{}, false, fmt.Errorf("root mismatch: object %s/%s archive %s/%s", old.Hash, old.ParentHash, root, parent)
 	}
-	equal, noncanonical, conflict, stats, err := compareStorage(old.StorageDiff, canonical)
-	if err != nil {
-		return packRecord{}, false, err
-	}
-	if equal {
-		return packRecord{}, false, nil
-	}
 	newBody, err := replaceStorageDiffRLP(object.Body, canonical)
 	if err != nil {
 		return packRecord{}, false, err
@@ -761,6 +755,9 @@ func makePackRecord(height uint64, key string, object storedObject, root, parent
 	if err := verifyRawRetainedFields(object.Body, newBody); err != nil {
 		return packRecord{}, false, err
 	}
+	if bytes.Equal(object.Body, newBody) {
+		return packRecord{}, false, nil
+	}
 	retained, err := retainedDigest(old)
 	if err != nil {
 		return packRecord{}, false, err
@@ -768,8 +765,7 @@ func makePackRecord(height uint64, key string, object storedObject, root, parent
 	return packRecord{
 		Schema: packSchema, Height: height, Key: key, OldETag: object.ETag,
 		OldBody: object.Body, NewBody: newBody, OldSHA256: sha256Hash(object.Body), NewSHA256: sha256Hash(newBody),
-		Headers: object.Headers, RetainedSHA256: retained, SlotsAdded: stats.Added, SlotsRemoved: stats.Removed,
-		SlotsChanged: stats.Changed, NoncanonicalOld: noncanonical, ConflictingOld: conflict,
+		Headers: object.Headers, RetainedSHA256: retained,
 	}, true, nil
 }
 
@@ -798,11 +794,15 @@ func verifyReencoded(old dtypes.BlockStorageDiff, canonical []dtypes.AccountStor
 	if err := rlp.DecodeBytes(body, &decoded); err != nil {
 		return err
 	}
-	equal, noncanonical, conflict, stats, err := compareStorage(decoded.StorageDiff, canonical)
+	decodedStorage, err := rlp.EncodeToBytes(decoded.StorageDiff)
 	if err != nil {
 		return err
 	}
-	if !equal || noncanonical || conflict || stats != (slotStats{}) {
+	canonicalStorage, err := rlp.EncodeToBytes(canonical)
+	if err != nil {
+		return err
+	}
+	if !bytes.Equal(decodedStorage, canonicalStorage) {
 		return fmt.Errorf("replacement storage is not canonical")
 	}
 	oldRetained, err := retainedDigest(old)

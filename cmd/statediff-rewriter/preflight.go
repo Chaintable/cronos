@@ -10,10 +10,8 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/cosmos/iavl"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/rlp"
-	"github.com/evmos/ethermint/debank/statediff"
 	dtypes "github.com/evmos/ethermint/debank/types"
 )
 
@@ -136,16 +134,9 @@ func validatePackRecordBodies(record packRecord, root, parent common.Hash) error
 			return fmt.Errorf("%s body root mismatch", label)
 		}
 	}
-	equal, noncanonical, conflict, stats, err := compareStorage(oldDiff.StorageDiff, newDiff.StorageDiff)
-	if err != nil {
-		return fmt.Errorf("compare old and new storage: %w", err)
-	}
-	if equal {
-		return fmt.Errorf("old and new storage are already equal and canonical")
-	}
-	if record.SlotsAdded != stats.Added || record.SlotsRemoved != stats.Removed || record.SlotsChanged != stats.Changed ||
-		record.NoncanonicalOld != noncanonical || record.ConflictingOld != conflict {
-		return fmt.Errorf("pack record storage statistics differ from its bodies")
+	if record.SlotsAdded != 0 || record.SlotsRemoved != 0 || record.SlotsChanged != 0 ||
+		record.NoncanonicalOld || record.ConflictingOld {
+		return fmt.Errorf("pack record contains disabled storage comparison statistics")
 	}
 	return nil
 }
@@ -189,108 +180,6 @@ func validateSortedRootsContext(ctx context.Context, path string, manifest planM
 	}
 	if count != manifest.Processed {
 		return fmt.Errorf("sorted root index has %d records, want %d", count, manifest.Processed)
-	}
-	return nil
-}
-
-func validatePlanTargetsAgainstDumpContext(ctx context.Context, planDir string, manifest planManifest) error {
-	dumpDir, err := requireSealedDumpDirectory(manifest.DumpPath)
-	if err != nil {
-		return err
-	}
-	dumpBody, err := readRegularFileNoFollow(filepath.Join(dumpDir, "dump-manifest.v1.json"), "sealed dump manifest")
-	if err != nil {
-		return err
-	}
-	if sha256Hex(dumpBody) != manifest.DumpManifestHash {
-		return fmt.Errorf("dump manifest hash mismatch")
-	}
-	var dumpInfo dumpManifest
-	if err := decodeStrictJSON(dumpBody, &dumpInfo, "dump manifest"); err != nil {
-		return err
-	}
-	if err := validateDumpContext(dumpInfo, dumpContext{
-		Schema: dumpManifestSchema, FirstVersion: 1, LastVersion: manifest.FinalHeight,
-		SnapshotID: manifest.SnapshotID, ArchiveIdentity: manifest.ArchiveIdentity,
-		CronosCommit: manifest.CronosCommit, EthermintCommit: manifest.EthermintCommit,
-		IAVLCommit: manifest.IAVLCommit, ImageDigest: manifest.ImageDigest, BuildTags: manifest.BuildTags,
-	}); err != nil {
-		return err
-	}
-	if _, err := requireReadOnlySealedDump(dumpDir, dumpInfo); err != nil {
-		return err
-	}
-	if err := validateDumpArtifactSet(dumpDir, dumpInfo); err != nil {
-		return err
-	}
-	roots, err := newHeightRootStream(filepath.Join(planDir, manifest.HeightRootIndex), uint64(manifest.FirstHeight))
-	if err != nil {
-		return err
-	}
-	defer roots.Close()
-	pack := newPackStream(planDir, manifest)
-	defer pack.Close()
-	var previousRoot common.Hash
-	var changed int64
-	err = iterateSealedDumpContext(ctx, dumpDir, dumpInfo, func(height int64, changeSet *iavl.ChangeSet) error {
-		if height == 1 {
-			return nil
-		}
-		canonical, err := statediff.CanonicalStorageDiff(changeSet)
-		if err != nil {
-			return fmt.Errorf("height %d canonical storage: %w", height, err)
-		}
-		root, err := roots.Next()
-		if err != nil {
-			return err
-		}
-		if root.Height != uint64(height) {
-			return fmt.Errorf("height root index returned %d for dump height %d", root.Height, height)
-		}
-		record, found, err := pack.Peek()
-		if err != nil {
-			return err
-		}
-		if found && record.Height < uint64(height) {
-			return fmt.Errorf("pack record height %d precedes dump height %d", record.Height, height)
-		}
-		if found && record.Height == uint64(height) {
-			record, _, err = pack.Next()
-			if err != nil {
-				return err
-			}
-			var diff dtypes.BlockStorageDiff
-			if err := rlp.DecodeBytes(record.NewBody, &diff); err != nil {
-				return err
-			}
-			equal, noncanonical, conflict, stats, err := compareStorage(diff.StorageDiff, canonical)
-			if err != nil {
-				return err
-			}
-			if !equal || noncanonical || conflict || stats != (slotStats{}) {
-				return fmt.Errorf("pack height %d target storage differs from sealed dump", height)
-			}
-			changed++
-		}
-		if root.Root == previousRoot && (len(canonical) != 0 || found && record.Height == uint64(height)) {
-			return fmt.Errorf("height %d has changes behind an equal-root short circuit", height)
-		}
-		previousRoot = root.Root
-		return nil
-	})
-	if err != nil {
-		return err
-	}
-	if err := roots.Finish(uint64(manifest.FinalHeight)); err != nil {
-		return err
-	}
-	if _, found, err := pack.Peek(); err != nil {
-		return err
-	} else if found {
-		return fmt.Errorf("pack has records after final dump height")
-	}
-	if changed != manifest.Changed {
-		return fmt.Errorf("dump cross-check saw %d changed records, want %d", changed, manifest.Changed)
 	}
 	return nil
 }

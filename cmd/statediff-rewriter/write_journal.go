@@ -31,6 +31,7 @@ type writeIntent struct {
 	PUTAttempts   uint64 `json:"put_attempts"`
 	ConfirmedPUTs uint64 `json:"confirmed_puts"`
 	UncertainPUTs uint64 `json:"uncertain_puts_verified"`
+	Conflicts     uint64 `json:"conditional_conflicts,omitempty"`
 }
 
 type writeObservedResult struct {
@@ -151,6 +152,7 @@ func validateWriteJournal(journal writeJournal, runID, manifestHash, operation s
 		}
 		if intent.ConfirmedPUTs > 1 || intent.UncertainPUTs > 1 ||
 			intent.ConfirmedPUTs > intent.PUTAttempts || intent.UncertainPUTs > intent.PUTAttempts-intent.ConfirmedPUTs ||
+			intent.Conflicts > intent.PUTAttempts ||
 			intent.ConfirmedPUTs+intent.UncertainPUTs > 1 {
 			return fmt.Errorf("write journal intent %d has inconsistent PUT counters", intent.Ordinal)
 		}
@@ -163,8 +165,11 @@ func validateWriteJournal(journal writeJournal, runID, manifestHash, operation s
 	seenResults := make(map[uint64]struct{}, len(journal.Results))
 	for _, result := range journal.Results {
 		if result.Ordinal < journal.Start || result.Ordinal > journal.End || result.PostPUTETag == "" ||
-			(result.Outcome != writeOutcomeConfirmed && result.Outcome != writeOutcomeUncertain) {
+			(result.Outcome != writeOutcomeConfirmed && result.Outcome != writeOutcomeUncertain && result.Outcome != writeOutcomeReconciled) {
 			return fmt.Errorf("write journal has an invalid observed result")
+		}
+		if result.Outcome == writeOutcomeReconciled && operation != applyMode {
+			return fmt.Errorf("write journal has an invalid reconciled result for %s", operation)
 		}
 		intent, found := intentsByOrdinal[result.Ordinal]
 		if !found {
@@ -178,7 +183,8 @@ func validateWriteJournal(journal writeJournal, runID, manifestHash, operation s
 			return fmt.Errorf("write journal result %d observed the wrong target", result.Ordinal)
 		}
 		if (result.Outcome == writeOutcomeConfirmed && intent.ConfirmedPUTs == 0) ||
-			(result.Outcome == writeOutcomeUncertain && intent.UncertainPUTs == 0) {
+			(result.Outcome == writeOutcomeUncertain && intent.UncertainPUTs == 0) ||
+			(result.Outcome == writeOutcomeReconciled && (intent.PUTAttempts == 0 || intent.Conflicts == 0 || intent.ConfirmedPUTs != 0 || intent.UncertainPUTs != 0)) {
 			return fmt.Errorf("write journal result %d has no matching PUT counter", result.Ordinal)
 		}
 		if _, found := seenResults[result.Ordinal]; found {
@@ -191,13 +197,6 @@ func validateWriteJournal(journal writeJournal, runID, manifestHash, operation s
 	}
 	if journal.State == writeJournalObserved && len(journal.Results) != len(journal.Intents) {
 		return fmt.Errorf("observed write journal has incomplete results")
-	}
-	if journal.State == writeJournalObserved {
-		for _, intent := range journal.Intents {
-			if intent.ConfirmedPUTs == 0 && intent.UncertainPUTs == 0 {
-				return fmt.Errorf("observed write journal intent %d has no verified PUT outcome", intent.Ordinal)
-			}
-		}
 	}
 	return nil
 }

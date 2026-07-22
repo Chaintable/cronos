@@ -20,7 +20,6 @@ import (
 	"github.com/ethereum/go-ethereum/rlp"
 	"github.com/evmos/ethermint/debank/statediff"
 	dtypes "github.com/evmos/ethermint/debank/types"
-	"github.com/holiman/uint256"
 	"github.com/stretchr/testify/require"
 )
 
@@ -39,6 +38,8 @@ type fakeObjectStore struct {
 	gets             map[string]int
 	activeGets       int
 	maxActiveGets    int
+	activePuts       int
+	maxActivePuts    int
 }
 
 func allowTestReadonlyFilesystems(t *testing.T) {
@@ -111,48 +112,64 @@ func (s *fakeObjectStore) getStats() (int, int, map[string]int) {
 	return total, s.maxActiveGets, counts
 }
 
-func (s *fakeObjectStore) Put(ctx context.Context, _, key string, body []byte, ifMatch string, headers objectHeaders) error {
+func (s *fakeObjectStore) putStats() (int, int) {
 	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.puts, s.maxActivePuts
+}
+
+func (s *fakeObjectStore) Put(ctx context.Context, _, key string, body []byte, ifMatch string, headers objectHeaders) (putResult, error) {
+	s.mu.Lock()
+	s.activePuts++
+	if s.activePuts > s.maxActivePuts {
+		s.maxActivePuts = s.activePuts
+	}
 	delay, gate := s.putDelay, s.putGates[key]
 	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		s.activePuts--
+		s.mu.Unlock()
+	}()
 	if delay > 0 {
 		timer := time.NewTimer(delay)
 		defer timer.Stop()
 		select {
 		case <-timer.C:
 		case <-ctx.Done():
-			return ctx.Err()
+			return putResult{}, ctx.Err()
 		}
 	}
 	if gate != nil {
 		select {
 		case <-gate:
 		case <-ctx.Done():
-			return ctx.Err()
+			return putResult{}, ctx.Err()
 		}
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	object, ok := s.objects[key]
 	if !ok {
-		return errors.New("not found")
+		return putResult{}, errors.New("not found")
 	}
 	if object.ETag != ifMatch {
-		return errors.New("precondition failed")
+		return putResult{}, fmt.Errorf("%w: precondition failed", errObjectConflict)
 	}
 	s.puts++
 	injectedErr := s.putErrors[key]
+	postETag := fmt.Sprintf("etag-%d", s.puts)
 	if injectedErr == nil || s.commitOnPutError[key] {
-		s.objects[key] = storedObject{Body: append([]byte(nil), body...), ETag: fmt.Sprintf("etag-%d", s.puts), Headers: cloneObjectHeaders(headers)}
+		s.objects[key] = storedObject{Body: append([]byte(nil), body...), ETag: postETag, Headers: cloneObjectHeaders(headers)}
 	}
 	if injectedErr != nil {
-		return injectedErr
+		return putResult{}, injectedErr
 	}
 	if s.uncertainPut {
 		s.uncertainPut = false
-		return errors.New("timeout after write")
+		return putResult{}, fmt.Errorf("%w: timeout after write", errObjectWriteUncertain)
 	}
-	return nil
+	return putResult{ETag: postETag}, nil
 }
 
 func cloneStoredObject(object storedObject) storedObject {
@@ -228,7 +245,6 @@ func makeSealedPlanRecords(t *testing.T, count int) (string, planManifest, []pac
 			Schema: packSchema, Ordinal: uint64(index + 1), Height: height, Key: objectKey, OldETag: fmt.Sprintf("etag-old-%d", height),
 			OldBody: oldBody, NewBody: newBody, OldSHA256: sha256Hash(oldBody), NewSHA256: sha256Hash(newBody),
 			Headers: objectHeaders{Metadata: metadata, ContentType: "application/octet-stream"}, RetainedSHA256: retained,
-			SlotsChanged: 1,
 		}
 		require.NoError(t, writer.Write(record))
 		records = append(records, record)
@@ -371,7 +387,7 @@ func TestApplyAndRollbackLifecycle(t *testing.T) {
 	report, err := runWriteMode(context.Background(), manifestPath, applyCheckpoint, backup, "apply", store)
 	require.NoError(t, err)
 	require.Equal(t, int64(1), report.PlannedChanged)
-	require.Equal(t, int64(1), report.AppliedChanged)
+	require.Equal(t, int64(1), report.CheckpointFrontier)
 	require.Equal(t, 1, store.puts)
 	require.Equal(t, record.NewSHA256, sha256Hash(store.objects[record.Key].Body))
 	require.Equal(t, record.Headers, store.objects[record.Key].Headers)
@@ -380,19 +396,23 @@ func TestApplyAndRollbackLifecycle(t *testing.T) {
 	require.Equal(t, uint64(1), applyCP.PUTAttempts)
 	require.Equal(t, uint64(1), applyCP.UncertainPUTs)
 	require.Zero(t, applyCP.AlreadyTarget)
+	totalGETs, _, _ := store.getStats()
+	require.Equal(t, 1, totalGETs)
 
 	report, err = runWriteMode(context.Background(), manifestPath, runtimeArtifactPath(manifestPath, "apply-again.json"), backup, "apply", store)
 	require.NoError(t, err)
+	require.Zero(t, report.UncertainPUTs)
 	require.Equal(t, int64(1), report.AlreadyTarget)
+	require.Equal(t, int64(1), report.Conflicts)
 	require.Equal(t, 1, store.puts)
 
 	report, err = runWriteMode(context.Background(), manifestPath, runtimeArtifactPath(manifestPath, "rollback.json"), "", "rollback", store)
 	require.NoError(t, err)
-	require.Equal(t, manifest.Changed, report.AppliedChanged)
+	require.Equal(t, manifest.Changed, report.CheckpointFrontier)
 	require.Equal(t, record.OldSHA256, sha256Hash(store.objects[record.Key].Body))
 }
 
-func TestCompletedCheckpointsCannotMaskLaterStateChanges(t *testing.T) {
+func TestCompletedCheckpointsRemainTerminalWithoutRemoteReads(t *testing.T) {
 	t.Run("apply checkpoint after rollback", func(t *testing.T) {
 		manifestPath, manifest, record, oldObject := makeSealedPlan(t)
 		_, manifestHash, err := loadPlanManifest(manifestPath)
@@ -432,55 +452,73 @@ func TestCompletedCheckpointsCannotMaskLaterStateChanges(t *testing.T) {
 	})
 }
 
-func TestPartialWriteCheckpointRevalidatesPrefix(t *testing.T) {
-	t.Run("rejects prefix reverted to source", func(t *testing.T) {
-		manifestPath, manifest, records, objects := makeSealedPlanRecords(t, 3)
-		_, manifestHash, err := loadPlanManifest(manifestPath)
-		require.NoError(t, err)
-		backup := writeBackupProof(t, manifestPath, manifestHash)
-		checkpointPath := runtimeArtifactPath(manifestPath, "apply-partial.json")
-		require.NoError(t, saveCheckpoint(checkpointPath, checkpoint{
-			RunID: manifest.RunID, ManifestHash: manifestHash, Mode: "apply",
-			Frontier: 1, Height: records[0].Height, AlreadyTarget: 1,
-		}))
-		store := &fakeObjectStore{objects: objects}
+func TestPartialWriteCheckpointAdvancesPackWithoutS3GET(t *testing.T) {
+	manifestPath, manifest, records, objects := makeSealedPlanRecords(t, 3)
+	_, manifestHash, err := loadPlanManifest(manifestPath)
+	require.NoError(t, err)
+	backup := writeBackupProof(t, manifestPath, manifestHash)
+	checkpointPath := runtimeArtifactPath(manifestPath, "apply-partial.json")
+	require.NoError(t, saveCheckpoint(checkpointPath, checkpoint{
+		RunID: manifest.RunID, ManifestHash: manifestHash, Mode: "apply",
+		Frontier: 1, Height: records[0].Height, ConfirmedPUTs: 1, PUTAttempts: 1,
+	}))
+	store := &fakeObjectStore{objects: objects}
 
-		report, err := runWriteModeWithOptions(
-			context.Background(), manifestPath, checkpointPath, backup, "apply", defaultParallelOptions(), store,
-		)
-		require.ErrorContains(t, err, "checkpoint prefix")
-		require.Zero(t, store.puts)
-		require.Zero(t, report.VerifiedThisRun)
-		require.True(t, store.oldVisible(records[0]))
-		require.Equal(t, 1, store.gets[records[0].Key])
+	report, err := runWriteModeWithOptions(
+		context.Background(), manifestPath, checkpointPath, backup, "apply", defaultParallelOptions(), store,
+	)
+	require.NoError(t, err)
+	require.Equal(t, int64(2), report.CompletedThisRun)
+	require.Zero(t, report.AlreadyTarget)
+	totalGETs, _, _ := store.getStats()
+	require.Zero(t, totalGETs)
+	puts, _ := store.putStats()
+	require.Equal(t, 2, puts)
+	require.True(t, store.oldVisible(records[0]))
+	for _, record := range records[1:] {
+		require.True(t, store.targetVisible(record), "height %d", record.Height)
+	}
+}
+
+func TestApplyInterruptionRecoveryGETsOnlyIssuedJournalBatch(t *testing.T) {
+	manifestPath, manifest, records, objects := makeSealedPlanRecords(t, 4)
+	_, manifestHash, err := loadPlanManifest(manifestPath)
+	require.NoError(t, err)
+	backup := writeBackupProof(t, manifestPath, manifestHash)
+	checkpointPath := runtimeArtifactPath(manifestPath, "apply-interrupted.json")
+	require.NoError(t, saveCheckpoint(checkpointPath, checkpoint{
+		RunID: manifest.RunID, ManifestHash: manifestHash, Mode: applyMode,
+		Frontier: 2, Height: records[1].Height, PUTAttempts: 2, ConfirmedPUTs: 2,
+	}))
+	journal := newIssuedWriteJournal(manifest, manifestHash, applyMode, []preparedWrite{
+		{record: records[2], needsPUT: true, ifMatch: records[2].OldETag},
+		{record: records[3], needsPUT: true, ifMatch: records[3].OldETag},
 	})
-
-	t.Run("revalidates target prefix before continuing", func(t *testing.T) {
-		manifestPath, manifest, records, objects := makeSealedPlanRecords(t, 3)
-		_, manifestHash, err := loadPlanManifest(manifestPath)
-		require.NoError(t, err)
-		backup := writeBackupProof(t, manifestPath, manifestHash)
-		checkpointPath := runtimeArtifactPath(manifestPath, "apply-partial.json")
-		require.NoError(t, saveCheckpoint(checkpointPath, checkpoint{
-			RunID: manifest.RunID, ManifestHash: manifestHash, Mode: "apply",
-			Frontier: 1, Height: records[0].Height, AlreadyTarget: 1,
-		}))
-		objects[records[0].Key] = storedObject{
-			Body: records[0].NewBody, ETag: "etag-new", Headers: cloneObjectHeaders(records[0].Headers),
+	require.NoError(t, saveWriteJournal(writeJournalPath(checkpointPath), journal))
+	for _, record := range records[:3] {
+		objects[record.Key] = storedObject{
+			Body: record.NewBody, ETag: "etag-new-" + record.Key, Headers: cloneObjectHeaders(record.Headers),
 		}
-		store := &fakeObjectStore{objects: objects}
+	}
+	store := &fakeObjectStore{objects: objects}
 
-		report, err := runWriteModeWithOptions(
-			context.Background(), manifestPath, checkpointPath, backup, "apply", defaultParallelOptions(), store,
-		)
-		require.NoError(t, err)
-		require.Equal(t, manifest.Changed, report.VerifiedThisRun)
-		require.Equal(t, int64(1), report.AlreadyTarget)
-		require.Equal(t, 2, store.puts)
-		for _, record := range records {
-			require.True(t, store.targetVisible(record), "height %d", record.Height)
-		}
-	})
+	report, err := runWriteModeWithOptions(
+		context.Background(), manifestPath, checkpointPath, backup, applyMode, defaultParallelOptions(), store,
+	)
+	require.NoError(t, err)
+	require.Equal(t, int64(2), report.CompletedThisRun)
+	require.Equal(t, int64(1), report.AlreadyTarget)
+	totalGETs, _, counts := store.getStats()
+	require.Equal(t, 2, totalGETs)
+	require.Zero(t, counts[records[0].Key])
+	require.Zero(t, counts[records[1].Key])
+	require.Equal(t, 1, counts[records[2].Key])
+	require.Equal(t, 1, counts[records[3].Key])
+	puts, _ := store.putStats()
+	require.Equal(t, 1, puts)
+	for _, record := range records {
+		require.True(t, store.targetVisible(record), "height %d", record.Height)
+	}
 }
 
 func TestPartialVerifyCheckpointRevalidatesPrefix(t *testing.T) {
@@ -609,11 +647,13 @@ func TestApplyParallelizesAtTwentyMillisecondObjectLatency(t *testing.T) {
 		context.Background(), manifestPath, runtimeArtifactPath(manifestPath, "apply-rate.json"), backup, "apply", options, store,
 	)
 	require.NoError(t, err)
-	require.Equal(t, int64(1000), report.VerifiedThisRun)
+	require.Equal(t, int64(1000), report.CompletedThisRun)
 	require.Equal(t, int64(1000), report.PUTs)
 	t.Logf("apply rate %.2f objects/s", report.ObjectsPerSecond)
-	total, maximum, _ := store.getStats()
-	require.Equal(t, 2000, total)
+	totalGETs, _, _ := store.getStats()
+	require.Zero(t, totalGETs)
+	puts, maximum := store.putStats()
+	require.Equal(t, 1000, puts)
 	require.GreaterOrEqual(t, maximum, 32)
 }
 
@@ -648,12 +688,14 @@ func TestConcurrentApplyCheckpointNeverCrossesFailureGap(t *testing.T) {
 	close(gate)
 	failed := <-done
 	require.ErrorIs(t, failed.err, boom)
+	totalGETs, _, _ := store.getStats()
+	require.Zero(t, totalGETs)
 
 	cp, err := loadCheckpoint(checkpointPath, manifest.RunID, manifestHash, "apply")
 	require.NoError(t, err)
 	require.Zero(t, cp.Frontier)
 	require.Zero(t, cp.Height)
-	require.Zero(t, failed.report.AppliedChanged)
+	require.Zero(t, failed.report.CheckpointFrontier)
 	journal, found, err := loadWriteJournal(writeJournalPath(checkpointPath), manifest.RunID, manifestHash, "apply")
 	require.NoError(t, err)
 	require.True(t, found)
@@ -694,7 +736,7 @@ func TestConcurrentApplyCheckpointNeverCrossesFailureGap(t *testing.T) {
 	options.MaxInFlightBytes = defaultParallelOptions().MaxInFlightBytes
 	resumed, err := runWriteModeWithOptions(context.Background(), manifestPath, checkpointPath, backup, "apply", options, store)
 	require.NoError(t, err)
-	require.Equal(t, manifest.Changed, resumed.AppliedChanged)
+	require.Equal(t, manifest.Changed, resumed.CheckpointFrontier)
 	require.Positive(t, resumed.AlreadyTarget)
 	for _, record := range records {
 		require.True(t, store.targetVisible(record), "height %d", record.Height)
@@ -863,15 +905,15 @@ func TestConcurrentRollbackRecoversIssuedBatchSymmetrically(t *testing.T) {
 	store.mu.Unlock()
 	report, err := runWriteModeWithOptions(context.Background(), manifestPath, checkpointPath, "", "rollback", options, store)
 	require.NoError(t, err)
-	require.Equal(t, manifest.Changed, report.AppliedChanged)
+	require.Equal(t, manifest.Changed, report.CheckpointFrontier)
 	require.Positive(t, report.AlreadyTarget)
 	for _, record := range records {
 		require.True(t, store.oldVisible(record), "height %d", record.Height)
 	}
 }
 
-func TestApplyConditionalConflictStopsEvenWhenTargetIsVisible(t *testing.T) {
-	manifestPath, _, record, oldObject := makeSealedPlan(t)
+func TestApplyConditionalConflictAcceptsReconciledTarget(t *testing.T) {
+	manifestPath, manifest, record, oldObject := makeSealedPlan(t)
 	_, manifestHash, err := loadPlanManifest(manifestPath)
 	require.NoError(t, err)
 	backup := writeBackupProof(t, manifestPath, manifestHash)
@@ -881,14 +923,128 @@ func TestApplyConditionalConflictStopsEvenWhenTargetIsVisible(t *testing.T) {
 		commitOnPutError: map[string]bool{record.Key: true},
 	}
 	checkpointPath := runtimeArtifactPath(manifestPath, "apply-conflict-target.json")
-	_, err = runWriteMode(context.Background(), manifestPath, checkpointPath, backup, "apply", store)
-	require.ErrorContains(t, err, "conditional conflict")
+	report, err := runWriteMode(context.Background(), manifestPath, checkpointPath, backup, "apply", store)
+	require.NoError(t, err)
 	require.True(t, store.targetVisible(record))
+	require.Zero(t, report.UncertainPUTs)
+	require.Equal(t, int64(1), report.AlreadyTarget)
+	require.Equal(t, int64(1), report.Conflicts)
+	require.Equal(t, uint64(1), report.CumulativeConflicts)
+	require.Equal(t, int64(1), report.CompletedThisRun)
+	totalGETs, _, _ := store.getStats()
+	require.Equal(t, 1, totalGETs)
 	_, statErr := os.Stat(checkpointPath)
-	require.ErrorIs(t, statErr, os.ErrNotExist)
+	require.NoError(t, statErr)
+	checkpoint, err := loadCheckpoint(checkpointPath, manifest.RunID, manifestHash, applyMode)
+	require.NoError(t, err)
+	require.Equal(t, uint64(1), checkpoint.AlreadyTarget)
+	require.Zero(t, checkpoint.UncertainPUTs)
+	require.Equal(t, uint64(1), checkpoint.Conflicts)
+
+	terminalReport, err := runWriteMode(context.Background(), manifestPath, checkpointPath, backup, applyMode, store)
+	require.ErrorContains(t, err, "checkpoint is already complete")
+	require.Equal(t, int64(1), terminalReport.CheckpointFrontier)
+	require.Equal(t, uint64(1), terminalReport.CumulativeConflicts)
+	totalGETsAfterTerminalResume, _, _ := store.getStats()
+	require.Equal(t, totalGETs, totalGETsAfterTerminalResume)
 }
 
-func TestApplyRejectsSourceMetadataDrift(t *testing.T) {
+func TestApplyRecoversDurableConditionalConflictAudit(t *testing.T) {
+	manifestPath, manifest, record, oldObject := makeSealedPlan(t)
+	_, manifestHash, err := loadPlanManifest(manifestPath)
+	require.NoError(t, err)
+	backup := writeBackupProof(t, manifestPath, manifestHash)
+	checkpointPath := runtimeArtifactPath(manifestPath, "apply-conflict-recovery.json")
+
+	journal := newIssuedWriteJournal(manifest, manifestHash, applyMode, []preparedWrite{{
+		record: record, needsPUT: true, ifMatch: record.OldETag,
+	}})
+	journal.State = writeJournalObserved
+	journal.Intents[0].PUTAttempts = 1
+	journal.Intents[0].Conflicts = 1
+	journal.Results = []writeObservedResult{{
+		Ordinal: record.Ordinal, ObservedSHA256: hex.EncodeToString(record.NewSHA256[:]),
+		PostPUTETag: "etag-concurrent-writer", Outcome: writeOutcomeReconciled,
+	}}
+	require.NoError(t, saveWriteJournal(writeJournalPath(checkpointPath), journal))
+	oldObject.Body = append([]byte(nil), record.NewBody...)
+	oldObject.ETag = "etag-concurrent-writer"
+	store := &fakeObjectStore{objects: map[string]storedObject{record.Key: oldObject}}
+
+	report, err := runWriteMode(context.Background(), manifestPath, checkpointPath, backup, applyMode, store)
+	require.NoError(t, err)
+	require.Zero(t, store.puts)
+	require.Zero(t, report.Conflicts)
+	require.Equal(t, uint64(1), report.CumulativeConflicts)
+	require.Equal(t, int64(1), report.CheckpointFrontier)
+
+	cp, err := loadCheckpoint(checkpointPath, manifest.RunID, manifestHash, applyMode)
+	require.NoError(t, err)
+	require.Equal(t, uint64(1), cp.Conflicts)
+	require.Equal(t, uint64(1), cp.AlreadyTarget)
+}
+
+func TestApplyStopsOnUnresolvedSourceAndResumesSafely(t *testing.T) {
+	for name, putErr := range map[string]error{
+		"conditional conflict": errObjectConflict,
+		"uncertain response":   errObjectWriteUncertain,
+	} {
+		t.Run(name, func(t *testing.T) {
+			manifestPath, manifest, record, oldObject := makeSealedPlan(t)
+			_, manifestHash, err := loadPlanManifest(manifestPath)
+			require.NoError(t, err)
+			backup := writeBackupProof(t, manifestPath, manifestHash)
+			checkpointPath := runtimeArtifactPath(manifestPath, "apply-source-retry.json")
+			store := &fakeObjectStore{
+				objects:   map[string]storedObject{record.Key: oldObject},
+				putErrors: map[string]error{record.Key: putErr},
+			}
+
+			report, err := runWriteMode(context.Background(), manifestPath, checkpointPath, backup, applyMode, store)
+			require.ErrorContains(t, err, "left source content")
+			require.Zero(t, report.CheckpointFrontier)
+			require.Zero(t, report.CompletedThisRun)
+			if errors.Is(putErr, errObjectConflict) {
+				require.Equal(t, int64(1), report.Conflicts)
+			} else {
+				require.Zero(t, report.Conflicts)
+			}
+			totalGETs, _, _ := store.getStats()
+			require.Equal(t, 1, totalGETs)
+			journal, found, err := loadWriteJournal(
+				writeJournalPath(checkpointPath), manifest.RunID, manifestHash, applyMode,
+			)
+			require.NoError(t, err)
+			require.True(t, found)
+			require.Equal(t, writeJournalIssued, journal.State)
+			require.Equal(t, uint64(1), journal.Intents[0].PUTAttempts)
+			require.Zero(t, journal.Intents[0].ConfirmedPUTs)
+			require.Zero(t, journal.Intents[0].UncertainPUTs)
+			if errors.Is(putErr, errObjectConflict) {
+				require.Equal(t, uint64(1), journal.Intents[0].Conflicts)
+			} else {
+				require.Zero(t, journal.Intents[0].Conflicts)
+			}
+
+			store.mu.Lock()
+			store.putErrors = nil
+			store.mu.Unlock()
+			report, err = runWriteMode(context.Background(), manifestPath, checkpointPath, backup, applyMode, store)
+			require.NoError(t, err)
+			require.Equal(t, manifest.Changed, report.CheckpointFrontier)
+			require.True(t, store.targetVisible(record))
+			if errors.Is(putErr, errObjectConflict) {
+				require.Equal(t, uint64(1), report.CumulativeConflicts)
+			} else {
+				require.Zero(t, report.CumulativeConflicts)
+			}
+			totalGETs, _, _ = store.getStats()
+			require.Equal(t, 2, totalGETs)
+		})
+	}
+}
+
+func TestApplyRestoresSealedMetadataWithoutPreGET(t *testing.T) {
 	manifestPath, _, record, oldObject := makeSealedPlan(t)
 	_, manifestHash, err := loadPlanManifest(manifestPath)
 	require.NoError(t, err)
@@ -896,7 +1052,10 @@ func TestApplyRejectsSourceMetadataDrift(t *testing.T) {
 	oldObject.Headers.ContentType = "changed/type"
 	store := &fakeObjectStore{objects: map[string]storedObject{record.Key: oldObject}}
 	_, err = runWriteMode(context.Background(), manifestPath, runtimeArtifactPath(manifestPath, "metadata.json"), backup, "apply", store)
-	require.ErrorContains(t, err, "source object metadata changed")
+	require.NoError(t, err)
+	require.True(t, store.targetVisible(record))
+	totalGETs, _, _ := store.getStats()
+	require.Zero(t, totalGETs)
 }
 
 func TestApplyRejectsConflictAndThirdContent(t *testing.T) {
@@ -908,7 +1067,7 @@ func TestApplyRejectsConflictAndThirdContent(t *testing.T) {
 	oldObject.ETag = "different-etag"
 	store := &fakeObjectStore{objects: map[string]storedObject{record.Key: oldObject}}
 	_, err = runWriteMode(context.Background(), manifestPath, runtimeArtifactPath(manifestPath, "conflict.json"), backup, "apply", store)
-	require.ErrorContains(t, err, "changed ETag")
+	require.ErrorContains(t, err, "source ETag changed")
 
 	store.objects[record.Key] = storedObject{Body: []byte("third"), ETag: "third"}
 	_, err = runWriteMode(context.Background(), manifestPath, runtimeArtifactPath(manifestPath, "third.json"), backup, "apply", store)
@@ -927,6 +1086,11 @@ func TestCheckpointRejectsCorruptionAndBindingMismatch(t *testing.T) {
 
 	err = saveCheckpoint(path, checkpoint{
 		RunID: "run", ManifestHash: "hash", Mode: "apply", Frontier: 1, Height: 2,
+	})
+	require.ErrorContains(t, err, "audit counters are inconsistent")
+	err = saveCheckpoint(path, checkpoint{
+		RunID: "run", ManifestHash: "hash", Mode: "apply", Frontier: 1, Height: 2,
+		PUTAttempts: 1, ConfirmedPUTs: 1, Conflicts: 2,
 	})
 	require.ErrorContains(t, err, "audit counters are inconsistent")
 	loaded, err := loadCheckpoint(path, "other", "hash", "apply")
@@ -999,43 +1163,5 @@ func TestApplyPreflightsEntirePackBeforeFirstPUT(t *testing.T) {
 		context.Background(), manifestPath, runtimeArtifactPath(manifestPath, "apply-preflight.json"), backup, "apply", store,
 	)
 	require.ErrorContains(t, err, "pack index")
-	require.Zero(t, store.puts)
-}
-
-func TestWritePreflightRejectsPackTargetThatDiffersFromDump(t *testing.T) {
-	manifestPath, manifest, records, objects := makeSealedPlanRecords(t, 1)
-	record := records[0]
-	var target dtypes.BlockStorageDiff
-	require.NoError(t, rlp.DecodeBytes(record.NewBody, &target))
-	target.StorageDiff[0].Values[0].Value = uint256.NewInt(3)
-	newBody, err := rlp.EncodeToBytes(target)
-	require.NoError(t, err)
-	manifest.NewBytes += int64(len(newBody) - len(record.NewBody))
-	record.NewBody = newBody
-	record.NewSHA256 = sha256Hash(newBody)
-
-	dir := filepath.Dir(manifestPath)
-	for _, chunk := range manifest.Chunks {
-		require.NoError(t, os.Remove(filepath.Join(dir, chunk.Pack)))
-		require.NoError(t, os.Remove(filepath.Join(dir, chunk.Index)))
-	}
-	writer, err := newPackWriter(dir, 1<<30)
-	require.NoError(t, err)
-	require.NoError(t, writer.Write(record))
-	manifest.Chunks, err = writer.Close()
-	require.NoError(t, err)
-	_, err = atomicJSON(manifestPath, manifest)
-	require.NoError(t, err)
-
-	loaded, _, err := loadPlanManifest(manifestPath)
-	require.NoError(t, err)
-	require.NoError(t, validatePlanForWrite(dir, loaded))
-	store := &fakeObjectStore{objects: objects}
-	_, err = runWriteMode(
-		context.Background(), manifestPath, runtimeArtifactPath(manifestPath, "rollback-tampered.json"), "", rollbackMode, store,
-	)
-	require.ErrorContains(t, err, "target storage differs from sealed dump")
-	total, _, _ := store.getStats()
-	require.Zero(t, total)
 	require.Zero(t, store.puts)
 }
