@@ -29,6 +29,22 @@ type refillTestRoots struct {
 	infos map[int64]*storetypes.CommitInfo
 }
 
+type refillTestPutCounter struct {
+	*fakeObjectStore
+	attemptsByKey map[string]int
+}
+
+func (store *refillTestPutCounter) Put(
+	ctx context.Context,
+	bucket, key string,
+	body []byte,
+	ifMatch string,
+	headers objectHeaders,
+) (putResult, error) {
+	store.attemptsByKey[key]++
+	return store.fakeObjectStore.Put(ctx, bucket, key, body, ifMatch, headers)
+}
+
 func (roots *refillTestRoots) commitInfo(version int64) (*storetypes.CommitInfo, error) {
 	info, found := roots.infos[version]
 	if !found {
@@ -79,13 +95,19 @@ func refillTestCanonical(t *testing.T, height int64, value byte) []dtypes.Accoun
 
 func writeRefillTestZZ(t *testing.T, first, last int64) string {
 	t.Helper()
+	path := filepath.Join(t.TempDir(), "block.zz")
+	writeRefillTestZZFile(t, path, first, last)
+	return path
+}
+
+func writeRefillTestZZFile(t *testing.T, path string, first, last int64) {
+	t.Helper()
 	var body []byte
 	for height := first; height <= last; height++ {
 		body = append(body, encodeChangeSet(t, height, refillTestPair(height, refillTestValue(height)))...)
 	}
-	path := filepath.Join(t.TempDir(), "block.zz")
+	require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
 	require.NoError(t, os.WriteFile(path, zlibBody(t, body), 0o600))
-	return path
 }
 
 func refillTestRoot(roots *refillTestRoots, height int64) common.Hash {
@@ -193,6 +215,41 @@ func TestIterateZZRangeFastStopsAtTargetBeforeBadTrailer(t *testing.T) {
 	require.Equal(t, []int64{2, 3}, delivered)
 }
 
+func TestIterateZZDirectoryRangeFastSortsFilesNumerically(t *testing.T) {
+	dir := t.TempDir()
+	writeRefillTestZZFile(t, filepath.Join(dir, "block-10.zz"), 10, 10)
+	writeRefillTestZZFile(t, filepath.Join(dir, "block-2.zz"), 2, 9)
+
+	var delivered []int64
+	err := iterateZZDirectoryRangeFastContext(
+		context.Background(), dir, 2, 10,
+		func(height int64, _ *iavl.ChangeSet) error {
+			delivered = append(delivered, height)
+			return nil
+		},
+	)
+	require.NoError(t, err)
+	require.Equal(t, []int64{2, 3, 4, 5, 6, 7, 8, 9, 10}, delivered)
+}
+
+func TestIterateZZDirectoryRangeFastStartsAndStopsInsideFiles(t *testing.T) {
+	dir := t.TempDir()
+	writeRefillTestZZFile(t, filepath.Join(dir, "block-100.zz"), 100, 104)
+	writeRefillTestZZFile(t, filepath.Join(dir, "block-105.zz"), 105, 109)
+	writeRefillTestZZFile(t, filepath.Join(dir, "block-110.zz"), 110, 114)
+
+	var delivered []int64
+	err := iterateZZDirectoryRangeFastContext(
+		context.Background(), dir, 102, 112,
+		func(height int64, _ *iavl.ChangeSet) error {
+			delivered = append(delivered, height)
+			return nil
+		},
+	)
+	require.NoError(t, err)
+	require.Equal(t, []int64{102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112}, delivered)
+}
+
 func TestRunRefillGetOnlyNeverPuts(t *testing.T) {
 	const first, last = int64(100), int64(102)
 	zz := writeRefillTestZZ(t, first, last)
@@ -287,6 +344,13 @@ func TestRefillOptionsRejectsMoreThanTenThousandHeights(t *testing.T) {
 
 	options.FinalHeight++
 	require.ErrorContains(t, options.prepare(), "refill range exceeds 10000 heights")
+
+	options.ZZFile = ""
+	options.ZZDir = "/tmp/changesets"
+	require.NoError(t, options.prepare(), "directory mode accepts a full refill range")
+
+	options.ZZFile = "/tmp/block.zz"
+	require.ErrorContains(t, options.prepare(), "exactly one of zz and zz-dir")
 }
 
 func TestRunRefillWriteResumesFromPersistedCheckpointAfterFailure(t *testing.T) {
@@ -331,4 +395,52 @@ func TestRunRefillWriteResumesFromPersistedCheckpointAfterFailure(t *testing.T) 
 	require.Equal(t, last, checkpoint.Frontier)
 	require.Equal(t, uint64(last-first+1), checkpoint.Processed)
 	require.Equal(t, uint64(last-first+1), checkpoint.Puts)
+}
+
+func TestRunRefillWriteResumesAcrossZZFileBoundaryWithoutRepeatingCompletedFile(t *testing.T) {
+	const first, boundary, last = int64(100), int64(1_100), int64(1_101)
+	dir := t.TempDir()
+	writeRefillTestZZFile(t, filepath.Join(dir, "block-100.zz"), first, boundary-1)
+	writeRefillTestZZFile(t, filepath.Join(dir, "block-1100.zz"), boundary, last)
+
+	roots := newRefillTestRoots(first, last)
+	objects, keys, _ := refillTestObjects(t, roots, "prefix", first, last, nil)
+	wantErr := errors.New("injected PUT failure")
+	store := &refillTestPutCounter{
+		fakeObjectStore: &fakeObjectStore{
+			objects:   objects,
+			putErrors: map[string]error{keys[boundary]: wantErr},
+		},
+		attemptsByKey: make(map[string]int),
+	}
+	options := refillOptions{
+		ZZDir: dir, ArchiveHome: filepath.Join(t.TempDir(), "archive"),
+		Checkpoint:  filepath.Join(t.TempDir(), "refill-checkpoint.json"),
+		FirstHeight: first, FinalHeight: last, Write: true,
+		Bucket: "bucket", Prefix: "prefix", Region: "region",
+		Concurrency: 1, Window: 1,
+	}
+
+	_, err := runRefillWithReaders(context.Background(), options, roots, store)
+	require.ErrorIs(t, err, wantErr)
+	checkpoint, found, err := loadRefillCheckpoint(options.Checkpoint, options)
+	require.NoError(t, err)
+	require.True(t, found)
+	require.Equal(t, boundary-1, checkpoint.Frontier)
+
+	delete(store.putErrors, keys[boundary])
+	report, err := runRefillWithReaders(context.Background(), options, roots, store)
+	require.NoError(t, err)
+	require.Equal(t, last, report.Frontier)
+	require.Equal(t, uint64(2), report.InvocationProcessed)
+
+	_, _, getsByKey := store.getStats()
+	require.Equal(t, 1, getsByKey[keys[first]])
+	require.Equal(t, 1, getsByKey[keys[boundary-1]])
+	require.Equal(t, 2, getsByKey[keys[boundary]])
+	require.Equal(t, 1, getsByKey[keys[last]])
+	require.Equal(t, 1, store.attemptsByKey[keys[first]])
+	require.Equal(t, 1, store.attemptsByKey[keys[boundary-1]])
+	require.Equal(t, 2, store.attemptsByKey[keys[boundary]])
+	require.Equal(t, 1, store.attemptsByKey[keys[last]])
 }

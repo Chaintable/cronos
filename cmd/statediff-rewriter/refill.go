@@ -9,6 +9,8 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -21,13 +23,16 @@ import (
 )
 
 const (
-	refillCheckpointSchema = "statediff-rewriter-refill-checkpoint/v1"
-	maxRefillHeights       = int64(10_000)
-	refillCheckpointEvery  = uint64(1_000)
+	refillCheckpointSchema          = "statediff-rewriter-refill-checkpoint/v1"
+	refillDirectoryCheckpointSchema = "statediff-rewriter-refill-directory-checkpoint/v1"
+	maxRefillHeights                = int64(10_000)
+	refillCheckpointEvery           = uint64(1_000)
+	refillProgressEvery             = uint64(10_000)
 )
 
 type refillOptions struct {
 	ZZFile      string
+	ZZDir       string
 	ArchiveHome string
 	Checkpoint  string
 	FirstHeight int64
@@ -60,7 +65,8 @@ type refillOutcome struct {
 type refillCheckpoint struct {
 	Schema      string `json:"schema"`
 	Mode        string `json:"mode"`
-	ZZFile      string `json:"zz_file"`
+	ZZFile      string `json:"zz_file,omitempty"`
+	ZZDir       string `json:"zz_dir,omitempty"`
 	ArchiveHome string `json:"archive_home"`
 	FirstHeight int64  `json:"first_height"`
 	FinalHeight int64  `json:"final_height"`
@@ -76,7 +82,8 @@ type refillCheckpoint struct {
 
 type refillReport struct {
 	Mode                string  `json:"mode"`
-	ZZFile              string  `json:"zz_file"`
+	ZZFile              string  `json:"zz_file,omitempty"`
+	ZZDir               string  `json:"zz_dir,omitempty"`
 	ArchiveHome         string  `json:"archive_home"`
 	FirstHeight         int64   `json:"first_height"`
 	FinalHeight         int64   `json:"final_height"`
@@ -102,7 +109,7 @@ func newRefillCommand() *cobra.Command {
 	}
 	command := &cobra.Command{
 		Use:   "refill",
-		Short: "Directly replace stateDiff storage from one changeset file",
+		Short: "Directly replace stateDiff storage from changeset files",
 		RunE: func(command *cobra.Command, _ []string) error {
 			report, err := runRefill(command.Context(), options, nil)
 			if err != nil {
@@ -112,14 +119,14 @@ func newRefillCommand() *cobra.Command {
 		},
 	}
 	command.Flags().StringVar(&options.ZZFile, "zz", "", "changeset block-*.zz file")
+	command.Flags().StringVar(&options.ZZDir, "zz-dir", "", "directory of numerically ordered block-*.zz files")
 	command.Flags().StringVar(&options.ArchiveHome, "home", "", "frozen Cronos archive home")
 	command.Flags().Int64Var(&options.FirstHeight, "first-height", 0, "first block height")
-	command.Flags().Int64Var(&options.FinalHeight, "final-height", 0, "final block height; at most 10,000 blocks")
+	command.Flags().Int64Var(&options.FinalHeight, "final-height", 0, "final block height; one-file mode allows at most 10,000 blocks")
 	command.Flags().BoolVar(&options.Write, "write", false, "PUT replaced objects; the default only performs GET and replacement")
 	command.Flags().StringVar(&options.Checkpoint, "checkpoint", "", "write-mode checkpoint path")
 	command.Flags().IntVar(&options.Concurrency, "concurrency", options.Concurrency, "maximum concurrent S3 operations")
 	command.Flags().IntVar(&options.Window, "window", options.Window, "maximum emitted but not continuously completed operations")
-	_ = command.MarkFlagRequired("zz")
 	_ = command.MarkFlagRequired("home")
 	_ = command.MarkFlagRequired("first-height")
 	_ = command.MarkFlagRequired("final-height")
@@ -127,16 +134,25 @@ func newRefillCommand() *cobra.Command {
 }
 
 func (options *refillOptions) prepare() error {
-	if !filepath.IsAbs(options.ZZFile) || !filepath.IsAbs(options.ArchiveHome) {
-		return fmt.Errorf("zz and home must be absolute paths")
+	if (options.ZZFile == "") == (options.ZZDir == "") {
+		return fmt.Errorf("exactly one of zz and zz-dir is required")
 	}
-	options.ZZFile = filepath.Clean(options.ZZFile)
+	if !filepath.IsAbs(options.ArchiveHome) ||
+		(options.ZZFile != "" && !filepath.IsAbs(options.ZZFile)) ||
+		(options.ZZDir != "" && !filepath.IsAbs(options.ZZDir)) {
+		return fmt.Errorf("zz or zz-dir and home must be absolute paths")
+	}
+	if options.ZZFile != "" {
+		options.ZZFile = filepath.Clean(options.ZZFile)
+	} else {
+		options.ZZDir = filepath.Clean(options.ZZDir)
+	}
 	options.ArchiveHome = filepath.Clean(options.ArchiveHome)
 	options.Prefix = strings.TrimSuffix(options.Prefix, "/")
 	if options.FirstHeight < 2 || options.FinalHeight < options.FirstHeight {
 		return fmt.Errorf("invalid refill range %d-%d", options.FirstHeight, options.FinalHeight)
 	}
-	if options.FinalHeight-options.FirstHeight+1 > maxRefillHeights {
+	if options.ZZFile != "" && options.FinalHeight-options.FirstHeight+1 > maxRefillHeights {
 		return fmt.Errorf("refill range exceeds %d heights", maxRefillHeights)
 	}
 	if options.Bucket == "" || options.Prefix == "" || options.Region == "" {
@@ -157,6 +173,13 @@ func (options *refillOptions) prepare() error {
 		return fmt.Errorf("checkpoint is only used with write mode")
 	}
 	return nil
+}
+
+func (options refillOptions) checkpointSchema() string {
+	if options.ZZDir != "" {
+		return refillDirectoryCheckpointSchema
+	}
+	return refillCheckpointSchema
 }
 
 func runRefill(ctx context.Context, options refillOptions, objects objectStore) (refillReport, error) {
@@ -191,8 +214,8 @@ func runRefillWithReaders(
 	}
 	mode := "get-only"
 	checkpoint := refillCheckpoint{
-		Schema: refillCheckpointSchema, Mode: mode,
-		ZZFile: options.ZZFile, ArchiveHome: options.ArchiveHome,
+		Schema: options.checkpointSchema(), Mode: mode,
+		ZZFile: options.ZZFile, ZZDir: options.ZZDir, ArchiveHome: options.ArchiveHome,
 		FirstHeight: options.FirstHeight, FinalHeight: options.FinalHeight,
 	}
 	if options.Write {
@@ -230,8 +253,21 @@ func runRefillWithReaders(
 		nextSequence := firstSequence
 		err := runOrderedPipeline(ctx, firstSequence, options.Concurrency, options.Window,
 			func(pipelineCtx context.Context, emit func(uint64, refillTask) error) error {
-				return iterateZZRangeFastContext(
-					pipelineCtx, options.ZZFile, startHeight, options.FinalHeight,
+				iterate := func(
+					iteratorCtx context.Context,
+					fn func(int64, *iavl.ChangeSet) error,
+				) error {
+					if options.ZZDir != "" {
+						return iterateZZDirectoryRangeFastContext(
+							iteratorCtx, options.ZZDir, startHeight, options.FinalHeight, fn,
+						)
+					}
+					return iterateZZRangeFastContext(
+						iteratorCtx, options.ZZFile, startHeight, options.FinalHeight, fn,
+					)
+				}
+				return iterate(
+					pipelineCtx,
 					func(height int64, changeSet *iavl.ChangeSet) error {
 						canonical, err := statediff.CanonicalStorageDiff(changeSet)
 						if err != nil {
@@ -283,6 +319,15 @@ func runRefillWithReaders(
 						return err
 					}
 				}
+				if checkpoint.Processed%refillProgressEvery == 0 ||
+					outcome.height == options.FinalHeight {
+					fmt.Fprintf(
+						os.Stderr,
+						"refill progress frontier=%d processed=%d gets=%d puts=%d skipped_equal_root=%d\n",
+						checkpoint.Frontier, checkpoint.Processed, checkpoint.Gets,
+						checkpoint.Puts, checkpoint.Skipped,
+					)
+				}
 				return nil
 			},
 		)
@@ -298,7 +343,7 @@ func runRefillWithReaders(
 		rate = float64(invocationProcessed) / elapsed
 	}
 	return refillReport{
-		Mode: mode, ZZFile: options.ZZFile, ArchiveHome: options.ArchiveHome,
+		Mode: mode, ZZFile: options.ZZFile, ZZDir: options.ZZDir, ArchiveHome: options.ArchiveHome,
 		FirstHeight: options.FirstHeight, FinalHeight: options.FinalHeight,
 		Frontier: checkpoint.Frontier, Processed: checkpoint.Processed,
 		InvocationProcessed: invocationProcessed,
@@ -307,6 +352,90 @@ func runRefillWithReaders(
 		StartedAt: started.UTC().Format(time.RFC3339Nano), FinishedAt: finished.UTC().Format(time.RFC3339Nano),
 		ElapsedSeconds: elapsed, BlocksPerSecond: rate,
 	}, nil
+}
+
+type refillZZFile struct {
+	path  string
+	first int64
+}
+
+func listRefillZZFiles(dir string) ([]refillZZFile, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	files := make([]refillZZFile, 0, len(entries))
+	for _, entry := range entries {
+		name := entry.Name()
+		if !strings.HasPrefix(name, "block-") || !strings.HasSuffix(name, ".zz") {
+			continue
+		}
+		value := strings.TrimSuffix(strings.TrimPrefix(name, "block-"), ".zz")
+		first, err := strconv.ParseInt(value, 10, 64)
+		if err != nil || first < 1 || strconv.FormatInt(first, 10) != value {
+			return nil, fmt.Errorf("invalid changeset filename %q", name)
+		}
+		path := filepath.Join(dir, name)
+		if err := requireRegularFile(path, "refill changeset"); err != nil {
+			return nil, err
+		}
+		files = append(files, refillZZFile{path: path, first: first})
+	}
+	if len(files) == 0 {
+		return nil, fmt.Errorf("no block-*.zz files in %s", dir)
+	}
+	sort.Slice(files, func(i, j int) bool {
+		return files[i].first < files[j].first
+	})
+	for index := 1; index < len(files); index++ {
+		if files[index].first == files[index-1].first {
+			return nil, fmt.Errorf("duplicate changeset start height %d", files[index].first)
+		}
+	}
+	return files, nil
+}
+
+func iterateZZDirectoryRangeFastContext(
+	ctx context.Context,
+	dir string,
+	first, last int64,
+	fn func(int64, *iavl.ChangeSet) error,
+) error {
+	files, err := listRefillZZFiles(dir)
+	if err != nil {
+		return err
+	}
+	startIndex := sort.Search(len(files), func(index int) bool {
+		return files[index].first > first
+	}) - 1
+	if startIndex < 0 {
+		return fmt.Errorf("no changeset file covers height %d", first)
+	}
+	expected := first
+	for index := startIndex; index < len(files) && expected <= last; index++ {
+		fileFirst := expected
+		fileLast := last
+		if index+1 < len(files) && files[index+1].first <= last {
+			fileLast = files[index+1].first - 1
+		}
+		err := iterateZZRangeFastContext(
+			ctx, files[index].path, fileFirst, fileLast,
+			func(height int64, changeSet *iavl.ChangeSet) error {
+				if height != expected {
+					return fmt.Errorf("changeset height %d follows %d", height, expected-1)
+				}
+				expected++
+				return fn(height, changeSet)
+			},
+		)
+		if err != nil {
+			return err
+		}
+	}
+	if expected != last+1 {
+		return fmt.Errorf("changeset directory ended at height %d, want %d", expected-1, last)
+	}
+	return nil
 }
 
 func processRefillTask(
@@ -397,15 +526,18 @@ func loadRefillCheckpoint(path string, options refillOptions) (refillCheckpoint,
 	if err := decodeStrictJSON(body, &checkpoint, "refill checkpoint"); err != nil {
 		return refillCheckpoint{}, false, err
 	}
-	if checkpoint.Schema != refillCheckpointSchema || checkpoint.Mode != "write" ||
-		checkpoint.ZZFile != options.ZZFile || checkpoint.ArchiveHome != options.ArchiveHome ||
+	if checkpoint.Schema != options.checkpointSchema() || checkpoint.Mode != "write" ||
+		checkpoint.ZZFile != options.ZZFile || checkpoint.ZZDir != options.ZZDir ||
+		checkpoint.ArchiveHome != options.ArchiveHome ||
 		checkpoint.FirstHeight != options.FirstHeight || checkpoint.FinalHeight != options.FinalHeight {
 		return refillCheckpoint{}, false, fmt.Errorf("refill checkpoint does not match this run")
 	}
 	if checkpoint.Processed > uint64(options.FinalHeight-options.FirstHeight+1) ||
 		(checkpoint.Processed == 0) != (checkpoint.Frontier == 0) ||
 		(checkpoint.Frontier != 0 && (checkpoint.Frontier < options.FirstHeight ||
-			checkpoint.Frontier > options.FinalHeight)) {
+			checkpoint.Frontier > options.FinalHeight)) ||
+		(checkpoint.Processed > 0 &&
+			checkpoint.Frontier != options.FirstHeight+int64(checkpoint.Processed)-1) {
 		return refillCheckpoint{}, false, fmt.Errorf("refill checkpoint frontier is invalid")
 	}
 	return checkpoint, true, nil
