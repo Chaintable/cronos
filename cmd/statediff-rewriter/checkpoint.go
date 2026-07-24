@@ -10,6 +10,8 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+
+	"github.com/ethereum/go-ethereum/common"
 )
 
 const checkpointSchema = "statediff-rewriter-checkpoint/v1"
@@ -140,7 +142,8 @@ func loadPlanManifestContext(ctx context.Context, path string) (planManifest, st
 	if err := decodeStrictJSON(body, &manifest, "plan manifest"); err != nil {
 		return planManifest{}, "", err
 	}
-	if (manifest.Schema != manifestSchema && manifest.Schema != pilotManifestSchema) || !manifest.Sealed {
+	if (manifest.Schema != manifestSchema && manifest.Schema != pilotManifestSchema &&
+		manifest.Schema != segmentManifestSchema) || !manifest.Sealed {
 		return planManifest{}, "", fmt.Errorf("manifest is not sealed schema v1")
 	}
 	if manifest.RunID == "" || manifest.Bucket != defaultBucket || manifest.Prefix != defaultPrefix || manifest.Region != defaultRegion {
@@ -162,8 +165,22 @@ func loadPlanManifestContext(ctx context.Context, path string) (planManifest, st
 			filepath.Ext(filepath.Clean(manifest.DumpPath)) != ".sealed" {
 			return planManifest{}, "", fmt.Errorf("manifest dump identity is incomplete")
 		}
+		if manifest.DumpProducer != nil {
+			if err := validateDumpSourceContext(*manifest.DumpProducer); err != nil {
+				return planManifest{}, "", fmt.Errorf("manifest dump producer: %w", err)
+			}
+			if manifest.DumpProducer.SnapshotID != manifest.SnapshotID ||
+				manifest.DumpProducer.ArchiveIdentity != manifest.ArchiveIdentity ||
+				manifest.FirstHeight < manifest.DumpProducer.FirstVersion ||
+				manifest.FinalHeight > manifest.DumpProducer.LastVersion {
+				return planManifest{}, "", fmt.Errorf("manifest dump producer does not cover this plan")
+			}
+		} else if manifest.Schema == segmentManifestSchema {
+			return planManifest{}, "", fmt.Errorf("production segment has no dump producer identity")
+		}
 	case planSourceDirectV1:
-		if manifest.DumpPath != "" || manifest.DumpManifestHash != "" || !filepath.IsAbs(manifest.ArchiveIdentity.Home) {
+		if manifest.DumpPath != "" || manifest.DumpManifestHash != "" || manifest.DumpProducer != nil ||
+			!filepath.IsAbs(manifest.ArchiveIdentity.Home) {
 			return planManifest{}, "", fmt.Errorf("manifest direct IAVL identity is invalid")
 		}
 	default:
@@ -174,6 +191,17 @@ func loadPlanManifestContext(ctx context.Context, path string) (planManifest, st
 	}
 	if manifest.Schema == manifestSchema && (manifest.FirstHeight != 2 || manifest.FinalHeight != manifest.ArchiveIdentity.LatestVersion) {
 		return planManifest{}, "", fmt.Errorf("full manifest does not cover blocks 2 through archive latest")
+	}
+	if manifest.FirstHeight == 2 {
+		if manifest.InitialParentRoot != (common.Hash{}) {
+			return planManifest{}, "", fmt.Errorf("block 2 manifest has a non-zero initial parent root")
+		}
+	} else if manifest.InitialParentRoot == (common.Hash{}) {
+		return planManifest{}, "", fmt.Errorf("partial manifest has a zero initial parent root")
+	}
+	if manifest.Schema == segmentManifestSchema &&
+		manifest.FinalHeight-manifest.FirstHeight+1 > maxSegmentHeights {
+		return planManifest{}, "", fmt.Errorf("production segment exceeds %d heights", maxSegmentHeights)
 	}
 	expectedProcessed := manifest.FinalHeight - manifest.FirstHeight + 1
 	if manifest.Processed != expectedProcessed || manifest.Processed < 0 || manifest.Changed < 0 ||
@@ -322,8 +350,8 @@ func samePlanProgress(left, right planManifest) bool {
 		left.SlotsChanged == right.SlotsChanged && left.OldBytes == right.OldBytes && left.NewBytes == right.NewBytes
 }
 
-func requireFullPlan(manifest planManifest, operation string) error {
-	if manifest.Schema != manifestSchema {
+func requireProductionPlan(manifest planManifest, operation string) error {
+	if manifest.Schema != manifestSchema && manifest.Schema != segmentManifestSchema {
 		return fmt.Errorf("pilot plans support plan only; %s is disabled", operation)
 	}
 	return nil

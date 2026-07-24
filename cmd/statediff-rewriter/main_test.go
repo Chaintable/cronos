@@ -9,7 +9,7 @@ import (
 
 func TestCommandsRejectPositionalArguments(t *testing.T) {
 	root := newRootCommand()
-	commands := append([]string{root.Name()}, "dump", "plan", "apply", "verify", "rollback")
+	commands := append([]string{root.Name()}, "dump", "refill", "plan", "apply", "verify", "rollback")
 	for _, name := range commands {
 		command := root
 		if name != root.Name() {
@@ -52,7 +52,7 @@ func TestStopAfterLegacyOnlyAppearsOnDump(t *testing.T) {
 	trustFlag := dump.Flags().Lookup("legacy-trust-node-set")
 	require.NotNil(t, trustFlag)
 	require.Equal(t, "false", trustFlag.DefValue)
-	for _, name := range []string{"plan", "apply", "verify", "rollback"} {
+	for _, name := range []string{"refill", "plan", "apply", "verify", "rollback"} {
 		command, _, findErr := root.Find([]string{name})
 		require.NoError(t, findErr)
 		require.Nil(t, command.Flags().Lookup("stop-after-legacy"), name)

@@ -31,7 +31,8 @@ func validatePlanForWriteContext(ctx context.Context, dir string, manifest planM
 	stream := newPackStream(dir, manifest)
 	defer stream.Close()
 	var currentHeight uint64
-	var currentRoot, parentRoot common.Hash
+	currentRoot := manifest.InitialParentRoot
+	var parentRoot common.Hash
 	var slotsAdded, slotsRemoved, slotsChanged uint64
 	var oldBytes, newBytes, changedCanonical, changedConflict int64
 	for {

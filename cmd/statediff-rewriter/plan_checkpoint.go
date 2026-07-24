@@ -154,8 +154,16 @@ func samePlanIdentity(left, right planManifest) bool {
 		left.FinalHeight == right.FinalHeight && left.CronosCommit == right.CronosCommit &&
 		left.EthermintCommit == right.EthermintCommit && left.IAVLCommit == right.IAVLCommit &&
 		effectivePlanSourceMode(left) == effectivePlanSourceMode(right) && left.DumpPath == right.DumpPath &&
-		left.DumpManifestHash == right.DumpManifestHash && left.ArchiveIdentity == right.ArchiveIdentity &&
+		left.DumpManifestHash == right.DumpManifestHash && sameDumpProducer(left.DumpProducer, right.DumpProducer) &&
+		left.ArchiveIdentity == right.ArchiveIdentity && left.InitialParentRoot == right.InitialParentRoot &&
 		left.SnapshotID == right.SnapshotID && left.ImageDigest == right.ImageDigest && left.BuildTags == right.BuildTags
+}
+
+func sameDumpProducer(left, right *dumpContext) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	return *left == *right
 }
 
 type planCheckpointSaver struct {

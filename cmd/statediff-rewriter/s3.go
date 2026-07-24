@@ -41,11 +41,25 @@ type objectStore interface {
 }
 
 type s3ObjectStore struct {
-	readClient  *s3.Client
-	writeClient *s3.Client
+	readClient            *s3.Client
+	writeClient           *s3.Client
+	validateGetAttributes bool
 }
 
 func newS3ObjectStore(ctx context.Context, region string, concurrency int) (*s3ObjectStore, error) {
+	return newS3ObjectStoreWithValidation(ctx, region, concurrency, true)
+}
+
+func newRefillS3ObjectStore(ctx context.Context, region string, concurrency int) (*s3ObjectStore, error) {
+	return newS3ObjectStoreWithValidation(ctx, region, concurrency, false)
+}
+
+func newS3ObjectStoreWithValidation(
+	ctx context.Context,
+	region string,
+	concurrency int,
+	validateGetAttributes bool,
+) (*s3ObjectStore, error) {
 	if concurrency < 1 || concurrency > maximumObjectConcurrency {
 		return nil, fmt.Errorf("S3 concurrency must be between 1 and %d", maximumObjectConcurrency)
 	}
@@ -66,7 +80,10 @@ func newS3ObjectStore(ctx context.Context, region string, concurrency int) (*s3O
 			standard.MaxAttempts = 1
 		})
 	})
-	return &s3ObjectStore{readClient: readClient, writeClient: writeClient}, nil
+	return &s3ObjectStore{
+		readClient: readClient, writeClient: writeClient,
+		validateGetAttributes: validateGetAttributes,
+	}, nil
 }
 
 func (s *s3ObjectStore) Get(ctx context.Context, bucket, key string) (storedObject, error) {
@@ -86,8 +103,10 @@ func (s *s3ObjectStore) Get(ctx context.Context, bucket, key string) (storedObje
 	if err != nil {
 		return storedObject{}, err
 	}
-	if err := validateS3ExpressObject(output); err != nil {
-		return storedObject{}, fmt.Errorf("object %s has unsupported attributes: %w", key, err)
+	if s.validateGetAttributes {
+		if err := validateS3ExpressObject(output); err != nil {
+			return storedObject{}, fmt.Errorf("object %s has unsupported attributes: %w", key, err)
+		}
 	}
 	if aws.ToString(output.ETag) == "" {
 		return storedObject{}, fmt.Errorf("object %s has no ETag", key)

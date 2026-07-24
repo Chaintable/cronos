@@ -27,28 +27,32 @@ import (
 )
 
 type planOptions struct {
-	DumpStaging      string
-	Direct           bool
-	IAVLCacheSize    int
-	IAVLConcurrency  int
-	ArchiveHome      string
-	Output           string
-	Bucket           string
-	Prefix           string
-	Region           string
-	MinFree          uint64
-	SnapshotID       string
-	ImageDigest      string
-	Pilot            bool
-	PilotFirstHeight int64
-	PilotFinalHeight int64
-	Parallel         parallelOptions
+	DumpStaging        string
+	Direct             bool
+	IAVLCacheSize      int
+	IAVLConcurrency    int
+	ArchiveHome        string
+	Output             string
+	Bucket             string
+	Prefix             string
+	Region             string
+	MinFree            uint64
+	SnapshotID         string
+	ImageDigest        string
+	Pilot              bool
+	PilotFirstHeight   int64
+	PilotFinalHeight   int64
+	Segment            bool
+	SegmentFirstHeight int64
+	SegmentFinalHeight int64
+	Parallel           parallelOptions
 }
 
 const (
 	planBufferedWriteReserve = uint64(3 << 20)
 	planInitialWriteReserve  = uint64(4 << 20)
 	directTraversalChunkSize = int64(100_000)
+	maxSegmentHeights        = int64(10_000)
 )
 
 type planRange struct {
@@ -129,22 +133,129 @@ func resolvePlanRange(options planOptions, latestVersion int64) (planRange, erro
 	if latestVersion < 2 {
 		return planRange{}, fmt.Errorf("archive latest version %d is below block 2", latestVersion)
 	}
-	if !options.Pilot {
+	if options.Pilot && options.Segment {
+		return planRange{}, fmt.Errorf("pilot and production segment modes are mutually exclusive")
+	}
+	if !options.Pilot && !options.Segment {
 		if options.PilotFirstHeight != 0 || options.PilotFinalHeight != 0 {
 			return planRange{}, fmt.Errorf("pilot heights require explicit pilot mode")
+		}
+		if options.SegmentFirstHeight != 0 || options.SegmentFinalHeight != 0 {
+			return planRange{}, fmt.Errorf("segment heights require explicit segment mode")
 		}
 		return planRange{
 			FirstHeight: 2, FinalHeight: latestVersion, DumpFirstVersion: 1,
 			ManifestSchema: manifestSchema, DumpSchema: dumpManifestSchema,
 		}, nil
 	}
-	if options.PilotFirstHeight < 2 || options.PilotFinalHeight < options.PilotFirstHeight || options.PilotFinalHeight > latestVersion {
-		return planRange{}, fmt.Errorf("invalid pilot range %d-%d for archive latest %d", options.PilotFirstHeight, options.PilotFinalHeight, latestVersion)
+	if options.Pilot {
+		if options.SegmentFirstHeight != 0 || options.SegmentFinalHeight != 0 {
+			return planRange{}, fmt.Errorf("segment heights require explicit segment mode")
+		}
+		if options.PilotFirstHeight < 2 || options.PilotFinalHeight < options.PilotFirstHeight || options.PilotFinalHeight > latestVersion {
+			return planRange{}, fmt.Errorf("invalid pilot range %d-%d for archive latest %d", options.PilotFirstHeight, options.PilotFinalHeight, latestVersion)
+		}
+		return planRange{
+			FirstHeight: options.PilotFirstHeight, FinalHeight: options.PilotFinalHeight,
+			DumpFirstVersion: options.PilotFirstHeight, ManifestSchema: pilotManifestSchema, DumpSchema: pilotDumpManifestSchema,
+		}, nil
+	}
+	if options.PilotFirstHeight != 0 || options.PilotFinalHeight != 0 {
+		return planRange{}, fmt.Errorf("pilot heights require explicit pilot mode")
+	}
+	if options.SegmentFirstHeight < 2 || options.SegmentFinalHeight < options.SegmentFirstHeight ||
+		options.SegmentFinalHeight > latestVersion {
+		return planRange{}, fmt.Errorf(
+			"invalid production segment range %d-%d for archive latest %d",
+			options.SegmentFirstHeight, options.SegmentFinalHeight, latestVersion,
+		)
+	}
+	if options.SegmentFinalHeight-options.SegmentFirstHeight+1 > maxSegmentHeights {
+		return planRange{}, fmt.Errorf("production segment exceeds %d heights", maxSegmentHeights)
 	}
 	return planRange{
-		FirstHeight: options.PilotFirstHeight, FinalHeight: options.PilotFinalHeight,
-		DumpFirstVersion: options.PilotFirstHeight, ManifestSchema: pilotManifestSchema, DumpSchema: pilotDumpManifestSchema,
+		FirstHeight: options.SegmentFirstHeight, FinalHeight: options.SegmentFinalHeight,
+		DumpFirstVersion: options.SegmentFirstHeight,
+		ManifestSchema:   segmentManifestSchema, DumpSchema: pilotDumpManifestSchema,
 	}, nil
+}
+
+func prepareSegmentDumpContext(
+	ctx context.Context,
+	path, snapshotID string,
+	identity archiveIdentity,
+	first, last int64,
+) (string, dumpManifest, string, dumpContext, error) {
+	cleanPath := filepath.Clean(path)
+	sourceRoot := cleanPath
+	if strings.HasSuffix(cleanPath, ".staging") {
+		sealedSibling := strings.TrimSuffix(cleanPath, ".staging") + ".sealed"
+		_, stagingErr := os.Lstat(cleanPath)
+		_, sealedErr := os.Lstat(sealedSibling)
+		if stagingErr != nil && !errors.Is(stagingErr, os.ErrNotExist) {
+			return "", dumpManifest{}, "", dumpContext{}, stagingErr
+		}
+		if sealedErr != nil && !errors.Is(sealedErr, os.ErrNotExist) {
+			return "", dumpManifest{}, "", dumpContext{}, sealedErr
+		}
+		if stagingErr == nil && sealedErr == nil {
+			return "", dumpManifest{}, "", dumpContext{}, fmt.Errorf(
+				"both staging and sealed dumps exist: %s and %s", cleanPath, sealedSibling,
+			)
+		}
+		if errors.Is(stagingErr, os.ErrNotExist) && sealedErr == nil {
+			sourceRoot = sealedSibling
+		}
+	}
+	source, sourceHash, found, err := loadDumpSource(filepath.Join(sourceRoot, dumpSourceFileName))
+	if err != nil {
+		return "", dumpManifest{}, "", dumpContext{}, err
+	}
+	if !found {
+		return "", dumpManifest{}, "", dumpContext{}, fmt.Errorf("production segment dump has no source manifest")
+	}
+	if source.Context.SnapshotID != snapshotID {
+		return "", dumpManifest{}, "", dumpContext{}, fmt.Errorf(
+			"dump source snapshot %q differs from plan snapshot %q",
+			source.Context.SnapshotID, snapshotID,
+		)
+	}
+	if source.Context.ArchiveIdentity != identity {
+		return "", dumpManifest{}, "", dumpContext{}, fmt.Errorf("dump source archive identity differs from plan archive")
+	}
+	if first < source.Context.FirstVersion || last > source.Context.LastVersion {
+		return "", dumpManifest{}, "", dumpContext{}, fmt.Errorf(
+			"production segment range %d-%d is outside dump source range %d-%d",
+			first, last, source.Context.FirstVersion, source.Context.LastVersion,
+		)
+	}
+
+	if strings.HasSuffix(cleanPath, ".staging") {
+		sealed, manifest, manifestHash, err := prepareDumpContext(ctx, cleanPath, source.Context)
+		return sealed, manifest, manifestHash, source.Context, err
+	}
+	sealed, err := requireSealedDumpDirectory(cleanPath)
+	if err != nil {
+		return "", dumpManifest{}, "", dumpContext{}, err
+	}
+	body, err := readRegularFileNoFollow(filepath.Join(sealed, "dump-manifest.v1.json"), "sealed dump manifest")
+	if err != nil {
+		return "", dumpManifest{}, "", dumpContext{}, err
+	}
+	var manifest dumpManifest
+	if err := decodeStrictJSON(body, &manifest, "dump manifest"); err != nil {
+		return "", dumpManifest{}, "", dumpContext{}, err
+	}
+	if err := validateDumpContext(manifest, source.Context); err != nil {
+		return "", dumpManifest{}, "", dumpContext{}, err
+	}
+	if manifest.SourceManifestSHA256 != sourceHash {
+		return "", dumpManifest{}, "", dumpContext{}, fmt.Errorf("sealed dump source manifest changed")
+	}
+	if err := validateDumpArtifactSet(sealed, manifest); err != nil {
+		return "", dumpManifest{}, "", dumpContext{}, err
+	}
+	return sealed, manifest, sha256Hex(body), source.Context, nil
 }
 
 func iterateDirectStateChangesContext(
@@ -260,17 +371,32 @@ func runPlan(ctx context.Context, options planOptions, objects objectStore) (pla
 	if err := requireRuntimeBuild(cronosCommit, ethermintCommit, iavlCommit, options.ImageDigest, version.BuildTags); err != nil {
 		return planManifest{}, "", err
 	}
+	_, initialParentRoot, err := archiveRoots(archive, scope.FirstHeight)
+	if err != nil {
+		return planManifest{}, "", fmt.Errorf("read initial parent root: %w", err)
+	}
 	var sealedDump, dumpHash string
 	var dumpInfo dumpManifest
+	var dumpProducer *dumpContext
 	sourceMode := planSourceDirectV1
 	if !options.Direct {
 		sourceMode = planSourceDumpV1
-		sealedDump, dumpInfo, dumpHash, err = prepareDumpContext(ctx, options.DumpStaging, dumpContext{
-			Schema: scope.DumpSchema, FirstVersion: scope.DumpFirstVersion, LastVersion: scope.FinalHeight,
-			SnapshotID: options.SnapshotID, ArchiveIdentity: identity, CronosCommit: cronosCommit,
-			EthermintCommit: ethermintCommit, IAVLCommit: iavlCommit,
-			ImageDigest: options.ImageDigest, BuildTags: version.BuildTags,
-		})
+		if options.Segment {
+			var producer dumpContext
+			sealedDump, dumpInfo, dumpHash, producer, err = prepareSegmentDumpContext(
+				ctx, options.DumpStaging, options.SnapshotID, identity, scope.FirstHeight, scope.FinalHeight,
+			)
+			dumpProducer = &producer
+		} else {
+			expectedDump := dumpContext{
+				Schema: scope.DumpSchema, FirstVersion: scope.DumpFirstVersion, LastVersion: scope.FinalHeight,
+				SnapshotID: options.SnapshotID, ArchiveIdentity: identity, CronosCommit: cronosCommit,
+				EthermintCommit: ethermintCommit, IAVLCommit: iavlCommit,
+				ImageDigest: options.ImageDigest, BuildTags: version.BuildTags,
+			}
+			sealedDump, dumpInfo, dumpHash, err = prepareDumpContext(ctx, options.DumpStaging, expectedDump)
+			dumpProducer = &expectedDump
+		}
 		if err != nil {
 			return planManifest{}, "", err
 		}
@@ -280,7 +406,8 @@ func runPlan(ctx context.Context, options planOptions, objects objectStore) (pla
 		Bucket: options.Bucket, Prefix: strings.TrimSuffix(options.Prefix, "/"), Region: options.Region,
 		FirstHeight: scope.FirstHeight, FinalHeight: scope.FinalHeight,
 		CronosCommit: cronosCommit, EthermintCommit: ethermintCommit, IAVLCommit: iavlCommit,
-		SourceMode: sourceMode, DumpPath: sealedDump, DumpManifestHash: dumpHash, ArchiveIdentity: identity,
+		SourceMode: sourceMode, DumpPath: sealedDump, DumpManifestHash: dumpHash, DumpProducer: dumpProducer,
+		ArchiveIdentity: identity, InitialParentRoot: initialParentRoot,
 		SnapshotID: options.SnapshotID, ImageDigest: options.ImageDigest, BuildTags: version.BuildTags,
 	}
 	if existing, manifestPath, found, err := reuseSealedPlanContext(ctx, sealedPlan, expectedManifest); err != nil {
@@ -442,7 +569,7 @@ func runPlan(ctx context.Context, options planOptions, objects objectStore) (pla
 				scope.FirstHeight, scope.FinalHeight, callback,
 			)
 		}
-		return iterateSealedDumpContext(iterCtx, sealedDump, dumpInfo, func(height int64, changeSet *iavl.ChangeSet) error {
+		consume := func(height int64, changeSet *iavl.ChangeSet) error {
 			if height == 1 && scope.FirstHeight == 2 {
 				return callback(height, nil)
 			}
@@ -451,7 +578,13 @@ func runPlan(ctx context.Context, options planOptions, objects objectStore) (pla
 				return fmt.Errorf("height %d canonical storage: %w", height, err)
 			}
 			return callback(height, canonical)
-		})
+		}
+		if options.Segment {
+			return iterateSealedDumpRangeContext(
+				iterCtx, sealedDump, dumpInfo, scope.FirstHeight, scope.FinalHeight, consume,
+			)
+		}
+		return iterateSealedDumpContext(iterCtx, sealedDump, dumpInfo, consume)
 	}
 	err = runOrderedPipeline(ctx, firstSequence, options.Parallel.Concurrency, options.Parallel.Window,
 		func(pipelineCtx context.Context, emit func(uint64, planTask) error) error {
@@ -466,6 +599,12 @@ func runPlan(ctx context.Context, options planOptions, objects objectStore) (pla
 				root, parent, err := rootCursor.Next(height)
 				if err != nil {
 					return err
+				}
+				if height == scope.FirstHeight && parent != manifest.InitialParentRoot {
+					return fmt.Errorf(
+						"initial parent root changed: got %s, sealed %s",
+						parent, manifest.InitialParentRoot,
+					)
 				}
 				if root == parent && len(canonical) != 0 {
 					return fmt.Errorf("height %d has storage changes behind an equal-root short circuit", height)
@@ -651,7 +790,16 @@ func runPlan(ctx context.Context, options planOptions, objects objectStore) (pla
 		if err := validateSealedDumpManifest(sealedDump, dumpInfo, dumpHash); err != nil {
 			return planManifest{}, "", err
 		}
-		if err := validateSealedDumpArtifactsContext(ctx, sealedDump, dumpInfo); err != nil {
+		validateDump := func() error {
+			if options.Segment {
+				return iterateSealedDumpRangeContext(
+					ctx, sealedDump, dumpInfo, scope.FirstHeight, scope.FinalHeight,
+					func(int64, *iavl.ChangeSet) error { return nil },
+				)
+			}
+			return validateSealedDumpArtifactsContext(ctx, sealedDump, dumpInfo)
+		}
+		if err := validateDump(); err != nil {
 			return planManifest{}, "", fmt.Errorf("sealed dump changed during plan: %w", err)
 		}
 	}

@@ -532,6 +532,90 @@ func iterateSealedDumpContext(ctx context.Context, path string, manifest dumpMan
 	return nil
 }
 
+func iterateSealedDumpRangeContext(
+	ctx context.Context,
+	path string,
+	manifest dumpManifest,
+	first, last int64,
+	fn func(int64, *iavl.ChangeSet) error,
+) error {
+	if ctx == nil {
+		return fmt.Errorf("iterate sealed dump range context is required")
+	}
+	if fn == nil {
+		return fmt.Errorf("iterate sealed dump range callback is required")
+	}
+	if first < 1 || last < first {
+		return fmt.Errorf("invalid sealed dump range %d-%d", first, last)
+	}
+	if first < manifest.FirstVersion || last > manifest.LastVersion {
+		return fmt.Errorf(
+			"sealed dump range %d-%d is outside manifest range %d-%d",
+			first, last, manifest.FirstVersion, manifest.LastVersion,
+		)
+	}
+	path, err := requireSealedDumpDirectory(path)
+	if err != nil {
+		return err
+	}
+	if err := validateDumpArtifactSet(path, manifest); err != nil {
+		return err
+	}
+	if manifest.SourceManifestSHA256 != "" {
+		sourcePath := filepath.Join(path, dumpSourceFileName)
+		if err := requireRegularFile(sourcePath, "sealed dump source manifest"); err != nil {
+			return err
+		}
+		_, sourceHash, found, err := loadDumpSource(sourcePath)
+		if err != nil {
+			return err
+		}
+		if !found || sourceHash != manifest.SourceManifestSHA256 {
+			return fmt.Errorf("sealed dump source manifest changed")
+		}
+	}
+
+	var delivered int64
+	var touched bool
+	for _, file := range manifest.Files {
+		if file.LastVersion < first || file.FirstVersion > last {
+			continue
+		}
+		touched = true
+		filePath, err := requireDumpArtifact(path, file.Path)
+		if err != nil {
+			return err
+		}
+		entry, err := scanZlibChangeSetsContext(ctx, filePath, func(version int64, changeSet *iavl.ChangeSet) error {
+			if version < first || version > last {
+				return nil
+			}
+			expected := first + delivered
+			if version != expected {
+				return fmt.Errorf("dump version %d, want %d", version, expected)
+			}
+			delivered++
+			return fn(version, changeSet)
+		})
+		if err != nil {
+			return err
+		}
+		if entry.SHA256 != file.SHA256 || entry.Size != file.Size ||
+			entry.FirstVersion != file.FirstVersion || entry.LastVersion != file.LastVersion ||
+			entry.Records != file.Records {
+			return fmt.Errorf("sealed dump file changed: %s", file.Path)
+		}
+	}
+	expectedRecords := last - first + 1
+	if !touched || delivered != expectedRecords {
+		return fmt.Errorf(
+			"sealed dump range %d-%d contains %d records, want %d",
+			first, last, delivered, expectedRecords,
+		)
+	}
+	return nil
+}
+
 func validateSealedDumpArtifactsContext(ctx context.Context, path string, manifest dumpManifest) error {
 	if ctx == nil {
 		return fmt.Errorf("validate sealed dump context is required")

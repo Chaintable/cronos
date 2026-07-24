@@ -187,7 +187,7 @@ func runWriteModeWithOptions(
 	if err != nil {
 		return writeReport{}, err
 	}
-	if err := requireFullPlan(manifest, mode); err != nil {
+	if err := requireProductionPlan(manifest, mode); err != nil {
 		return writeReport{}, err
 	}
 	if err := requireRuntimeBuildIdentity(manifest); err != nil {
@@ -1049,7 +1049,7 @@ func runVerifyWithOptions(
 	if err != nil {
 		return verifyReport{}, err
 	}
-	if err := requireFullPlan(manifest, "verify"); err != nil {
+	if err := requireProductionPlan(manifest, "verify"); err != nil {
 		return verifyReport{}, err
 	}
 	if err := requireRuntimeBuildIdentity(manifest); err != nil {
@@ -1080,20 +1080,32 @@ func runVerifyWithOptions(
 		if err := decodeStrictJSON(dumpBody, &dumpInfo, "dump manifest"); err != nil {
 			return verifyReport{}, err
 		}
-		if err := validateDumpContext(dumpInfo, dumpContext{
-			Schema: dumpManifestSchema, FirstVersion: 1, LastVersion: manifest.FinalHeight,
-			SnapshotID: manifest.SnapshotID, ArchiveIdentity: manifest.ArchiveIdentity,
-			CronosCommit: manifest.CronosCommit, EthermintCommit: manifest.EthermintCommit,
-			IAVLCommit:  manifest.IAVLCommit,
-			ImageDigest: manifest.ImageDigest, BuildTags: manifest.BuildTags,
-		}); err != nil {
-			return verifyReport{}, err
+		if manifest.Schema == segmentManifestSchema {
+			if manifest.DumpProducer == nil {
+				return verifyReport{}, fmt.Errorf("production segment has no dump producer identity")
+			}
+			if err := validateDumpContext(dumpInfo, *manifest.DumpProducer); err != nil {
+				return verifyReport{}, err
+			}
+			if manifest.FirstHeight < dumpInfo.FirstVersion || manifest.FinalHeight > dumpInfo.LastVersion {
+				return verifyReport{}, fmt.Errorf("sealed dump does not cover production segment")
+			}
+		} else {
+			if err := validateDumpContext(dumpInfo, dumpContext{
+				Schema: dumpManifestSchema, FirstVersion: 1, LastVersion: manifest.FinalHeight,
+				SnapshotID: manifest.SnapshotID, ArchiveIdentity: manifest.ArchiveIdentity,
+				CronosCommit: manifest.CronosCommit, EthermintCommit: manifest.EthermintCommit,
+				IAVLCommit:  manifest.IAVLCommit,
+				ImageDigest: manifest.ImageDigest, BuildTags: manifest.BuildTags,
+			}); err != nil {
+				return verifyReport{}, err
+			}
 		}
 		if _, err := requireReadOnlySealedDump(manifest.DumpPath, dumpInfo); err != nil {
 			return verifyReport{}, err
 		}
 		iterateVerifySource = func(iterCtx context.Context, callback func(int64, []dtypes.AccountStorageDiff) error) error {
-			return iterateSealedDumpContext(iterCtx, manifest.DumpPath, dumpInfo, func(height int64, changeSet *iavl.ChangeSet) error {
+			consume := func(height int64, changeSet *iavl.ChangeSet) error {
 				if height == 1 {
 					return callback(height, nil)
 				}
@@ -1102,7 +1114,13 @@ func runVerifyWithOptions(
 					return fmt.Errorf("height %d canonical storage: %w", height, err)
 				}
 				return callback(height, canonical)
-			})
+			}
+			if manifest.Schema == segmentManifestSchema {
+				return iterateSealedDumpRangeContext(
+					iterCtx, manifest.DumpPath, dumpInfo, manifest.FirstHeight, manifest.FinalHeight, consume,
+				)
+			}
+			return iterateSealedDumpContext(iterCtx, manifest.DumpPath, dumpInfo, consume)
 		}
 	case planSourceDirectV1:
 		directArchive, err = openArchive(manifest.ArchiveIdentity.Home)
@@ -1184,7 +1202,7 @@ func runVerifyWithOptions(
 	}
 	pipelineErr := runOrderedPipeline(ctx, firstSequence, options.Concurrency, options.Window,
 		func(pipelineCtx context.Context, emit func(uint64, verifyTask) error) error {
-			var previousRoot common.Hash
+			previousRoot := manifest.InitialParentRoot
 			var changedSeen uint64
 			err := iterateVerifySource(pipelineCtx, func(height int64, canonical []dtypes.AccountStorageDiff) error {
 				if height == 1 {
