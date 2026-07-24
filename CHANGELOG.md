@@ -4,6 +4,7 @@
 
 ### Improvements
 
+* [Chaintable/cronos#6](https://github.com/Chaintable/cronos/pull/6) feat: add bounded production segments for historical state-diff recovery.
 * [Chaintable/cronos#3](https://github.com/Chaintable/cronos/pull/3) feat: add fail-closed tooling for canonical historical state-diff recovery.
 * [#2095](https://github.com/crypto-org-chain/cronos/pull/2095) feat: add hardcoded unblockable address list that is filtered out of both the mempool and consensus blocklists.
 
