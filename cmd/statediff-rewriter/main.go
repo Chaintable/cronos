@@ -42,7 +42,10 @@ func newRootCommand() *cobra.Command {
 		},
 	}
 	root.SetVersionTemplate("{{.Version}}\n")
-	commands := []*cobra.Command{newDumpCommand(), newPlanCommand(), newApplyCommand(), newVerifyCommand(), newRollbackCommand()}
+	commands := []*cobra.Command{
+		newDumpCommand(), newRefillCommand(), newPlanCommand(),
+		newApplyCommand(), newVerifyCommand(), newRollbackCommand(),
+	}
 	for _, command := range commands {
 		command.Args = cobra.NoArgs
 	}
