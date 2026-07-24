@@ -14,16 +14,17 @@ import (
 )
 
 const (
-	manifestSchema      = "statediff-rewriter-manifest/v1"
-	pilotManifestSchema = "statediff-rewriter-pilot-manifest/v1"
-	planSourceDumpV1    = "dump-v1"
-	planSourceDirectV1  = "direct-iavl-v1"
-	packSchema          = uint64(1)
-	defaultBucket       = "chaintable-nodex-pipeline--apne1-az4--x-s3"
-	defaultPrefix       = "25/4cc51d2e"
-	defaultRegion       = "ap-northeast-1"
-	maxObjectSize       = int64(64 << 20)
-	chunkSize           = int64(512 << 20)
+	manifestSchema        = "statediff-rewriter-manifest/v1"
+	pilotManifestSchema   = "statediff-rewriter-pilot-manifest/v1"
+	segmentManifestSchema = "statediff-rewriter-segment-manifest/v1"
+	planSourceDumpV1      = "dump-v1"
+	planSourceDirectV1    = "direct-iavl-v1"
+	packSchema            = uint64(1)
+	defaultBucket         = "chaintable-nodex-pipeline--apne1-az4--x-s3"
+	defaultPrefix         = "25/4cc51d2e"
+	defaultRegion         = "ap-northeast-1"
+	maxObjectSize         = int64(64 << 20)
+	chunkSize             = int64(512 << 20)
 )
 
 type dumpFileManifest struct {
@@ -81,7 +82,9 @@ type planManifest struct {
 	SourceMode            string          `json:"source_mode,omitempty"`
 	DumpPath              string          `json:"dump_path,omitempty"`
 	DumpManifestHash      string          `json:"dump_manifest_sha256,omitempty"`
+	DumpProducer          *dumpContext    `json:"dump_producer,omitempty"`
 	ArchiveIdentity       archiveIdentity `json:"archive_identity"`
+	InitialParentRoot     common.Hash     `json:"initial_parent_root"`
 	Processed             int64           `json:"processed"`
 	Changed               int64           `json:"changed"`
 	ChangedCanonical      int64           `json:"changed_noncanonical"`

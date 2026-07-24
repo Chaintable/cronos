@@ -66,12 +66,21 @@ func newPlanCommand() *cobra.Command {
 		Use:   "plan",
 		Short: "Build a read-only changed-object plan from a sealed dump or frozen IAVL",
 		RunE: func(command *cobra.Command, _ []string) error {
-			firstSet := command.Flags().Changed("pilot-first-height")
-			finalSet := command.Flags().Changed("pilot-final-height")
-			if firstSet != finalSet {
+			pilotFirstSet := command.Flags().Changed("pilot-first-height")
+			pilotFinalSet := command.Flags().Changed("pilot-final-height")
+			if pilotFirstSet != pilotFinalSet {
 				return fmt.Errorf("pilot-first-height and pilot-final-height must be set together")
 			}
-			options.Pilot = firstSet
+			segmentFirstSet := command.Flags().Changed("segment-first-height")
+			segmentFinalSet := command.Flags().Changed("segment-final-height")
+			if segmentFirstSet != segmentFinalSet {
+				return fmt.Errorf("segment-first-height and segment-final-height must be set together")
+			}
+			if pilotFirstSet && segmentFirstSet {
+				return fmt.Errorf("pilot and production segment ranges are mutually exclusive")
+			}
+			options.Pilot = pilotFirstSet
+			options.Segment = segmentFirstSet
 			manifest, location, err := runPlan(command.Context(), options, nil)
 			if err != nil {
 				return err
@@ -98,6 +107,8 @@ func newPlanCommand() *cobra.Command {
 	command.Flags().StringVar(&options.ImageDigest, "image-digest", "", "immutable rewriter image digest")
 	command.Flags().Int64Var(&options.PilotFirstHeight, "pilot-first-height", 0, "first height of a read-only pilot plan; requires pilot-final-height")
 	command.Flags().Int64Var(&options.PilotFinalHeight, "pilot-final-height", 0, "final height of a read-only pilot plan; requires pilot-first-height")
+	command.Flags().Int64Var(&options.SegmentFirstHeight, "segment-first-height", 0, "first height of a production segment; requires segment-final-height")
+	command.Flags().Int64Var(&options.SegmentFinalHeight, "segment-final-height", 0, "final height of a production segment; requires segment-first-height")
 	addParallelFlags(command, &options.Parallel, true, true)
 	_ = command.MarkFlagRequired("home")
 	_ = command.MarkFlagRequired("output")
