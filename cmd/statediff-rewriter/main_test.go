@@ -64,7 +64,7 @@ func TestRefillExposesDirectIAVLFlags(t *testing.T) {
 	root := newRootCommand()
 	refill, _, err := root.Find([]string{"refill"})
 	require.NoError(t, err)
-	for _, name := range []string{"direct", "iavl-cache-size", "iavl-concurrency"} {
+	for _, name := range []string{"direct", "iavl-cache-size", "iavl-concurrency", "iavl-run-heights"} {
 		require.NotNil(t, refill.Flags().Lookup(name), name)
 	}
 }

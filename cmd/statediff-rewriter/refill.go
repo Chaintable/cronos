@@ -48,6 +48,7 @@ type refillOptions struct {
 	Window          int
 	IAVLCacheSize   int
 	IAVLConcurrency int
+	IAVLRunHeights  int64
 }
 
 type refillStorageIterator func(
@@ -126,6 +127,7 @@ func newRefillCommand() *cobra.Command {
 		Bucket: defaultBucket, Prefix: defaultPrefix, Region: defaultRegion,
 		Concurrency: defaultObjectConcurrency, Window: defaultObjectWindow,
 		IAVLCacheSize: defaultDumpCacheSize, IAVLConcurrency: defaultDirectIAVLConcurrency,
+		IAVLRunHeights: defaultDirectIAVLRunHeights,
 	}
 	command := &cobra.Command{
 		Use:   "refill",
@@ -150,6 +152,7 @@ func newRefillCommand() *cobra.Command {
 	command.Flags().IntVar(&options.Window, "window", options.Window, "maximum emitted but not continuously completed operations")
 	command.Flags().IntVar(&options.IAVLCacheSize, "iavl-cache-size", options.IAVLCacheSize, "IAVL node-cache entries per direct traversal worker")
 	command.Flags().IntVar(&options.IAVLConcurrency, "iavl-concurrency", options.IAVLConcurrency, "parallel IAVL shards for direct traversal")
+	command.Flags().Int64Var(&options.IAVLRunHeights, "iavl-run-heights", options.IAVLRunHeights, "consecutive heights processed by one direct IAVL worker")
 	_ = command.MarkFlagRequired("home")
 	_ = command.MarkFlagRequired("first-height")
 	_ = command.MarkFlagRequired("final-height")
@@ -194,6 +197,10 @@ func (options *refillOptions) prepare() error {
 		}
 		if options.IAVLConcurrency < 1 || options.IAVLConcurrency > maximumDirectIAVLConcurrency {
 			return fmt.Errorf("iavl-concurrency must be between 1 and %d", maximumDirectIAVLConcurrency)
+		}
+		if options.IAVLRunHeights < directIAVLShardSize ||
+			options.IAVLRunHeights%directIAVLShardSize != 0 {
+			return fmt.Errorf("iavl-run-heights must be a positive multiple of %d", directIAVLShardSize)
 		}
 	}
 	if options.Bucket == "" || options.Prefix == "" || options.Region == "" {
@@ -256,7 +263,7 @@ func runRefill(ctx context.Context, options refillOptions, objects objectStore) 
 		) error {
 			return iterateArchiveDirectStorageDiffsContext(
 				iterCtx, archive, options.IAVLCacheSize, options.IAVLConcurrency,
-				first, last, callback,
+				options.IAVLRunHeights, first, last, callback,
 			)
 		}
 	}

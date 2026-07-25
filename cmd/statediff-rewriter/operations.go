@@ -1138,7 +1138,7 @@ func runVerifyWithOptions(
 		iterateVerifySource = func(iterCtx context.Context, callback func(int64, []dtypes.AccountStorageDiff) error) error {
 			return iterateArchiveDirectStorageDiffsContext(
 				iterCtx, directArchive, defaultDumpCacheSize, defaultDirectIAVLConcurrency,
-				manifest.FirstHeight, manifest.FinalHeight, callback,
+				defaultDirectIAVLRunHeights, manifest.FirstHeight, manifest.FinalHeight, callback,
 			)
 		}
 	default:

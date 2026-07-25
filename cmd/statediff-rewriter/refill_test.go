@@ -195,6 +195,7 @@ func refillTestDirectOptions(t *testing.T, first, last int64, write bool) refill
 	options.Direct = true
 	options.IAVLCacheSize = 10
 	options.IAVLConcurrency = 2
+	options.IAVLRunHeights = defaultDirectIAVLRunHeights
 	options.ArchiveIdentity = archiveIdentity{
 		Home:             options.ArchiveHome,
 		DatabaseIdentity: "refill-test-db",
@@ -426,6 +427,7 @@ func TestRefillOptionsRejectsMoreThanTenThousandHeights(t *testing.T) {
 	options.Direct = true
 	options.IAVLCacheSize = 0
 	options.IAVLConcurrency = 1
+	options.IAVLRunHeights = defaultDirectIAVLRunHeights
 	options.FinalHeight = 20_000
 	require.NoError(t, options.prepare(), "direct mode accepts a full refill range")
 
@@ -435,6 +437,10 @@ func TestRefillOptionsRejectsMoreThanTenThousandHeights(t *testing.T) {
 	options.ZZFile = ""
 	options.IAVLConcurrency = 0
 	require.ErrorContains(t, options.prepare(), "iavl-concurrency")
+
+	options.IAVLConcurrency = 1
+	options.IAVLRunHeights = directIAVLShardSize + 1
+	require.ErrorContains(t, options.prepare(), "iavl-run-heights")
 }
 
 func TestRunRefillWriteResumesFromPersistedCheckpointAfterFailure(t *testing.T) {

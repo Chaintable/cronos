@@ -14,6 +14,7 @@ const (
 	defaultDirectIAVLConcurrency = 8
 	maximumDirectIAVLConcurrency = 64
 	directIAVLShardSize          = int64(64)
+	defaultDirectIAVLRunHeights  = directIAVLShardSize
 	directResultBaseBytes        = int64(1 << 20)
 	directResultItemBytes        = int64(128)
 )
@@ -43,6 +44,7 @@ func iterateArchiveDirectStorageDiffsContext(
 	ctx context.Context,
 	archive *archiveReader,
 	cacheSize, concurrency int,
+	runHeights int64,
 	first, last int64,
 	callback func(int64, []dtypes.AccountStorageDiff) error,
 ) error {
@@ -56,7 +58,7 @@ func iterateArchiveDirectStorageDiffsContext(
 	return iterateParallelDirectStorageDiffsContext(
 		ctx,
 		func() keyRangeStateChangeSource { return archive.evmStateChangeSource(cacheSize) },
-		legacyLatest, concurrency, first, last, callback,
+		legacyLatest, concurrency, runHeights, first, last, callback,
 	)
 }
 
@@ -65,6 +67,7 @@ func iterateParallelDirectStorageDiffsContext(
 	newSource func() keyRangeStateChangeSource,
 	legacyLatest int64,
 	concurrency int,
+	runHeights int64,
 	first, last int64,
 	callback func(int64, []dtypes.AccountStorageDiff) error,
 ) error {
@@ -73,6 +76,9 @@ func iterateParallelDirectStorageDiffsContext(
 	}
 	if concurrency < 1 || concurrency > maximumDirectIAVLConcurrency {
 		return fmt.Errorf("iavl-concurrency must be between 1 and %d", maximumDirectIAVLConcurrency)
+	}
+	if runHeights < directIAVLShardSize || runHeights%directIAVLShardSize != 0 {
+		return fmt.Errorf("iavl-run-heights must be a positive multiple of %d", directIAVLShardSize)
 	}
 	if legacyLatest < 0 {
 		return fmt.Errorf("invalid latest legacy version %d", legacyLatest)
@@ -92,7 +98,7 @@ func iterateParallelDirectStorageDiffsContext(
 		defer close(jobs)
 		ordinal := uint64(1)
 		for shardFirst := first; ; ordinal++ {
-			shardLast := shardFirst + directIAVLShardSize - 1
+			shardLast := shardFirst + runHeights - 1
 			if shardLast < shardFirst || shardLast > last {
 				shardLast = last
 			}
@@ -128,22 +134,38 @@ func iterateParallelDirectStorageDiffsContext(
 				retainedBytes := int64(0)
 				result := directShardResult{
 					directShardTask: task,
-					changes:         make([]directStorageChange, 0, task.last-task.first+1),
+					changes:         make([]directStorageChange, 0, directIAVLShardSize),
 				}
-				err := iterateDirectStorageStateChangesContext(groupCtx, source, task.first, task.last, func(height int64, changeSet *iavl.ChangeSet) error {
-					canonical, err := statediff.CanonicalStorageDiff(changeSet)
-					if err != nil {
-						return fmt.Errorf("height %d canonical storage: %w", height, err)
+				for chunkFirst := task.first; ; {
+					chunkLast := chunkFirst + directIAVLShardSize - 1
+					if chunkLast < chunkFirst || chunkLast > task.last {
+						chunkLast = task.last
 					}
-					retainedBytes, err = addDirectShardRetainedBytes(retainedBytes, canonical)
+					err := iterateDirectStorageStateChangesContext(
+						groupCtx, source, chunkFirst, chunkLast,
+						func(height int64, changeSet *iavl.ChangeSet) error {
+							canonical, err := statediff.CanonicalStorageDiff(changeSet)
+							if err != nil {
+								return fmt.Errorf("height %d canonical storage: %w", height, err)
+							}
+							retainedBytes, err = addDirectShardRetainedBytes(retainedBytes, canonical)
+							if err != nil {
+								return fmt.Errorf("height %d canonical storage: %w", height, err)
+							}
+							result.changes = append(result.changes, directStorageChange{height: height, canonical: canonical})
+							return nil
+						},
+					)
 					if err != nil {
-						return fmt.Errorf("height %d canonical storage: %w", height, err)
+						return fmt.Errorf(
+							"direct run %d versions %d-%d chunk %d-%d: %w",
+							task.ordinal, task.first, task.last, chunkFirst, chunkLast, err,
+						)
 					}
-					result.changes = append(result.changes, directStorageChange{height: height, canonical: canonical})
-					return nil
-				})
-				if err != nil {
-					return fmt.Errorf("direct shard %d versions %d-%d: %w", task.ordinal, task.first, task.last, err)
+					if chunkLast == task.last {
+						break
+					}
+					chunkFirst = chunkLast + 1
 				}
 				select {
 				case results <- result:

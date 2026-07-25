@@ -23,6 +23,7 @@ type parallelDirectFake struct {
 	maxActive   int
 	workerError error
 	errorFirst  int64
+	withChanges bool
 
 	holdFirst   int64
 	release     chan struct{}
@@ -80,7 +81,11 @@ func (source *parallelDirectFakeSource) TraverseStateChanges(
 		}
 	}
 	for version := first; version <= last; version++ {
-		if err := callback(version, &iavl.ChangeSet{}); err != nil {
+		changeSet := &iavl.ChangeSet{}
+		if fake.withChanges {
+			changeSet.Pairs = []*iavl.KVPair{refillTestPair(version, refillTestValue(version))}
+		}
+		if err := callback(version, changeSet); err != nil {
 			return err
 		}
 	}
@@ -128,7 +133,7 @@ func TestIterateParallelDirectStorageDiffsContextOrdersShardsAndSplitsLegacyBoun
 	var heights []int64
 
 	err := iterateParallelDirectStorageDiffsContext(
-		context.Background(), fake.source, legacyLatest, concurrency, first, last,
+		context.Background(), fake.source, legacyLatest, concurrency, directIAVLShardSize*2, first, last,
 		func(height int64, storage []dtypes.AccountStorageDiff) error {
 			heights = append(heights, height)
 			require.Empty(t, storage)
@@ -162,7 +167,8 @@ func TestIterateParallelDirectStorageDiffsContextBoundsConcurrency(t *testing.T)
 	}
 
 	err := iterateParallelDirectStorageDiffsContext(
-		context.Background(), fake.source, 0, concurrency, 2, 2+directIAVLShardSize*4-1,
+		context.Background(), fake.source, 0, concurrency, directIAVLShardSize,
+		2, 2+directIAVLShardSize*4-1,
 		func(int64, []dtypes.AccountStorageDiff) error { return nil },
 	)
 	require.NoError(t, err)
@@ -172,7 +178,8 @@ func TestIterateParallelDirectStorageDiffsContextBoundsConcurrency(t *testing.T)
 
 func TestIterateParallelDirectStorageDiffsContextRejectsNilFactoryResult(t *testing.T) {
 	err := iterateParallelDirectStorageDiffsContext(
-		context.Background(), func() keyRangeStateChangeSource { return nil }, 0, 1, 2, 2,
+		context.Background(), func() keyRangeStateChangeSource { return nil }, 0, 1,
+		directIAVLShardSize, 2, 2,
 		func(int64, []dtypes.AccountStorageDiff) error { return nil },
 	)
 	require.ErrorContains(t, err, "direct state change source factory returned nil")
@@ -183,11 +190,57 @@ func TestIterateParallelDirectStorageDiffsContextPropagatesWorkerError(t *testin
 	fake := &parallelDirectFake{workerError: wantErr, errorFirst: 2}
 
 	err := iterateParallelDirectStorageDiffsContext(
-		context.Background(), fake.source, 0, 2, 2, 129,
+		context.Background(), fake.source, 0, 2, directIAVLShardSize, 2, 129,
 		func(int64, []dtypes.AccountStorageDiff) error { return nil },
 	)
 	require.ErrorIs(t, err, wantErr)
-	require.ErrorContains(t, err, "direct shard 1 versions 2-65")
+	require.ErrorContains(t, err, "direct run 1 versions 2-65 chunk 2-65")
+}
+
+func TestIterateParallelDirectStorageDiffsContextKeepsChunksInOneRunAtomic(t *testing.T) {
+	wantErr := errors.New("second chunk failed")
+	fake := &parallelDirectFake{
+		workerError: wantErr,
+		errorFirst:  2 + directIAVLShardSize,
+	}
+	callbacks := 0
+
+	err := iterateParallelDirectStorageDiffsContext(
+		context.Background(), fake.source, 0, 1, directIAVLShardSize*2,
+		2, 2+directIAVLShardSize*2-1,
+		func(int64, []dtypes.AccountStorageDiff) error {
+			callbacks++
+			return nil
+		},
+	)
+	require.ErrorIs(t, err, wantErr)
+	require.ErrorContains(t, err, "direct run 1 versions 2-129 chunk 66-129")
+	require.Zero(t, callbacks, "a run must not publish before every checked chunk succeeds")
+	ranges, _, _ := fake.snapshot()
+	require.Equal(t, [][2]int64{{2, 65}, {66, 129}}, ranges)
+}
+
+func TestIterateParallelDirectStorageDiffsContextRunSizesProduceSameStorage(t *testing.T) {
+	const first, last = int64(2), int64(321)
+	collect := func(runHeights int64) []directStorageChange {
+		t.Helper()
+		fake := &parallelDirectFake{withChanges: true}
+		changes := make([]directStorageChange, 0, last-first+1)
+		err := iterateParallelDirectStorageDiffsContext(
+			context.Background(), fake.source, 0, 3, runHeights, first, last,
+			func(height int64, canonical []dtypes.AccountStorageDiff) error {
+				changes = append(changes, directStorageChange{height: height, canonical: canonical})
+				return nil
+			},
+		)
+		require.NoError(t, err)
+		return changes
+	}
+
+	baseline := collect(directIAVLShardSize)
+	require.Len(t, baseline, int(last-first+1))
+	require.Equal(t, baseline, collect(directIAVLShardSize*2))
+	require.Equal(t, baseline, collect(directIAVLShardSize*4))
 }
 
 func TestIterateParallelDirectStorageDiffsContextPropagatesCallbackError(t *testing.T) {
@@ -195,7 +248,7 @@ func TestIterateParallelDirectStorageDiffsContextPropagatesCallbackError(t *test
 	fake := &parallelDirectFake{}
 
 	err := iterateParallelDirectStorageDiffsContext(
-		context.Background(), fake.source, 0, 2, 2, 129,
+		context.Background(), fake.source, 0, 2, directIAVLShardSize, 2, 129,
 		func(height int64, _ []dtypes.AccountStorageDiff) error {
 			if height == 7 {
 				return wantErr
@@ -212,7 +265,7 @@ func TestIterateParallelDirectStorageDiffsContextHonorsCancellation(t *testing.T
 	fake := &parallelDirectFake{}
 
 	err := iterateParallelDirectStorageDiffsContext(
-		ctx, fake.source, 0, 2, 2, 129,
+		ctx, fake.source, 0, 2, directIAVLShardSize, 2, 129,
 		func(int64, []dtypes.AccountStorageDiff) error { return nil },
 	)
 	require.ErrorIs(t, err, context.Canceled)
@@ -256,7 +309,7 @@ func TestIterateParallelDirectStorageDiffsContextPublishesOnlyPostCheckedShards(
 	err := iterateParallelDirectStorageDiffsContext(
 		context.Background(),
 		func() keyRangeStateChangeSource { return &postCheckMismatchSource{} },
-		0, 1, 2, 2+directIAVLShardSize-1,
+		0, 1, directIAVLShardSize, 2, 2+directIAVLShardSize-1,
 		func(int64, []dtypes.AccountStorageDiff) error {
 			callbacks++
 			return nil
@@ -269,10 +322,20 @@ func TestIterateParallelDirectStorageDiffsContextPublishesOnlyPostCheckedShards(
 func TestIterateParallelDirectStorageDiffsContextRejectsInvalidLegacyBoundary(t *testing.T) {
 	fake := &parallelDirectFake{}
 	err := iterateParallelDirectStorageDiffsContext(
-		context.Background(), fake.source, -1, 1, 2, 2,
+		context.Background(), fake.source, -1, 1, directIAVLShardSize, 2, 2,
 		func(int64, []dtypes.AccountStorageDiff) error { return nil },
 	)
 	require.ErrorContains(t, err, "invalid latest legacy version -1")
+}
+
+func TestIterateParallelDirectStorageDiffsContextRejectsInvalidRunHeights(t *testing.T) {
+	for _, runHeights := range []int64{0, directIAVLShardSize - 1, directIAVLShardSize + 1} {
+		err := iterateParallelDirectStorageDiffsContext(
+			context.Background(), (&parallelDirectFake{}).source, 0, 1, runHeights, 2, 2,
+			func(int64, []dtypes.AccountStorageDiff) error { return nil },
+		)
+		require.ErrorContains(t, err, "iavl-run-heights", runHeights)
+	}
 }
 
 func TestEstimatedCanonicalStorageBytesBoundsRetainedMemory(t *testing.T) {

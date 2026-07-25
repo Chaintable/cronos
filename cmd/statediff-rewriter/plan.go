@@ -602,7 +602,7 @@ func runPlan(ctx context.Context, options planOptions, objects objectStore) (pla
 		if options.Direct {
 			return iterateArchiveDirectStorageDiffsContext(
 				iterCtx, archive, options.IAVLCacheSize, options.IAVLConcurrency,
-				scope.FirstHeight, scope.FinalHeight, callback,
+				defaultDirectIAVLRunHeights, scope.FirstHeight, scope.FinalHeight, callback,
 			)
 		}
 		consume := func(height int64, changeSet *iavl.ChangeSet) error {
