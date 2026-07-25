@@ -264,7 +264,43 @@ func iterateDirectStateChangesContext(
 	first, last int64,
 	callback func(int64, *iavl.ChangeSet) error,
 ) error {
-	if ctx == nil || source == nil || callback == nil {
+	if source == nil {
+		return fmt.Errorf("direct traversal context, source, and callback are required")
+	}
+	return iterateDirectStateChangesWithContext(
+		ctx, source, source.TraverseStateChanges, first, last, callback,
+	)
+}
+
+func iterateDirectStorageStateChangesContext(
+	ctx context.Context,
+	source keyRangeStateChangeSource,
+	first, last int64,
+	callback func(int64, *iavl.ChangeSet) error,
+) error {
+	if source == nil {
+		return fmt.Errorf("direct traversal context, source, and callback are required")
+	}
+	return iterateDirectStateChangesWithContext(
+		ctx,
+		source,
+		func(rangeFirst, rangeLast int64, fn func(int64, *iavl.ChangeSet) error) error {
+			return source.TraverseStateChangesInKeyRange(
+				rangeFirst, rangeLast, []byte{0x02}, []byte{0x03}, fn,
+			)
+		},
+		first, last, callback,
+	)
+}
+
+func iterateDirectStateChangesWithContext(
+	ctx context.Context,
+	source stateChangeSource,
+	traverse func(int64, int64, func(int64, *iavl.ChangeSet) error) error,
+	first, last int64,
+	callback func(int64, *iavl.ChangeSet) error,
+) error {
+	if ctx == nil || source == nil || traverse == nil || callback == nil {
 		return fmt.Errorf("direct traversal context, source, and callback are required")
 	}
 	if first < 2 || last < first {
@@ -276,7 +312,7 @@ func iterateDirectStateChangesContext(
 			chunkLast = last
 		}
 		expected := chunkFirst
-		err := traverseVerifiedStateChanges(source, chunkFirst, chunkLast, func(version int64, changeSet *iavl.ChangeSet) error {
+		err := traverseVerifiedStateChangesWith(source, chunkFirst, chunkLast, traverse, func(version int64, changeSet *iavl.ChangeSet) error {
 			if err := ctx.Err(); err != nil {
 				return err
 			}

@@ -25,25 +25,37 @@ import (
 const (
 	refillCheckpointSchema          = "statediff-rewriter-refill-checkpoint/v1"
 	refillDirectoryCheckpointSchema = "statediff-rewriter-refill-directory-checkpoint/v1"
+	refillDirectCheckpointSchema    = "statediff-rewriter-refill-direct-checkpoint/v1"
 	maxRefillHeights                = int64(10_000)
 	refillCheckpointEvery           = uint64(1_000)
 	refillProgressEvery             = uint64(10_000)
 )
 
 type refillOptions struct {
-	ZZFile      string
-	ZZDir       string
-	ArchiveHome string
-	Checkpoint  string
-	FirstHeight int64
-	FinalHeight int64
-	Write       bool
-	Bucket      string
-	Prefix      string
-	Region      string
-	Concurrency int
-	Window      int
+	Direct          bool
+	ZZFile          string
+	ZZDir           string
+	ArchiveHome     string
+	ArchiveIdentity archiveIdentity
+	Checkpoint      string
+	FirstHeight     int64
+	FinalHeight     int64
+	Write           bool
+	Bucket          string
+	Prefix          string
+	Region          string
+	Concurrency     int
+	Window          int
+	IAVLCacheSize   int
+	IAVLConcurrency int
 }
+
+type refillStorageIterator func(
+	context.Context,
+	int64,
+	int64,
+	func(int64, []dtypes.AccountStorageDiff) error,
+) error
 
 type refillTask struct {
 	height    int64
@@ -63,53 +75,61 @@ type refillOutcome struct {
 }
 
 type refillCheckpoint struct {
-	Schema      string `json:"schema"`
-	Mode        string `json:"mode"`
-	ZZFile      string `json:"zz_file,omitempty"`
-	ZZDir       string `json:"zz_dir,omitempty"`
-	ArchiveHome string `json:"archive_home"`
-	FirstHeight int64  `json:"first_height"`
-	FinalHeight int64  `json:"final_height"`
-	Frontier    int64  `json:"frontier"`
-	Processed   uint64 `json:"processed"`
-	Gets        uint64 `json:"gets"`
-	Puts        uint64 `json:"puts"`
-	WouldPUTs   uint64 `json:"would_puts"`
-	Skipped     uint64 `json:"skipped_equal_root"`
-	OldBytes    uint64 `json:"old_bytes"`
-	NewBytes    uint64 `json:"new_bytes"`
+	Schema          string          `json:"schema"`
+	Mode            string          `json:"mode"`
+	Direct          bool            `json:"direct,omitempty"`
+	ZZFile          string          `json:"zz_file,omitempty"`
+	ZZDir           string          `json:"zz_dir,omitempty"`
+	ArchiveHome     string          `json:"archive_home"`
+	ArchiveIdentity archiveIdentity `json:"archive_identity,omitempty"`
+	Bucket          string          `json:"bucket,omitempty"`
+	Prefix          string          `json:"prefix,omitempty"`
+	Region          string          `json:"region,omitempty"`
+	FirstHeight     int64           `json:"first_height"`
+	FinalHeight     int64           `json:"final_height"`
+	Frontier        int64           `json:"frontier"`
+	Processed       uint64          `json:"processed"`
+	Gets            uint64          `json:"gets"`
+	Puts            uint64          `json:"puts"`
+	WouldPUTs       uint64          `json:"would_puts"`
+	Skipped         uint64          `json:"skipped_equal_root"`
+	OldBytes        uint64          `json:"old_bytes"`
+	NewBytes        uint64          `json:"new_bytes"`
 }
 
 type refillReport struct {
-	Mode                string  `json:"mode"`
-	ZZFile              string  `json:"zz_file,omitempty"`
-	ZZDir               string  `json:"zz_dir,omitempty"`
-	ArchiveHome         string  `json:"archive_home"`
-	FirstHeight         int64   `json:"first_height"`
-	FinalHeight         int64   `json:"final_height"`
-	Frontier            int64   `json:"frontier"`
-	Processed           uint64  `json:"processed"`
-	InvocationProcessed uint64  `json:"invocation_processed"`
-	Gets                uint64  `json:"gets"`
-	Puts                uint64  `json:"puts"`
-	WouldPUTs           uint64  `json:"would_puts"`
-	SkippedEqualRoot    uint64  `json:"skipped_equal_root"`
-	OldBytes            uint64  `json:"old_bytes"`
-	NewBytes            uint64  `json:"new_bytes"`
-	StartedAt           string  `json:"started_at"`
-	FinishedAt          string  `json:"finished_at"`
-	ElapsedSeconds      float64 `json:"elapsed_seconds"`
-	BlocksPerSecond     float64 `json:"blocks_per_second"`
+	Mode                string          `json:"mode"`
+	Direct              bool            `json:"direct,omitempty"`
+	ZZFile              string          `json:"zz_file,omitempty"`
+	ZZDir               string          `json:"zz_dir,omitempty"`
+	ArchiveHome         string          `json:"archive_home"`
+	ArchiveIdentity     archiveIdentity `json:"archive_identity,omitempty"`
+	FirstHeight         int64           `json:"first_height"`
+	FinalHeight         int64           `json:"final_height"`
+	Frontier            int64           `json:"frontier"`
+	Processed           uint64          `json:"processed"`
+	InvocationProcessed uint64          `json:"invocation_processed"`
+	Gets                uint64          `json:"gets"`
+	Puts                uint64          `json:"puts"`
+	WouldPUTs           uint64          `json:"would_puts"`
+	SkippedEqualRoot    uint64          `json:"skipped_equal_root"`
+	OldBytes            uint64          `json:"old_bytes"`
+	NewBytes            uint64          `json:"new_bytes"`
+	StartedAt           string          `json:"started_at"`
+	FinishedAt          string          `json:"finished_at"`
+	ElapsedSeconds      float64         `json:"elapsed_seconds"`
+	BlocksPerSecond     float64         `json:"blocks_per_second"`
 }
 
 func newRefillCommand() *cobra.Command {
 	options := refillOptions{
 		Bucket: defaultBucket, Prefix: defaultPrefix, Region: defaultRegion,
 		Concurrency: defaultObjectConcurrency, Window: defaultObjectWindow,
+		IAVLCacheSize: defaultDumpCacheSize, IAVLConcurrency: defaultDirectIAVLConcurrency,
 	}
 	command := &cobra.Command{
 		Use:   "refill",
-		Short: "Directly replace stateDiff storage from changeset files",
+		Short: "Directly replace stateDiff storage from changeset files or frozen IAVL",
 		RunE: func(command *cobra.Command, _ []string) error {
 			report, err := runRefill(command.Context(), options, nil)
 			if err != nil {
@@ -118,6 +138,7 @@ func newRefillCommand() *cobra.Command {
 			return printJSON(report)
 		},
 	}
+	command.Flags().BoolVar(&options.Direct, "direct", false, "derive storage changes directly from the frozen archive IAVL")
 	command.Flags().StringVar(&options.ZZFile, "zz", "", "changeset block-*.zz file")
 	command.Flags().StringVar(&options.ZZDir, "zz-dir", "", "directory of numerically ordered block-*.zz files")
 	command.Flags().StringVar(&options.ArchiveHome, "home", "", "frozen Cronos archive home")
@@ -127,6 +148,8 @@ func newRefillCommand() *cobra.Command {
 	command.Flags().StringVar(&options.Checkpoint, "checkpoint", "", "write-mode checkpoint path")
 	command.Flags().IntVar(&options.Concurrency, "concurrency", options.Concurrency, "maximum concurrent S3 operations")
 	command.Flags().IntVar(&options.Window, "window", options.Window, "maximum emitted but not continuously completed operations")
+	command.Flags().IntVar(&options.IAVLCacheSize, "iavl-cache-size", options.IAVLCacheSize, "IAVL node-cache entries per direct traversal worker")
+	command.Flags().IntVar(&options.IAVLConcurrency, "iavl-concurrency", options.IAVLConcurrency, "parallel IAVL shards for direct traversal")
 	_ = command.MarkFlagRequired("home")
 	_ = command.MarkFlagRequired("first-height")
 	_ = command.MarkFlagRequired("final-height")
@@ -134,8 +157,18 @@ func newRefillCommand() *cobra.Command {
 }
 
 func (options *refillOptions) prepare() error {
-	if (options.ZZFile == "") == (options.ZZDir == "") {
-		return fmt.Errorf("exactly one of zz and zz-dir is required")
+	sourceCount := 0
+	if options.Direct {
+		sourceCount++
+	}
+	if options.ZZFile != "" {
+		sourceCount++
+	}
+	if options.ZZDir != "" {
+		sourceCount++
+	}
+	if sourceCount != 1 {
+		return fmt.Errorf("exactly one refill source is required: direct, zz, or zz-dir")
 	}
 	if !filepath.IsAbs(options.ArchiveHome) ||
 		(options.ZZFile != "" && !filepath.IsAbs(options.ZZFile)) ||
@@ -144,7 +177,7 @@ func (options *refillOptions) prepare() error {
 	}
 	if options.ZZFile != "" {
 		options.ZZFile = filepath.Clean(options.ZZFile)
-	} else {
+	} else if options.ZZDir != "" {
 		options.ZZDir = filepath.Clean(options.ZZDir)
 	}
 	options.ArchiveHome = filepath.Clean(options.ArchiveHome)
@@ -154,6 +187,14 @@ func (options *refillOptions) prepare() error {
 	}
 	if options.ZZFile != "" && options.FinalHeight-options.FirstHeight+1 > maxRefillHeights {
 		return fmt.Errorf("refill range exceeds %d heights", maxRefillHeights)
+	}
+	if options.Direct {
+		if options.IAVLCacheSize < 0 {
+			return fmt.Errorf("iavl-cache-size must not be negative")
+		}
+		if options.IAVLConcurrency < 1 || options.IAVLConcurrency > maximumDirectIAVLConcurrency {
+			return fmt.Errorf("iavl-concurrency must be between 1 and %d", maximumDirectIAVLConcurrency)
+		}
 	}
 	if options.Bucket == "" || options.Prefix == "" || options.Region == "" {
 		return fmt.Errorf("refill S3 target is required")
@@ -176,6 +217,9 @@ func (options *refillOptions) prepare() error {
 }
 
 func (options refillOptions) checkpointSchema() string {
+	if options.Direct {
+		return refillDirectCheckpointSchema
+	}
 	if options.ZZDir != "" {
 		return refillDirectoryCheckpointSchema
 	}
@@ -191,13 +235,32 @@ func runRefill(ctx context.Context, options refillOptions, objects objectStore) 
 		return refillReport{}, err
 	}
 	defer archive.Close()
+	if options.Direct {
+		options.ArchiveIdentity, err = archive.identity()
+		if err != nil {
+			return refillReport{}, fmt.Errorf("resolve direct refill archive identity: %w", err)
+		}
+	}
 	if objects == nil {
 		objects, err = newRefillS3ObjectStore(ctx, options.Region, options.Concurrency)
 		if err != nil {
 			return refillReport{}, err
 		}
 	}
-	return runRefillWithReaders(ctx, options, archive, objects)
+	var directIterator refillStorageIterator
+	if options.Direct {
+		directIterator = func(
+			iterCtx context.Context,
+			first, last int64,
+			callback func(int64, []dtypes.AccountStorageDiff) error,
+		) error {
+			return iterateArchiveDirectStorageDiffsContext(
+				iterCtx, archive, options.IAVLCacheSize, options.IAVLConcurrency,
+				first, last, callback,
+			)
+		}
+	}
+	return runRefillWithReadersAndIterator(ctx, options, archive, objects, directIterator)
 }
 
 func runRefillWithReaders(
@@ -206,16 +269,40 @@ func runRefillWithReaders(
 	roots commitInfoReader,
 	objects objectStore,
 ) (refillReport, error) {
+	return runRefillWithReadersAndIterator(ctx, options, roots, objects, nil)
+}
+
+func runRefillWithReadersAndIterator(
+	ctx context.Context,
+	options refillOptions,
+	roots commitInfoReader,
+	objects objectStore,
+	directIterator refillStorageIterator,
+) (refillReport, error) {
 	if err := options.prepare(); err != nil {
 		return refillReport{}, err
 	}
 	if ctx == nil || roots == nil || objects == nil {
 		return refillReport{}, fmt.Errorf("refill context, archive, and object store are required")
 	}
+	if options.Direct && directIterator == nil {
+		return refillReport{}, fmt.Errorf("direct refill storage iterator is required")
+	}
+	if options.Direct {
+		if options.ArchiveIdentity.Home != options.ArchiveHome ||
+			options.ArchiveIdentity.DatabaseIdentity == "" ||
+			options.ArchiveIdentity.LatestVersion < options.FinalHeight ||
+			options.ArchiveIdentity.FinalCommitHash == "" {
+			return refillReport{}, fmt.Errorf("direct refill archive identity is invalid")
+		}
+	}
 	mode := "get-only"
 	checkpoint := refillCheckpoint{
 		Schema: options.checkpointSchema(), Mode: mode,
+		Direct: options.Direct,
 		ZZFile: options.ZZFile, ZZDir: options.ZZDir, ArchiveHome: options.ArchiveHome,
+		ArchiveIdentity: options.ArchiveIdentity,
+		Bucket:          options.Bucket, Prefix: options.Prefix, Region: options.Region,
 		FirstHeight: options.FirstHeight, FinalHeight: options.FinalHeight,
 	}
 	if options.Write {
@@ -253,52 +340,50 @@ func runRefillWithReaders(
 		nextSequence := firstSequence
 		err := runOrderedPipeline(ctx, firstSequence, options.Concurrency, options.Window,
 			func(pipelineCtx context.Context, emit func(uint64, refillTask) error) error {
-				iterate := func(
-					iteratorCtx context.Context,
-					fn func(int64, *iavl.ChangeSet) error,
-				) error {
-					if options.ZZDir != "" {
-						return iterateZZDirectoryRangeFastContext(
-							iteratorCtx, options.ZZDir, startHeight, options.FinalHeight, fn,
-						)
+				emitCanonical := func(height int64, canonical []dtypes.AccountStorageDiff) error {
+					rootInfo, err := roots.commitInfo(height - 1)
+					if err != nil {
+						return err
 					}
-					return iterateZZRangeFastContext(
-						iteratorCtx, options.ZZFile, startHeight, options.FinalHeight, fn,
+					root := common.BytesToHash(rootInfo.Hash())
+					parent := common.Hash{}
+					if height > 2 {
+						if previousHeight == height-1 {
+							parent = previousRoot
+						} else {
+							parentInfo, err := roots.commitInfo(height - 2)
+							if err != nil {
+								return err
+							}
+							parent = common.BytesToHash(parentInfo.Hash())
+						}
+					}
+					task := refillTask{
+						height: height, canonical: canonical, skip: root == parent,
+						key: fmt.Sprintf("%s/%s/stateDiff", options.Prefix, strings.ToLower(root.Hex())),
+					}
+					sequence := nextSequence
+					nextSequence++
+					previousHeight, previousRoot = height, root
+					return emit(sequence, task)
+				}
+				if options.Direct {
+					return directIterator(pipelineCtx, startHeight, options.FinalHeight, emitCanonical)
+				}
+				consume := func(height int64, changeSet *iavl.ChangeSet) error {
+					canonical, err := statediff.CanonicalStorageDiff(changeSet)
+					if err != nil {
+						return fmt.Errorf("height %d canonical storage: %w", height, err)
+					}
+					return emitCanonical(height, canonical)
+				}
+				if options.ZZDir != "" {
+					return iterateZZDirectoryRangeFastContext(
+						pipelineCtx, options.ZZDir, startHeight, options.FinalHeight, consume,
 					)
 				}
-				return iterate(
-					pipelineCtx,
-					func(height int64, changeSet *iavl.ChangeSet) error {
-						canonical, err := statediff.CanonicalStorageDiff(changeSet)
-						if err != nil {
-							return fmt.Errorf("height %d canonical storage: %w", height, err)
-						}
-						rootInfo, err := roots.commitInfo(height - 1)
-						if err != nil {
-							return err
-						}
-						root := common.BytesToHash(rootInfo.Hash())
-						parent := common.Hash{}
-						if height > 2 {
-							if previousHeight == height-1 {
-								parent = previousRoot
-							} else {
-								parentInfo, err := roots.commitInfo(height - 2)
-								if err != nil {
-									return err
-								}
-								parent = common.BytesToHash(parentInfo.Hash())
-							}
-						}
-						task := refillTask{
-							height: height, canonical: canonical, skip: root == parent,
-							key: fmt.Sprintf("%s/%s/stateDiff", options.Prefix, strings.ToLower(root.Hex())),
-						}
-						sequence := nextSequence
-						nextSequence++
-						previousHeight, previousRoot = height, root
-						return emit(sequence, task)
-					},
+				return iterateZZRangeFastContext(
+					pipelineCtx, options.ZZFile, startHeight, options.FinalHeight, consume,
 				)
 			},
 			func(workerCtx context.Context, task refillTask) (refillOutcome, error) {
@@ -343,8 +428,10 @@ func runRefillWithReaders(
 		rate = float64(invocationProcessed) / elapsed
 	}
 	return refillReport{
-		Mode: mode, ZZFile: options.ZZFile, ZZDir: options.ZZDir, ArchiveHome: options.ArchiveHome,
-		FirstHeight: options.FirstHeight, FinalHeight: options.FinalHeight,
+		Mode: mode, Direct: options.Direct,
+		ZZFile: options.ZZFile, ZZDir: options.ZZDir, ArchiveHome: options.ArchiveHome,
+		ArchiveIdentity: options.ArchiveIdentity,
+		FirstHeight:     options.FirstHeight, FinalHeight: options.FinalHeight,
 		Frontier: checkpoint.Frontier, Processed: checkpoint.Processed,
 		InvocationProcessed: invocationProcessed,
 		Gets:                checkpoint.Gets, Puts: checkpoint.Puts, WouldPUTs: checkpoint.WouldPUTs,
@@ -527,8 +614,12 @@ func loadRefillCheckpoint(path string, options refillOptions) (refillCheckpoint,
 		return refillCheckpoint{}, false, err
 	}
 	if checkpoint.Schema != options.checkpointSchema() || checkpoint.Mode != "write" ||
+		checkpoint.Direct != options.Direct ||
 		checkpoint.ZZFile != options.ZZFile || checkpoint.ZZDir != options.ZZDir ||
 		checkpoint.ArchiveHome != options.ArchiveHome ||
+		(options.Direct && (checkpoint.ArchiveIdentity != options.ArchiveIdentity ||
+			checkpoint.Bucket != options.Bucket || checkpoint.Prefix != options.Prefix ||
+			checkpoint.Region != options.Region)) ||
 		checkpoint.FirstHeight != options.FirstHeight || checkpoint.FinalHeight != options.FinalHeight {
 		return refillCheckpoint{}, false, fmt.Errorf("refill checkpoint does not match this run")
 	}

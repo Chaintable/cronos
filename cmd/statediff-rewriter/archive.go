@@ -45,7 +45,7 @@ func (a *archiveReader) evmIAVLDB() iavldb.DB {
 	return wrapper.NewDBWrapper(dbm.NewPrefixDB(a.db, []byte(evmIAVLPrefix)))
 }
 
-func (a *archiveReader) evmStateChangeSource(cacheSize int) stateChangeSource {
+func (a *archiveReader) evmStateChangeSource(cacheSize int) keyRangeStateChangeSource {
 	return iavl.NewImmutableTree(a.evmIAVLDB(), cacheSize, true, log.NewNopLogger())
 }
 

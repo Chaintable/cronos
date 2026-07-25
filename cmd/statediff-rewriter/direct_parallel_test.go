@@ -93,7 +93,18 @@ func (source *parallelDirectFakeSource) TraverseStateChanges(
 	return nil
 }
 
-func (fake *parallelDirectFake) source() stateChangeSource {
+func (source *parallelDirectFakeSource) TraverseStateChangesInKeyRange(
+	first, last int64,
+	startKey, endKey []byte,
+	callback func(int64, *iavl.ChangeSet) error,
+) error {
+	if !bytes.Equal(startKey, []byte{0x02}) || !bytes.Equal(endKey, []byte{0x03}) {
+		return errors.New("unexpected direct storage key range")
+	}
+	return source.TraverseStateChanges(first, last, callback)
+}
+
+func (fake *parallelDirectFake) source() keyRangeStateChangeSource {
 	return &parallelDirectFakeSource{fake: fake}
 }
 
@@ -161,7 +172,7 @@ func TestIterateParallelDirectStorageDiffsContextBoundsConcurrency(t *testing.T)
 
 func TestIterateParallelDirectStorageDiffsContextRejectsNilFactoryResult(t *testing.T) {
 	err := iterateParallelDirectStorageDiffsContext(
-		context.Background(), func() stateChangeSource { return nil }, 0, 1, 2, 2,
+		context.Background(), func() keyRangeStateChangeSource { return nil }, 0, 1, 2, 2,
 		func(int64, []dtypes.AccountStorageDiff) error { return nil },
 	)
 	require.ErrorContains(t, err, "direct state change source factory returned nil")
@@ -232,11 +243,19 @@ func (source *postCheckMismatchSource) TraverseStateChanges(
 	return nil
 }
 
+func (source *postCheckMismatchSource) TraverseStateChangesInKeyRange(
+	first, last int64,
+	_, _ []byte,
+	callback func(int64, *iavl.ChangeSet) error,
+) error {
+	return source.TraverseStateChanges(first, last, callback)
+}
+
 func TestIterateParallelDirectStorageDiffsContextPublishesOnlyPostCheckedShards(t *testing.T) {
 	callbacks := 0
 	err := iterateParallelDirectStorageDiffsContext(
 		context.Background(),
-		func() stateChangeSource { return &postCheckMismatchSource{} },
+		func() keyRangeStateChangeSource { return &postCheckMismatchSource{} },
 		0, 1, 2, 2+directIAVLShardSize-1,
 		func(int64, []dtypes.AccountStorageDiff) error {
 			callbacks++

@@ -189,6 +189,49 @@ func refillTestOptions(t *testing.T, zz string, first, last int64, write bool) r
 	return options
 }
 
+func refillTestDirectOptions(t *testing.T, first, last int64, write bool) refillOptions {
+	t.Helper()
+	options := refillTestOptions(t, "", first, last, write)
+	options.Direct = true
+	options.IAVLCacheSize = 10
+	options.IAVLConcurrency = 2
+	options.ArchiveIdentity = archiveIdentity{
+		Home:             options.ArchiveHome,
+		DatabaseIdentity: "refill-test-db",
+		LatestVersion:    last,
+		FinalCommitHash:  "0x1234",
+	}
+	return options
+}
+
+func refillTestDirectIterator(
+	t *testing.T,
+	first, last int64,
+	starts *[]int64,
+) refillStorageIterator {
+	t.Helper()
+	canonical := make(map[int64][]dtypes.AccountStorageDiff, last-first+1)
+	for height := first; height <= last; height++ {
+		canonical[height] = refillTestCanonical(t, height, refillTestValue(height))
+	}
+	return func(
+		ctx context.Context,
+		rangeFirst, rangeLast int64,
+		callback func(int64, []dtypes.AccountStorageDiff) error,
+	) error {
+		*starts = append(*starts, rangeFirst)
+		for height := rangeFirst; height <= rangeLast; height++ {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			if err := callback(height, canonical[height]); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+}
+
 func TestIterateZZRangeFastStopsAtTargetBeforeBadTrailer(t *testing.T) {
 	body := append(encodeChangeSet(t, 2), encodeChangeSet(t, 3)...)
 	trailing := make([]byte, 64<<10)
@@ -333,6 +376,33 @@ func TestRunRefillWriteAlwaysPutsOnlyReplacedStorage(t *testing.T) {
 	require.Equal(t, uint64(2), checkpoint.Puts)
 }
 
+func TestRunRefillDirectWriteUsesCanonicalIterator(t *testing.T) {
+	const first, last = int64(100), int64(102)
+	roots := newRefillTestRoots(first, last)
+	objects, keys, canonical := refillTestObjects(t, roots, "prefix", first, last, nil)
+	store := &fakeObjectStore{objects: objects}
+	options := refillTestDirectOptions(t, first, last, true)
+	var starts []int64
+
+	report, err := runRefillWithReadersAndIterator(
+		context.Background(), options, roots, store,
+		refillTestDirectIterator(t, first, last, &starts),
+	)
+	require.NoError(t, err)
+	require.True(t, report.Direct)
+	require.Equal(t, []int64{first}, starts)
+	require.Equal(t, uint64(last-first+1), report.Gets)
+	require.Equal(t, uint64(last-first+1), report.Puts)
+
+	for height := first; height <= last; height++ {
+		fields, err := blockStorageDiffRawFields(store.objects[keys[height]].Body)
+		require.NoError(t, err)
+		wantStorage, err := rlp.EncodeToBytes(canonical[height])
+		require.NoError(t, err)
+		require.Equal(t, wantStorage, []byte(fields[storageDiffFieldIndex]))
+	}
+}
+
 func TestRefillOptionsRejectsMoreThanTenThousandHeights(t *testing.T) {
 	options := refillOptions{
 		ZZFile: "/tmp/block.zz", ArchiveHome: "/tmp/archive",
@@ -350,7 +420,21 @@ func TestRefillOptionsRejectsMoreThanTenThousandHeights(t *testing.T) {
 	require.NoError(t, options.prepare(), "directory mode accepts a full refill range")
 
 	options.ZZFile = "/tmp/block.zz"
-	require.ErrorContains(t, options.prepare(), "exactly one of zz and zz-dir")
+	require.ErrorContains(t, options.prepare(), "exactly one refill source")
+
+	options.ZZFile, options.ZZDir = "", ""
+	options.Direct = true
+	options.IAVLCacheSize = 0
+	options.IAVLConcurrency = 1
+	options.FinalHeight = 20_000
+	require.NoError(t, options.prepare(), "direct mode accepts a full refill range")
+
+	options.ZZFile = "/tmp/block.zz"
+	require.ErrorContains(t, options.prepare(), "exactly one refill source")
+
+	options.ZZFile = ""
+	options.IAVLConcurrency = 0
+	require.ErrorContains(t, options.prepare(), "iavl-concurrency")
 }
 
 func TestRunRefillWriteResumesFromPersistedCheckpointAfterFailure(t *testing.T) {
@@ -395,6 +479,45 @@ func TestRunRefillWriteResumesFromPersistedCheckpointAfterFailure(t *testing.T) 
 	require.Equal(t, last, checkpoint.Frontier)
 	require.Equal(t, uint64(last-first+1), checkpoint.Processed)
 	require.Equal(t, uint64(last-first+1), checkpoint.Puts)
+}
+
+func TestRunRefillDirectWriteResumesIteratorAtPersistedFrontier(t *testing.T) {
+	const first, last = int64(100), int64(1_101)
+	const failedHeight = int64(1_100)
+	roots := newRefillTestRoots(first, last)
+	objects, keys, _ := refillTestObjects(t, roots, "prefix", first, last, nil)
+	wantErr := errors.New("injected direct PUT failure")
+	store := &fakeObjectStore{
+		objects:   objects,
+		putErrors: map[string]error{keys[failedHeight]: wantErr},
+	}
+	options := refillTestDirectOptions(t, first, last, true)
+	var starts []int64
+	iterator := refillTestDirectIterator(t, first, last, &starts)
+
+	_, err := runRefillWithReadersAndIterator(
+		context.Background(), options, roots, store, iterator,
+	)
+	require.ErrorIs(t, err, wantErr)
+	checkpoint, found, err := loadRefillCheckpoint(options.Checkpoint, options)
+	require.NoError(t, err)
+	require.True(t, found)
+	require.Equal(t, failedHeight-1, checkpoint.Frontier)
+	require.Equal(t, refillCheckpointEvery, checkpoint.Processed)
+
+	otherSource := options
+	otherSource.ArchiveIdentity.DatabaseIdentity = "other-db"
+	_, _, err = loadRefillCheckpoint(options.Checkpoint, otherSource)
+	require.ErrorContains(t, err, "checkpoint does not match")
+
+	delete(store.putErrors, keys[failedHeight])
+	report, err := runRefillWithReadersAndIterator(
+		context.Background(), options, roots, store, iterator,
+	)
+	require.NoError(t, err)
+	require.Equal(t, []int64{first, failedHeight}, starts)
+	require.Equal(t, uint64(2), report.InvocationProcessed)
+	require.Equal(t, last, report.Frontier)
 }
 
 func TestRunRefillWriteResumesAcrossZZFileBoundaryWithoutRepeatingCompletedFile(t *testing.T) {

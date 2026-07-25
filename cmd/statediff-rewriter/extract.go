@@ -730,7 +730,19 @@ func traverseVerifiedStateChanges(
 	first, last int64,
 	callback func(int64, *iavl.ChangeSet) error,
 ) error {
-	if source == nil || callback == nil {
+	if source == nil {
+		return fmt.Errorf("state change source and callback are required")
+	}
+	return traverseVerifiedStateChangesWith(source, first, last, source.TraverseStateChanges, callback)
+}
+
+func traverseVerifiedStateChangesWith(
+	source stateChangeSource,
+	first, last int64,
+	traverse func(int64, int64, func(int64, *iavl.ChangeSet) error) error,
+	callback func(int64, *iavl.ChangeSet) error,
+) error {
+	if source == nil || traverse == nil || callback == nil {
 		return fmt.Errorf("state change source and callback are required")
 	}
 	if first < 1 || last < first {
@@ -755,7 +767,7 @@ func traverseVerifiedStateChanges(
 		}
 		hashes[version] = hash
 	}
-	if err := source.TraverseStateChanges(first, last, callback); err != nil {
+	if err := traverse(first, last, callback); err != nil {
 		return err
 	}
 	for _, version := range versions {

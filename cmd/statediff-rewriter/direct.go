@@ -23,6 +23,11 @@ type directStorageChange struct {
 	canonical []dtypes.AccountStorageDiff
 }
 
+type keyRangeStateChangeSource interface {
+	stateChangeSource
+	TraverseStateChangesInKeyRange(int64, int64, []byte, []byte, func(int64, *iavl.ChangeSet) error) error
+}
+
 type directShardTask struct {
 	ordinal uint64
 	first   int64
@@ -50,14 +55,14 @@ func iterateArchiveDirectStorageDiffsContext(
 	}
 	return iterateParallelDirectStorageDiffsContext(
 		ctx,
-		func() stateChangeSource { return archive.evmStateChangeSource(cacheSize) },
+		func() keyRangeStateChangeSource { return archive.evmStateChangeSource(cacheSize) },
 		legacyLatest, concurrency, first, last, callback,
 	)
 }
 
 func iterateParallelDirectStorageDiffsContext(
 	ctx context.Context,
-	newSource func() stateChangeSource,
+	newSource func() keyRangeStateChangeSource,
 	legacyLatest int64,
 	concurrency int,
 	first, last int64,
@@ -125,7 +130,7 @@ func iterateParallelDirectStorageDiffsContext(
 					directShardTask: task,
 					changes:         make([]directStorageChange, 0, task.last-task.first+1),
 				}
-				err := iterateDirectStateChangesContext(groupCtx, source, task.first, task.last, func(height int64, changeSet *iavl.ChangeSet) error {
+				err := iterateDirectStorageStateChangesContext(groupCtx, source, task.first, task.last, func(height int64, changeSet *iavl.ChangeSet) error {
 					canonical, err := statediff.CanonicalStorageDiff(changeSet)
 					if err != nil {
 						return fmt.Errorf("height %d canonical storage: %w", height, err)

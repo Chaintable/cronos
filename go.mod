@@ -318,7 +318,7 @@ replace (
 	// v0.38.x
 	github.com/cometbft/cometbft => github.com/crypto-org-chain/cometbft v0.0.0-20260126040959-178ea8502144
 	// v1.2.6 plus read-only legacy r/n/o inspection for historical state-diff extraction.
-	github.com/cosmos/iavl => github.com/Chaintable/iavl v1.2.7-0.20260722064406-ba1209fb0adb
+	github.com/cosmos/iavl => github.com/Chaintable/iavl v1.2.7-0.20260722163350-649b53baefe8
 
 	// TODO: remove temporary fix for client state query issue v10.5.0-cronos
 	github.com/cosmos/ibc-go/v10 => github.com/crypto-org-chain/ibc-go/v10 v10.0.0-20260421013314-1a60e77d1cba
