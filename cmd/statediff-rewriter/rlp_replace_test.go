@@ -61,3 +61,38 @@ func TestVerifyRawRetainedFieldsRejectsRetainedMutation(t *testing.T) {
 	require.NoError(t, err)
 	require.ErrorContains(t, verifyRawRetainedFields(oldBody, changedBody), "field 1 changed")
 }
+
+func TestReplaceWorldStateRLPPreservesRootsAndReplacesEmptyFields(t *testing.T) {
+	old := dtypes.BlockStorageDiff{
+		Hash: common.HexToHash("0x01"), ParentHash: common.HexToHash("0x02"),
+		NewAccounts:     []dtypes.NewAccount{{Address: common.HexToHash("0x03"), Balance: uint256.NewInt(4)}},
+		DeletedAccounts: []common.Hash{common.HexToHash("0x05")},
+		StorageDiff:     []dtypes.AccountStorageDiff{{Address: common.HexToHash("0x06")}},
+		NewCodes:        []dtypes.NewCode{{CodeHash: common.HexToHash("0x07"), Code: []byte{0x60}}},
+	}
+	oldBody, err := rlp.EncodeToBytes(old)
+	require.NoError(t, err)
+
+	newBody, err := replaceWorldStateRLP(oldBody, expectedWorldState{})
+	require.NoError(t, err)
+	requireWorldStateRootsRawUnchanged(t, oldBody, newBody)
+
+	var got dtypes.BlockStorageDiff
+	require.NoError(t, rlp.DecodeBytes(newBody, &got))
+	require.Equal(t, old.Hash, got.Hash)
+	require.Equal(t, old.ParentHash, got.ParentHash)
+	require.Empty(t, got.NewAccounts)
+	require.Empty(t, got.DeletedAccounts)
+	require.Empty(t, got.StorageDiff)
+	require.Empty(t, got.NewCodes)
+}
+
+func requireWorldStateRootsRawUnchanged(t *testing.T, oldBody, newBody []byte) {
+	t.Helper()
+	oldFields, err := blockStorageDiffRawFields(oldBody)
+	require.NoError(t, err)
+	newFields, err := blockStorageDiffRawFields(newBody)
+	require.NoError(t, err)
+	require.Equal(t, []byte(oldFields[0]), []byte(newFields[0]))
+	require.Equal(t, []byte(oldFields[1]), []byte(newFields[1]))
+}

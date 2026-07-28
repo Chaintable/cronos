@@ -58,6 +58,7 @@ type worldStateDelta struct {
 	accounts []accountMutation
 	balances []balanceMutation
 	codes    []codeMutation
+	storage  []dtypes.AccountStorageDiff
 }
 
 type worldStateDecoder struct {
@@ -262,6 +263,7 @@ type expectedWorldState struct {
 	deletedAccounts []common.Hash
 	codeWrites      []dtypes.NewCode
 	codeDeletes     []common.Hash
+	storage         []dtypes.AccountStorageDiff
 	rawAddresses    map[common.Hash]common.Address
 }
 
@@ -290,7 +292,10 @@ func (projection *worldStateProjection) apply(delta worldStateDelta) expectedWor
 		}
 	}
 
-	expected := expectedWorldState{rawAddresses: make(map[common.Hash]common.Address, len(addresses))}
+	expected := expectedWorldState{
+		storage:      delta.storage,
+		rawAddresses: make(map[common.Hash]common.Address, len(addresses)),
+	}
 	for address, before := range addresses {
 		after := projection.account(address)
 		// Presence alone is not observable in the EVM state represented by this

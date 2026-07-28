@@ -286,8 +286,8 @@ schema = 3
     version = "v1.7.2"
     hash = "sha256-L9sJZoQGWaix43AJ7rsm1DUng8uoD8HJ6Mb92Ynq8+s="
   [mod."github.com/cosmos/iavl"]
-    version = "v1.2.7-0.20260722064406-ba1209fb0adb"
-    hash = "sha256-/ceLbgDDUmo5G951c5yItQ/clxhMubCRz58o5onlqlA="
+    version = "v1.2.7-0.20260722163350-649b53baefe8"
+    hash = "sha256-hLEUFzRmhAiSfslKZMFbkRo4dS7AbK7p6IAp2t2WGxM="
     replaced = "github.com/Chaintable/iavl"
   [mod."github.com/cosmos/ibc-go/v10"]
     version = "v10.0.0-20260421013314-1a60e77d1cba"
@@ -385,8 +385,8 @@ schema = 3
     version = "v0.2.2"
     hash = "sha256-0MLfSJKdeK3Z7tWAXTdzwB4091dmyxIX38S5SKH5QAw="
   [mod."github.com/evmos/ethermint"]
-    version = "v0.22.1-0.20260721171431-e017d5ee7c8f"
-    hash = "sha256-TAo8sdTfOIPr3dCdsb2Xdu4bsYLMSEGzhxzdX7+v45Y="
+    version = "v0.22.1-0.20260728072605-97f6e1188267"
+    hash = "sha256-F32eR7g34JlLGuR2XLl6PtxRdISOvO/OG4MohUysMdc="
     replaced = "github.com/Chaintable/ethermint-cronos"
   [mod."github.com/fatih/color"]
     version = "v1.17.0"

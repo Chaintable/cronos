@@ -404,6 +404,84 @@ func TestRunRefillDirectWriteUsesCanonicalIterator(t *testing.T) {
 	}
 }
 
+func TestRunRefillDirectWorldStateReplacesAllCanonicalFields(t *testing.T) {
+	const first, last = int64(100), int64(101)
+	roots := newRefillTestRoots(first, last)
+	objects, keys, canonical := refillTestObjects(t, roots, "prefix", first, last, nil)
+	original := make(map[string]storedObject, len(objects))
+	for key, object := range objects {
+		original[key] = cloneStoredObject(object)
+	}
+	store := &fakeObjectStore{objects: objects}
+	options := refillTestDirectOptions(t, first, last, true)
+	options.WorldState = true
+	options.EVMDenom = "basecro"
+	address := common.HexToHash("0x1234")
+	worldByHeight := map[int64]expectedWorldState{
+		first: {
+			newAccounts: []dtypes.NewAccount{{
+				Address: address, Balance: uint256.NewInt(9), Nonce: 10,
+				CodeHash: common.HexToHash("0x5678"),
+			}},
+			deletedAccounts: []common.Hash{common.HexToHash("0x90")},
+			storage:         canonical[first],
+			codeWrites:      []dtypes.NewCode{{CodeHash: common.HexToHash("0xab"), Code: []byte{0x60}}},
+		},
+		last: {},
+	}
+	var starts []int64
+	iterator := func(
+		ctx context.Context,
+		rangeFirst, rangeLast int64,
+		callback func(int64, expectedWorldState) error,
+	) error {
+		starts = append(starts, rangeFirst)
+		for height := rangeFirst; height <= rangeLast; height++ {
+			if err := callback(height, worldByHeight[height]); err != nil {
+				return err
+			}
+		}
+		return ctx.Err()
+	}
+
+	report, err := runRefillWithReadersAndIterators(
+		context.Background(), options, roots, store, nil, iterator,
+	)
+	require.NoError(t, err)
+	require.True(t, report.WorldState)
+	require.Equal(t, "basecro", report.EVMDenom)
+	require.Equal(t, []int64{first}, starts)
+	for height := first; height <= last; height++ {
+		require.Equal(t, original[keys[height]].Headers, store.objects[keys[height]].Headers)
+		requireWorldStateRootsRawUnchanged(t,
+			original[keys[height]].Body, store.objects[keys[height]].Body,
+		)
+		var got dtypes.BlockStorageDiff
+		require.NoError(t, rlp.DecodeBytes(store.objects[keys[height]].Body, &got))
+		if height == last {
+			require.Empty(t, got.NewAccounts)
+			require.Empty(t, got.DeletedAccounts)
+			require.Empty(t, got.StorageDiff)
+			require.Empty(t, got.NewCodes)
+		} else {
+			require.Equal(t, worldByHeight[height].newAccounts, got.NewAccounts)
+			require.Equal(t, worldByHeight[height].deletedAccounts, got.DeletedAccounts)
+			require.Equal(t, worldByHeight[height].storage, got.StorageDiff)
+			require.Equal(t, worldByHeight[height].codeWrites, got.NewCodes)
+		}
+	}
+
+	checkpoint, found, err := loadRefillCheckpoint(options.Checkpoint, options)
+	require.NoError(t, err)
+	require.True(t, found)
+	require.Equal(t, refillWorldStateCheckpointSchema, checkpoint.Schema)
+	require.Equal(t, "basecro", checkpoint.EVMDenom)
+	otherDenom := options
+	otherDenom.EVMDenom = "other"
+	_, _, err = loadRefillCheckpoint(options.Checkpoint, otherDenom)
+	require.ErrorContains(t, err, "checkpoint does not match")
+}
+
 func TestRefillOptionsRejectsMoreThanTenThousandHeights(t *testing.T) {
 	options := refillOptions{
 		ZZFile: "/tmp/block.zz", ArchiveHome: "/tmp/archive",
@@ -441,6 +519,18 @@ func TestRefillOptionsRejectsMoreThanTenThousandHeights(t *testing.T) {
 	options.IAVLConcurrency = 1
 	options.IAVLRunHeights = directIAVLShardSize + 1
 	require.ErrorContains(t, options.prepare(), "iavl-run-heights")
+
+	options.IAVLRunHeights = defaultDirectIAVLRunHeights
+	options.Direct = false
+	options.WorldState = true
+	options.EVMDenom = "basecro"
+	options.ZZFile = "/tmp/block.zz"
+	require.ErrorContains(t, options.prepare(), "world-state refill requires direct")
+
+	options.ZZFile = ""
+	options.Direct = true
+	options.EVMDenom = ""
+	require.ErrorContains(t, options.prepare(), "requires an EVM denom")
 }
 
 func TestRunRefillWriteResumesFromPersistedCheckpointAfterFailure(t *testing.T) {

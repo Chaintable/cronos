@@ -8,12 +8,14 @@ import (
 	"testing"
 
 	"github.com/cosmos/iavl"
+	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/stretchr/testify/require"
 )
 
 type worldStateFake struct {
 	mu     sync.Mutex
 	ranges map[string][][2]int64
+	sets   map[string]map[int64]*iavl.ChangeSet
 }
 
 type worldStateFakeSource struct {
@@ -46,11 +48,55 @@ func (source *worldStateFakeSource) TraverseStateChangesInKeyRange(
 	source.fake.ranges[source.label] = append(source.fake.ranges[source.label], [2]int64{first, last})
 	source.fake.mu.Unlock()
 	for version := first; version <= last; version++ {
-		if err := callback(version, &iavl.ChangeSet{}); err != nil {
+		changeSet := &iavl.ChangeSet{}
+		if source.fake.sets[source.label] != nil && source.fake.sets[source.label][version] != nil {
+			changeSet = source.fake.sets[source.label][version]
+		}
+		if err := callback(version, changeSet); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+func TestIterateParallelWorldStateDeltasReadsCodeAndStorageInOneEVMTraversal(t *testing.T) {
+	code := []byte{0x60, 0x00}
+	codeHash := crypto.Keccak256Hash(code)
+	storageKey := make([]byte, 53)
+	storageKey[0] = 0x02
+	storageKey[20] = 0x01
+	storageKey[52] = 0x02
+	fake := &worldStateFake{
+		ranges: make(map[string][][2]int64),
+		sets: map[string]map[int64]*iavl.ChangeSet{
+			"evm": {
+				2: {Pairs: []*iavl.KVPair{
+					{Key: append([]byte{evmCodePrefix}, codeHash.Bytes()...), Value: code},
+					{Key: storageKey, Value: []byte{0x03}},
+				}},
+			},
+		},
+	}
+	factory := func() worldStateSources {
+		return worldStateSources{
+			accounts: &worldStateFakeSource{fake: fake, label: "acc", start: 0x01, end: 0x02},
+			balances: &worldStateFakeSource{fake: fake, label: "bank", start: 0x02, end: 0x03},
+			evm:      &worldStateFakeSource{fake: fake, label: "evm", start: 0x01, end: 0x03},
+		}
+	}
+	err := iterateParallelWorldStateDeltasContext(
+		context.Background(), factory, "basecro", []int64{2, 2, 2},
+		1, directIAVLShardSize, 2, 2, true,
+		func(delta worldStateDelta) error {
+			require.Equal(t, []codeMutation{{CodeHash: codeHash, Code: code}}, delta.codes)
+			require.Len(t, delta.storage, 1)
+			require.Len(t, delta.storage[0].Values, 1)
+			require.Equal(t, uint64(3), delta.storage[0].Values[0].Value.Uint64())
+			return nil
+		},
+	)
+	require.NoError(t, err)
+	require.Equal(t, [][2]int64{{2, 2}}, fake.ranges["evm"])
 }
 
 func TestIterateParallelWorldStateDeltasOrdersAndSplitsEveryLegacyBoundary(t *testing.T) {
@@ -59,18 +105,19 @@ func TestIterateParallelWorldStateDeltasOrdersAndSplitsEveryLegacyBoundary(t *te
 		return worldStateSources{
 			accounts: &worldStateFakeSource{fake: fake, label: "acc", start: 0x01, end: 0x02},
 			balances: &worldStateFakeSource{fake: fake, label: "bank", start: 0x02, end: 0x03},
-			codes:    &worldStateFakeSource{fake: fake, label: "evm", start: 0x01, end: 0x02},
+			evm:      &worldStateFakeSource{fake: fake, label: "evm", start: 0x01, end: 0x02},
 		}
 	}
 	var heights []int64
 	err := iterateParallelWorldStateDeltasContext(
 		context.Background(), factory, "basecro",
-		[]int64{70, 100, 120}, 3, directIAVLShardSize*2, 2, 200,
+		[]int64{70, 100, 120}, 3, directIAVLShardSize*2, 2, 200, false,
 		func(delta worldStateDelta) error {
 			heights = append(heights, delta.height)
 			require.Empty(t, delta.accounts)
 			require.Empty(t, delta.balances)
 			require.Empty(t, delta.codes)
+			require.Empty(t, delta.storage)
 			return nil
 		},
 	)
@@ -90,7 +137,7 @@ func TestIterateParallelWorldStateDeltasOrdersAndSplitsEveryLegacyBoundary(t *te
 func TestIterateParallelWorldStateDeltasRejectsInvalidArguments(t *testing.T) {
 	err := iterateParallelWorldStateDeltasContext(
 		context.Background(), func() worldStateSources { return worldStateSources{} }, "basecro",
-		[]int64{-1}, 1, directIAVLShardSize, 2, 2, func(worldStateDelta) error { return nil },
+		[]int64{-1}, 1, directIAVLShardSize, 2, 2, false, func(worldStateDelta) error { return nil },
 	)
 	require.ErrorContains(t, err, "invalid latest legacy version")
 }

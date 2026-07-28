@@ -10,7 +10,10 @@ import (
 
 const (
 	blockStorageDiffFieldCount = 6
+	newAccountsFieldIndex      = 2
+	deletedAccountsFieldIndex  = 3
 	storageDiffFieldIndex      = 4
+	newCodesFieldIndex         = 5
 )
 
 func blockStorageDiffRawFields(body []byte) ([]rlp.RawValue, error) {
@@ -34,6 +37,30 @@ func replaceStorageDiffRLP(body []byte, storage []dtypes.AccountStorageDiff) ([]
 		return nil, err
 	}
 	fields[storageDiffFieldIndex] = rlp.RawValue(storageBody)
+	return rlp.EncodeToBytes(fields)
+}
+
+func replaceWorldStateRLP(body []byte, world expectedWorldState) ([]byte, error) {
+	fields, err := blockStorageDiffRawFields(body)
+	if err != nil {
+		return nil, err
+	}
+	replacements := []struct {
+		index int
+		value any
+	}{
+		{newAccountsFieldIndex, world.newAccounts},
+		{deletedAccountsFieldIndex, world.deletedAccounts},
+		{storageDiffFieldIndex, world.storage},
+		{newCodesFieldIndex, world.codeWrites},
+	}
+	for _, replacement := range replacements {
+		encoded, err := rlp.EncodeToBytes(replacement.value)
+		if err != nil {
+			return nil, err
+		}
+		fields[replacement.index] = rlp.RawValue(encoded)
+	}
 	return rlp.EncodeToBytes(fields)
 }
 

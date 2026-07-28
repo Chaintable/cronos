@@ -6,6 +6,7 @@ import (
 	"fmt"
 
 	"github.com/cosmos/iavl"
+	"github.com/evmos/ethermint/debank/statediff"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -14,7 +15,7 @@ const defaultWorldStateRunHeights = int64(64)
 type worldStateSources struct {
 	accounts keyRangeStateChangeSource
 	balances keyRangeStateChangeSource
-	codes    keyRangeStateChangeSource
+	evm      keyRangeStateChangeSource
 }
 
 type worldStateShardResult struct {
@@ -29,6 +30,37 @@ func iterateArchiveWorldStateDeltasContext(
 	cacheSize, concurrency int,
 	runHeights int64,
 	first, last int64,
+	callback func(worldStateDelta) error,
+) error {
+	return iterateArchiveWorldStateDeltas(
+		ctx, archive, evmDenom, cacheSize, concurrency, runHeights,
+		first, last, false, callback,
+	)
+}
+
+func iterateArchiveWorldStateDeltasWithStorageContext(
+	ctx context.Context,
+	archive *archiveReader,
+	evmDenom string,
+	cacheSize, concurrency int,
+	runHeights int64,
+	first, last int64,
+	callback func(worldStateDelta) error,
+) error {
+	return iterateArchiveWorldStateDeltas(
+		ctx, archive, evmDenom, cacheSize, concurrency, runHeights,
+		first, last, true, callback,
+	)
+}
+
+func iterateArchiveWorldStateDeltas(
+	ctx context.Context,
+	archive *archiveReader,
+	evmDenom string,
+	cacheSize, concurrency int,
+	runHeights int64,
+	first, last int64,
+	includeStorage bool,
 	callback func(worldStateDelta) error,
 ) error {
 	if archive == nil {
@@ -51,12 +83,12 @@ func iterateArchiveWorldStateDeltasContext(
 			return worldStateSources{
 				accounts: archive.stateChangeSource("acc", cacheSize),
 				balances: archive.stateChangeSource("bank", cacheSize),
-				codes:    archive.stateChangeSource("evm", cacheSize),
+				evm:      archive.stateChangeSource("evm", cacheSize),
 			}
 		},
 		evmDenom,
 		[]int64{legacyLatest["acc"], legacyLatest["bank"], legacyLatest["evm"]},
-		concurrency, runHeights, first, last, callback,
+		concurrency, runHeights, first, last, includeStorage, callback,
 	)
 }
 
@@ -117,6 +149,7 @@ func iterateParallelWorldStateDeltasContext(
 	concurrency int,
 	runHeights int64,
 	first, last int64,
+	includeStorage bool,
 	callback func(worldStateDelta) error,
 ) error {
 	if ctx == nil || newSources == nil || callback == nil {
@@ -183,7 +216,7 @@ func iterateParallelWorldStateDeltasContext(
 	for range concurrency {
 		group.Go(func() error {
 			sources := newSources()
-			if sources.accounts == nil || sources.balances == nil || sources.codes == nil {
+			if sources.accounts == nil || sources.balances == nil || sources.evm == nil {
 				return fmt.Errorf("world-state source factory returned nil")
 			}
 			for task := range jobs {
@@ -216,16 +249,32 @@ func iterateParallelWorldStateDeltasContext(
 					}); err != nil {
 					return fmt.Errorf("balance %w", err)
 				}
-				if err := fillWorldStateShard(groupCtx, sources.codes, task, result.deltas, []byte{0x01}, []byte{0x02},
+				evmEnd := []byte{0x02}
+				if includeStorage {
+					evmEnd = []byte{0x03}
+				}
+				if err := fillWorldStateShard(groupCtx, sources.evm, task, result.deltas, []byte{0x01}, evmEnd,
 					func(delta *worldStateDelta, changeSet *iavl.ChangeSet) error {
-						decoded, err := decodeCodes(changeSet)
+						codeChanges := &iavl.ChangeSet{Pairs: make([]*iavl.KVPair, 0, len(changeSet.Pairs))}
+						for _, pair := range changeSet.Pairs {
+							if pair != nil && len(pair.Key) != 0 && pair.Key[0] == evmCodePrefix {
+								codeChanges.Pairs = append(codeChanges.Pairs, pair)
+							}
+						}
+						decoded, err := decodeCodes(codeChanges)
 						if err != nil {
 							return err
 						}
 						delta.codes = decoded
+						if includeStorage {
+							delta.storage, err = statediff.CanonicalStorageDiff(changeSet)
+							if err != nil {
+								return err
+							}
+						}
 						return nil
 					}); err != nil {
-					return fmt.Errorf("code %w", err)
+					return fmt.Errorf("EVM %w", err)
 				}
 				select {
 				case results <- result:
