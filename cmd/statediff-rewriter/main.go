@@ -45,6 +45,7 @@ func newRootCommand() *cobra.Command {
 	commands := []*cobra.Command{
 		newDumpCommand(), newRefillCommand(), newPlanCommand(),
 		newApplyCommand(), newVerifyCommand(), newRollbackCommand(),
+		newWorldStateAuditCommand(),
 	}
 	for _, command := range commands {
 		command.Args = cobra.NoArgs
