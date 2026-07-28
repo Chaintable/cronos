@@ -49,10 +49,6 @@ func iavlStorePrefix(storeName string) string {
 	return "s/k:" + storeName + "/"
 }
 
-func (a *archiveReader) evmIAVLDB() iavldb.DB {
-	return a.iavlDB("evm")
-}
-
 func (a *archiveReader) stateChangeSource(storeName string, cacheSize int) keyRangeStateChangeSource {
 	return iavl.NewImmutableTree(a.iavlDB(storeName), cacheSize, true, log.NewNopLogger())
 }

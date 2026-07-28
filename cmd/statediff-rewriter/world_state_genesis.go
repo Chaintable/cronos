@@ -28,7 +28,7 @@ func cronosGenesisExpectedWorldState(
 	for _, address := range cronosGenesisAccounts {
 		account := projection.account(address)
 		if !account.Present {
-			return expectedWorldState{}, fmt.Errorf("Cronos genesis account %s is absent at IAVL version 1", address)
+			return expectedWorldState{}, fmt.Errorf("cronos genesis account %s is absent at IAVL version 1", address)
 		}
 		wireAddress := crypto.Keccak256Hash(address.Bytes())
 		balance := new(uint256.Int)
