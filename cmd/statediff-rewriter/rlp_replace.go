@@ -40,21 +40,29 @@ func replaceStorageDiffRLP(body []byte, storage []dtypes.AccountStorageDiff) ([]
 	return rlp.EncodeToBytes(fields)
 }
 
-func replaceWorldStateRLP(body []byte, world expectedWorldState) ([]byte, error) {
+func replaceWorldStateRLP(
+	body []byte,
+	world expectedWorldState,
+	selected refillFields,
+) ([]byte, error) {
 	fields, err := blockStorageDiffRawFields(body)
 	if err != nil {
 		return nil, err
 	}
 	replacements := []struct {
 		index int
+		field refillFields
 		value any
 	}{
-		{newAccountsFieldIndex, world.newAccounts},
-		{deletedAccountsFieldIndex, world.deletedAccounts},
-		{storageDiffFieldIndex, world.storage},
-		{newCodesFieldIndex, world.codeWrites},
+		{newAccountsFieldIndex, refillNewAccounts, world.newAccounts},
+		{deletedAccountsFieldIndex, refillDeletedAccounts, world.deletedAccounts},
+		{storageDiffFieldIndex, refillStorage, world.storage},
+		{newCodesFieldIndex, refillNewCodes, world.codeWrites},
 	}
 	for _, replacement := range replacements {
+		if !selected.has(replacement.field) {
+			continue
+		}
 		encoded, err := rlp.EncodeToBytes(replacement.value)
 		if err != nil {
 			return nil, err

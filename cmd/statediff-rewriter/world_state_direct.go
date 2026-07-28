@@ -34,22 +34,23 @@ func iterateArchiveWorldStateDeltasContext(
 ) error {
 	return iterateArchiveWorldStateDeltas(
 		ctx, archive, evmDenom, cacheSize, concurrency, runHeights,
-		first, last, false, callback,
+		first, last, true, true, false, callback,
 	)
 }
 
-func iterateArchiveWorldStateDeltasWithStorageContext(
+func iterateArchiveRefillWorldStateDeltasContext(
 	ctx context.Context,
 	archive *archiveReader,
 	evmDenom string,
 	cacheSize, concurrency int,
 	runHeights int64,
 	first, last int64,
+	includeAccounts, includeCodes, includeStorage bool,
 	callback func(worldStateDelta) error,
 ) error {
 	return iterateArchiveWorldStateDeltas(
 		ctx, archive, evmDenom, cacheSize, concurrency, runHeights,
-		first, last, true, callback,
+		first, last, includeAccounts, includeCodes, includeStorage, callback,
 	)
 }
 
@@ -60,35 +61,52 @@ func iterateArchiveWorldStateDeltas(
 	cacheSize, concurrency int,
 	runHeights int64,
 	first, last int64,
-	includeStorage bool,
+	includeAccounts, includeCodes, includeStorage bool,
 	callback func(worldStateDelta) error,
 ) error {
 	if archive == nil {
 		return fmt.Errorf("world-state archive is required")
 	}
+	storeNames := make([]string, 0, 3)
+	if includeAccounts {
+		storeNames = append(storeNames, "acc", "bank")
+	}
+	if includeCodes || includeStorage {
+		storeNames = append(storeNames, "evm")
+	}
+	if len(storeNames) == 0 {
+		return fmt.Errorf("at least one world-state field is required")
+	}
 	legacyLatest := make(map[string]int64, 3)
-	for _, storeName := range []string{"acc", "bank", "evm"} {
+	legacyBoundaries := make([]int64, 0, len(storeNames))
+	for _, storeName := range storeNames {
 		version, err := archive.legacyLatestVersion(storeName)
 		if err != nil {
 			return fmt.Errorf("resolve latest legacy %s IAVL version: %w", storeName, err)
 		}
 		legacyLatest[storeName] = version
+		legacyBoundaries = append(legacyBoundaries, version)
 	}
-	if err := verifyWorldStateStoreRoots(archive, first, last, legacyLatest); err != nil {
+	if err := verifyWorldStateStoreRoots(archive, first, last, legacyLatest, storeNames); err != nil {
 		return err
 	}
 	return iterateParallelWorldStateDeltasContext(
 		ctx,
 		func() worldStateSources {
-			return worldStateSources{
-				accounts: archive.stateChangeSource("acc", cacheSize),
-				balances: archive.stateChangeSource("bank", cacheSize),
-				evm:      archive.stateChangeSource("evm", cacheSize),
+			sources := worldStateSources{}
+			if includeAccounts {
+				sources.accounts = archive.stateChangeSource("acc", cacheSize)
+				sources.balances = archive.stateChangeSource("bank", cacheSize)
 			}
+			if includeCodes || includeStorage {
+				sources.evm = archive.stateChangeSource("evm", cacheSize)
+			}
+			return sources
 		},
 		evmDenom,
-		[]int64{legacyLatest["acc"], legacyLatest["bank"], legacyLatest["evm"]},
-		concurrency, runHeights, first, last, includeStorage, callback,
+		legacyBoundaries,
+		concurrency, runHeights, first, last,
+		includeAccounts, includeCodes, includeStorage, callback,
 	)
 }
 
@@ -96,6 +114,7 @@ func verifyWorldStateStoreRoots(
 	archive *archiveReader,
 	first, last int64,
 	legacyLatest map[string]int64,
+	storeNames []string,
 ) error {
 	versions := map[int64]struct{}{first: {}, last: {}}
 	if first > 1 {
@@ -109,7 +128,7 @@ func verifyWorldStateStoreRoots(
 			}
 		}
 	}
-	for _, storeName := range []string{"acc", "bank", "evm"} {
+	for _, storeName := range storeNames {
 		source := archive.stateChangeSource(storeName, 0)
 		for version := range versions {
 			got, err := source.VersionHash(version)
@@ -149,11 +168,14 @@ func iterateParallelWorldStateDeltasContext(
 	concurrency int,
 	runHeights int64,
 	first, last int64,
-	includeStorage bool,
+	includeAccounts, includeCodes, includeStorage bool,
 	callback func(worldStateDelta) error,
 ) error {
 	if ctx == nil || newSources == nil || callback == nil {
 		return fmt.Errorf("world-state traversal context, source factory, and callback are required")
+	}
+	if !includeAccounts && !includeCodes && !includeStorage {
+		return fmt.Errorf("at least one world-state field is required")
 	}
 	if concurrency < 1 || concurrency > maximumDirectIAVLConcurrency {
 		return fmt.Errorf("iavl-concurrency must be between 1 and %d", maximumDirectIAVLConcurrency)
@@ -169,9 +191,13 @@ func iterateParallelWorldStateDeltasContext(
 			return fmt.Errorf("invalid latest legacy version %d", boundary)
 		}
 	}
-	decoder, err := newWorldStateDecoder(evmDenom)
-	if err != nil {
-		return err
+	var decoder *worldStateDecoder
+	if includeAccounts {
+		var err error
+		decoder, err = newWorldStateDecoder(evmDenom)
+		if err != nil {
+			return err
+		}
 	}
 
 	pipelineCtx, cancel := context.WithCancel(ctx)
@@ -216,7 +242,8 @@ func iterateParallelWorldStateDeltasContext(
 	for range concurrency {
 		group.Go(func() error {
 			sources := newSources()
-			if sources.accounts == nil || sources.balances == nil || sources.evm == nil {
+			if includeAccounts && (sources.accounts == nil || sources.balances == nil) ||
+				(includeCodes || includeStorage) && sources.evm == nil {
 				return fmt.Errorf("world-state source factory returned nil")
 			}
 			for task := range jobs {
@@ -227,54 +254,64 @@ func iterateParallelWorldStateDeltasContext(
 				for index := range result.deltas {
 					result.deltas[index].height = task.first + int64(index)
 				}
-				if err := fillWorldStateShard(groupCtx, sources.accounts, task, result.deltas, []byte{0x01}, []byte{0x02},
-					func(delta *worldStateDelta, changeSet *iavl.ChangeSet) error {
-						decoded, err := decoder.decodeAccounts(changeSet)
-						if err != nil {
-							return err
-						}
-						delta.accounts = decoded
-						return nil
-					}); err != nil {
-					return fmt.Errorf("account %w", err)
-				}
-				if err := fillWorldStateShard(groupCtx, sources.balances, task, result.deltas, []byte{0x02}, []byte{0x03},
-					func(delta *worldStateDelta, changeSet *iavl.ChangeSet) error {
-						decoded, err := decoder.decodeBalances(changeSet)
-						if err != nil {
-							return err
-						}
-						delta.balances = decoded
-						return nil
-					}); err != nil {
-					return fmt.Errorf("balance %w", err)
-				}
-				evmEnd := []byte{0x02}
-				if includeStorage {
-					evmEnd = []byte{0x03}
-				}
-				if err := fillWorldStateShard(groupCtx, sources.evm, task, result.deltas, []byte{0x01}, evmEnd,
-					func(delta *worldStateDelta, changeSet *iavl.ChangeSet) error {
-						codeChanges := &iavl.ChangeSet{Pairs: make([]*iavl.KVPair, 0, len(changeSet.Pairs))}
-						for _, pair := range changeSet.Pairs {
-							if pair != nil && len(pair.Key) != 0 && pair.Key[0] == evmCodePrefix {
-								codeChanges.Pairs = append(codeChanges.Pairs, pair)
-							}
-						}
-						decoded, err := decodeCodes(codeChanges)
-						if err != nil {
-							return err
-						}
-						delta.codes = decoded
-						if includeStorage {
-							delta.storage, err = statediff.CanonicalStorageDiff(changeSet)
+				if includeAccounts {
+					if err := fillWorldStateShard(groupCtx, sources.accounts, task, result.deltas, []byte{0x01}, []byte{0x02},
+						func(delta *worldStateDelta, changeSet *iavl.ChangeSet) error {
+							decoded, err := decoder.decodeAccounts(changeSet)
 							if err != nil {
 								return err
 							}
-						}
-						return nil
-					}); err != nil {
-					return fmt.Errorf("EVM %w", err)
+							delta.accounts = decoded
+							return nil
+						}); err != nil {
+						return fmt.Errorf("account %w", err)
+					}
+					if err := fillWorldStateShard(groupCtx, sources.balances, task, result.deltas, []byte{0x02}, []byte{0x03},
+						func(delta *worldStateDelta, changeSet *iavl.ChangeSet) error {
+							decoded, err := decoder.decodeBalances(changeSet)
+							if err != nil {
+								return err
+							}
+							delta.balances = decoded
+							return nil
+						}); err != nil {
+						return fmt.Errorf("balance %w", err)
+					}
+				}
+				if includeCodes || includeStorage {
+					evmStart, evmEnd := []byte{0x01}, []byte{0x02}
+					if !includeCodes {
+						evmStart = []byte{0x02}
+					}
+					if includeStorage {
+						evmEnd = []byte{0x03}
+					}
+					if err := fillWorldStateShard(groupCtx, sources.evm, task, result.deltas, evmStart, evmEnd,
+						func(delta *worldStateDelta, changeSet *iavl.ChangeSet) error {
+							if includeCodes {
+								codeChanges := &iavl.ChangeSet{Pairs: make([]*iavl.KVPair, 0, len(changeSet.Pairs))}
+								for _, pair := range changeSet.Pairs {
+									if pair != nil && len(pair.Key) != 0 && pair.Key[0] == evmCodePrefix {
+										codeChanges.Pairs = append(codeChanges.Pairs, pair)
+									}
+								}
+								decoded, err := decodeCodes(codeChanges)
+								if err != nil {
+									return err
+								}
+								delta.codes = decoded
+							}
+							if includeStorage {
+								storage, err := statediff.CanonicalStorageDiff(changeSet)
+								if err != nil {
+									return err
+								}
+								delta.storage = storage
+							}
+							return nil
+						}); err != nil {
+						return fmt.Errorf("EVM %w", err)
+					}
 				}
 				select {
 				case results <- result:

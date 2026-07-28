@@ -20,6 +20,28 @@ func initializeWorldStateProjection(
 	version int64,
 	cacheSize int,
 ) (*worldStateProjection, map[common.Hash]struct{}, worldStateInitialization, error) {
+	return initializeWorldStateProjectionWithCodes(archive, decoder, version, cacheSize, true)
+}
+
+func initializeAccountProjection(
+	archive *archiveReader,
+	decoder *worldStateDecoder,
+	version int64,
+	cacheSize int,
+) (*worldStateProjection, worldStateInitialization, error) {
+	projection, _, report, err := initializeWorldStateProjectionWithCodes(
+		archive, decoder, version, cacheSize, false,
+	)
+	return projection, report, err
+}
+
+func initializeWorldStateProjectionWithCodes(
+	archive *archiveReader,
+	decoder *worldStateDecoder,
+	version int64,
+	cacheSize int,
+	includeCodes bool,
+) (*worldStateProjection, map[common.Hash]struct{}, worldStateInitialization, error) {
 	if archive == nil || decoder == nil || version < 1 {
 		return nil, nil, worldStateInitialization{}, fmt.Errorf("archive, decoder, and positive version are required")
 	}
@@ -69,6 +91,9 @@ func initializeWorldStateProjection(
 	})
 	if err != nil {
 		return nil, nil, report, fmt.Errorf("initialize balances at version %d: %w", version, err)
+	}
+	if !includeCodes {
+		return projection, availableCodes, report, nil
 	}
 
 	codeTree, err := archive.versionedStateSource("evm", cacheSize).GetImmutable(version)

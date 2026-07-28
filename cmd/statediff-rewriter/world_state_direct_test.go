@@ -85,8 +85,8 @@ func TestIterateParallelWorldStateDeltasReadsCodeAndStorageInOneEVMTraversal(t *
 		}
 	}
 	err := iterateParallelWorldStateDeltasContext(
-		context.Background(), factory, "basecro", []int64{2, 2, 2},
-		1, directIAVLShardSize, 2, 2, true,
+		context.Background(), factory, "", []int64{2},
+		1, directIAVLShardSize, 2, 2, false, true, true,
 		func(delta worldStateDelta) error {
 			require.Equal(t, []codeMutation{{CodeHash: codeHash, Code: code}}, delta.codes)
 			require.Len(t, delta.storage, 1)
@@ -97,6 +97,58 @@ func TestIterateParallelWorldStateDeltasReadsCodeAndStorageInOneEVMTraversal(t *
 	)
 	require.NoError(t, err)
 	require.Equal(t, [][2]int64{{2, 2}}, fake.ranges["evm"])
+	require.Empty(t, fake.ranges["acc"])
+	require.Empty(t, fake.ranges["bank"])
+}
+
+func TestIterateParallelWorldStateDeltasReadsOnlySelectedStores(t *testing.T) {
+	tests := []struct {
+		name                     string
+		accounts, codes, storage bool
+		evmStart, evmEnd         byte
+	}{
+		{name: "accounts", accounts: true},
+		{name: "codes", codes: true, evmStart: 0x01, evmEnd: 0x02},
+		{name: "storage", storage: true, evmStart: 0x02, evmEnd: 0x03},
+		{name: "code and storage", codes: true, storage: true, evmStart: 0x01, evmEnd: 0x03},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fake := &worldStateFake{ranges: make(map[string][][2]int64)}
+			factory := func() worldStateSources {
+				sources := worldStateSources{}
+				if test.accounts {
+					sources.accounts = &worldStateFakeSource{fake: fake, label: "acc", start: 0x01, end: 0x02}
+					sources.balances = &worldStateFakeSource{fake: fake, label: "bank", start: 0x02, end: 0x03}
+				}
+				if test.codes || test.storage {
+					sources.evm = &worldStateFakeSource{
+						fake: fake, label: "evm", start: test.evmStart, end: test.evmEnd,
+					}
+				}
+				return sources
+			}
+			err := iterateParallelWorldStateDeltasContext(
+				context.Background(), factory, "basecro", nil,
+				1, directIAVLShardSize, 2, 2,
+				test.accounts, test.codes, test.storage,
+				func(worldStateDelta) error { return nil },
+			)
+			require.NoError(t, err)
+			if test.accounts {
+				require.Equal(t, [][2]int64{{2, 2}}, fake.ranges["acc"])
+				require.Equal(t, [][2]int64{{2, 2}}, fake.ranges["bank"])
+			} else {
+				require.Empty(t, fake.ranges["acc"])
+				require.Empty(t, fake.ranges["bank"])
+			}
+			if test.codes || test.storage {
+				require.Equal(t, [][2]int64{{2, 2}}, fake.ranges["evm"])
+			} else {
+				require.Empty(t, fake.ranges["evm"])
+			}
+		})
+	}
 }
 
 func TestIterateParallelWorldStateDeltasOrdersAndSplitsEveryLegacyBoundary(t *testing.T) {
@@ -111,7 +163,7 @@ func TestIterateParallelWorldStateDeltasOrdersAndSplitsEveryLegacyBoundary(t *te
 	var heights []int64
 	err := iterateParallelWorldStateDeltasContext(
 		context.Background(), factory, "basecro",
-		[]int64{70, 100, 120}, 3, directIAVLShardSize*2, 2, 200, false,
+		[]int64{70, 100, 120}, 3, directIAVLShardSize*2, 2, 200, true, true, false,
 		func(delta worldStateDelta) error {
 			heights = append(heights, delta.height)
 			require.Empty(t, delta.accounts)
@@ -137,7 +189,8 @@ func TestIterateParallelWorldStateDeltasOrdersAndSplitsEveryLegacyBoundary(t *te
 func TestIterateParallelWorldStateDeltasRejectsInvalidArguments(t *testing.T) {
 	err := iterateParallelWorldStateDeltasContext(
 		context.Background(), func() worldStateSources { return worldStateSources{} }, "basecro",
-		[]int64{-1}, 1, directIAVLShardSize, 2, 2, false, func(worldStateDelta) error { return nil },
+		[]int64{-1}, 1, directIAVLShardSize, 2, 2,
+		true, true, false, func(worldStateDelta) error { return nil },
 	)
 	require.ErrorContains(t, err, "invalid latest legacy version")
 }

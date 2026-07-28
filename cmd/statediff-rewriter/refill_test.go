@@ -404,7 +404,7 @@ func TestRunRefillDirectWriteUsesCanonicalIterator(t *testing.T) {
 	}
 }
 
-func TestRunRefillDirectWorldStateReplacesAllCanonicalFields(t *testing.T) {
+func TestRunRefillDirectSelectedWorldStateFieldsPreserveStorage(t *testing.T) {
 	const first, last = int64(100), int64(101)
 	roots := newRefillTestRoots(first, last)
 	objects, keys, canonical := refillTestObjects(t, roots, "prefix", first, last, nil)
@@ -414,8 +414,9 @@ func TestRunRefillDirectWorldStateReplacesAllCanonicalFields(t *testing.T) {
 	}
 	store := &fakeObjectStore{objects: objects}
 	options := refillTestDirectOptions(t, first, last, true)
-	options.WorldState = true
+	options.Fields = []string{"new-accounts", "deleted-accounts", "new-codes"}
 	options.EVMDenom = "basecro"
+	require.NoError(t, options.prepare())
 	address := common.HexToHash("0x1234")
 	worldByHeight := map[int64]expectedWorldState{
 		first: {
@@ -448,7 +449,7 @@ func TestRunRefillDirectWorldStateReplacesAllCanonicalFields(t *testing.T) {
 		context.Background(), options, roots, store, nil, iterator,
 	)
 	require.NoError(t, err)
-	require.True(t, report.WorldState)
+	require.Equal(t, options.Fields, report.Fields)
 	require.Equal(t, "basecro", report.EVMDenom)
 	require.Equal(t, []int64{first}, starts)
 	for height := first; height <= last; height++ {
@@ -456,17 +457,26 @@ func TestRunRefillDirectWorldStateReplacesAllCanonicalFields(t *testing.T) {
 		requireWorldStateRootsRawUnchanged(t,
 			original[keys[height]].Body, store.objects[keys[height]].Body,
 		)
+		oldFields, err := blockStorageDiffRawFields(original[keys[height]].Body)
+		require.NoError(t, err)
+		newFields, err := blockStorageDiffRawFields(store.objects[keys[height]].Body)
+		require.NoError(t, err)
+		require.Equal(t,
+			[]byte(oldFields[storageDiffFieldIndex]),
+			[]byte(newFields[storageDiffFieldIndex]),
+		)
 		var got dtypes.BlockStorageDiff
 		require.NoError(t, rlp.DecodeBytes(store.objects[keys[height]].Body, &got))
+		var old dtypes.BlockStorageDiff
+		require.NoError(t, rlp.DecodeBytes(original[keys[height]].Body, &old))
+		require.Equal(t, old.StorageDiff, got.StorageDiff)
 		if height == last {
 			require.Empty(t, got.NewAccounts)
 			require.Empty(t, got.DeletedAccounts)
-			require.Empty(t, got.StorageDiff)
 			require.Empty(t, got.NewCodes)
 		} else {
 			require.Equal(t, worldByHeight[height].newAccounts, got.NewAccounts)
 			require.Equal(t, worldByHeight[height].deletedAccounts, got.DeletedAccounts)
-			require.Equal(t, worldByHeight[height].storage, got.StorageDiff)
 			require.Equal(t, worldByHeight[height].codeWrites, got.NewCodes)
 		}
 	}
@@ -475,10 +485,24 @@ func TestRunRefillDirectWorldStateReplacesAllCanonicalFields(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, found)
 	require.Equal(t, refillWorldStateCheckpointSchema, checkpoint.Schema)
+	require.Equal(t, strings.Join(options.Fields, ","), checkpoint.Fields)
 	require.Equal(t, "basecro", checkpoint.EVMDenom)
 	otherDenom := options
 	otherDenom.EVMDenom = "other"
 	_, _, err = loadRefillCheckpoint(options.Checkpoint, otherDenom)
+	require.ErrorContains(t, err, "checkpoint does not match")
+
+	reordered := options
+	reordered.Fields = []string{"new-codes", "deleted-accounts", "new-accounts"}
+	require.NoError(t, reordered.prepare())
+	_, found, err = loadRefillCheckpoint(options.Checkpoint, reordered)
+	require.NoError(t, err)
+	require.True(t, found)
+
+	otherFields := options
+	otherFields.Fields = []string{"new-accounts"}
+	require.NoError(t, otherFields.prepare())
+	_, _, err = loadRefillCheckpoint(options.Checkpoint, otherFields)
 	require.ErrorContains(t, err, "checkpoint does not match")
 }
 
@@ -490,6 +514,7 @@ func TestRefillOptionsRejectsMoreThanTenThousandHeights(t *testing.T) {
 		Concurrency: 1, Window: 1,
 	}
 	require.NoError(t, options.prepare())
+	require.Equal(t, []string{"storage"}, options.Fields)
 
 	options.FinalHeight++
 	require.ErrorContains(t, options.prepare(), "refill range exceeds 10000 heights")
@@ -522,15 +547,27 @@ func TestRefillOptionsRejectsMoreThanTenThousandHeights(t *testing.T) {
 
 	options.IAVLRunHeights = defaultDirectIAVLRunHeights
 	options.Direct = false
-	options.WorldState = true
+	options.Fields = []string{"new-accounts"}
 	options.EVMDenom = "basecro"
 	options.ZZFile = "/tmp/block.zz"
-	require.ErrorContains(t, options.prepare(), "world-state refill requires direct")
+	require.ErrorContains(t, options.prepare(), "non-storage refill fields require direct")
 
 	options.ZZFile = ""
 	options.Direct = true
 	options.EVMDenom = ""
-	require.ErrorContains(t, options.prepare(), "requires an EVM denom")
+	require.ErrorContains(t, options.prepare(), "account refill fields require an EVM denom")
+
+	options.EVMDenom = "basecro"
+	options.Fields = []string{"unknown"}
+	require.ErrorContains(t, options.prepare(), "unknown refill field")
+
+	options.Fields = []string{"storage", "storage"}
+	require.ErrorContains(t, options.prepare(), "duplicate refill field")
+
+	options.Fields = []string{"new-codes"}
+	options.EVMDenom = ""
+	require.NoError(t, options.prepare(), "code-only refill does not need an EVM denom")
+	require.Empty(t, options.checkpointDenom())
 }
 
 func TestRunRefillWriteResumesFromPersistedCheckpointAfterFailure(t *testing.T) {

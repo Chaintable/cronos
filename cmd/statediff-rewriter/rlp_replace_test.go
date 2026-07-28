@@ -73,7 +73,11 @@ func TestReplaceWorldStateRLPPreservesRootsAndReplacesEmptyFields(t *testing.T) 
 	oldBody, err := rlp.EncodeToBytes(old)
 	require.NoError(t, err)
 
-	newBody, err := replaceWorldStateRLP(oldBody, expectedWorldState{})
+	newBody, err := replaceWorldStateRLP(
+		oldBody,
+		expectedWorldState{},
+		refillNewAccounts|refillDeletedAccounts|refillStorage|refillNewCodes,
+	)
 	require.NoError(t, err)
 	requireWorldStateRootsRawUnchanged(t, oldBody, newBody)
 
@@ -85,6 +89,18 @@ func TestReplaceWorldStateRLPPreservesRootsAndReplacesEmptyFields(t *testing.T) 
 	require.Empty(t, got.DeletedAccounts)
 	require.Empty(t, got.StorageDiff)
 	require.Empty(t, got.NewCodes)
+
+	withoutStorage, err := replaceWorldStateRLP(
+		oldBody,
+		expectedWorldState{},
+		refillNewAccounts|refillDeletedAccounts|refillNewCodes,
+	)
+	require.NoError(t, err)
+	oldFields, err := blockStorageDiffRawFields(oldBody)
+	require.NoError(t, err)
+	newFields, err := blockStorageDiffRawFields(withoutStorage)
+	require.NoError(t, err)
+	require.Equal(t, []byte(oldFields[storageDiffFieldIndex]), []byte(newFields[storageDiffFieldIndex]))
 }
 
 func requireWorldStateRootsRawUnchanged(t *testing.T, oldBody, newBody []byte) {

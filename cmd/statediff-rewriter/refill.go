@@ -32,9 +32,28 @@ const (
 	refillProgressEvery              = uint64(10_000)
 )
 
+type refillFields uint8
+
+const (
+	refillNewAccounts refillFields = 1 << iota
+	refillDeletedAccounts
+	refillStorage
+	refillNewCodes
+)
+
+var refillFieldNames = []struct {
+	name  string
+	field refillFields
+}{
+	{"new-accounts", refillNewAccounts},
+	{"deleted-accounts", refillDeletedAccounts},
+	{"storage", refillStorage},
+	{"new-codes", refillNewCodes},
+}
+
 type refillOptions struct {
 	Direct          bool
-	WorldState      bool
+	Fields          []string
 	EVMDenom        string
 	ZZFile          string
 	ZZDir           string
@@ -52,6 +71,7 @@ type refillOptions struct {
 	IAVLCacheSize   int
 	IAVLConcurrency int
 	IAVLRunHeights  int64
+	selectedFields  refillFields
 }
 
 type refillStorageIterator func(
@@ -90,7 +110,7 @@ type refillCheckpoint struct {
 	Schema          string          `json:"schema"`
 	Mode            string          `json:"mode"`
 	Direct          bool            `json:"direct,omitempty"`
-	WorldState      bool            `json:"world_state,omitempty"`
+	Fields          string          `json:"fields,omitempty"`
 	EVMDenom        string          `json:"evm_denom,omitempty"`
 	ZZFile          string          `json:"zz_file,omitempty"`
 	ZZDir           string          `json:"zz_dir,omitempty"`
@@ -114,7 +134,7 @@ type refillCheckpoint struct {
 type refillReport struct {
 	Mode                string          `json:"mode"`
 	Direct              bool            `json:"direct,omitempty"`
-	WorldState          bool            `json:"world_state,omitempty"`
+	Fields              []string        `json:"fields"`
 	EVMDenom            string          `json:"evm_denom,omitempty"`
 	ZZFile              string          `json:"zz_file,omitempty"`
 	ZZDir               string          `json:"zz_dir,omitempty"`
@@ -137,9 +157,53 @@ type refillReport struct {
 	BlocksPerSecond     float64         `json:"blocks_per_second"`
 }
 
+func parseRefillFields(names []string) (refillFields, []string, error) {
+	if len(names) == 0 {
+		names = []string{"storage"}
+	}
+	var selected refillFields
+	for _, name := range names {
+		name = strings.TrimSpace(name)
+		var field refillFields
+		for _, candidate := range refillFieldNames {
+			if name == candidate.name {
+				field = candidate.field
+				break
+			}
+		}
+		if field == 0 {
+			return 0, nil, fmt.Errorf("unknown refill field %q", name)
+		}
+		if selected&field != 0 {
+			return 0, nil, fmt.Errorf("duplicate refill field %q", name)
+		}
+		selected |= field
+	}
+	normalized := make([]string, 0, len(refillFieldNames))
+	for _, candidate := range refillFieldNames {
+		if selected&candidate.field != 0 {
+			normalized = append(normalized, candidate.name)
+		}
+	}
+	return selected, normalized, nil
+}
+
+func (fields refillFields) has(field refillFields) bool {
+	return fields&field != 0
+}
+
+func (fields refillFields) needsAccounts() bool {
+	return fields&(refillNewAccounts|refillDeletedAccounts) != 0
+}
+
+func (fields refillFields) needsWorldState() bool {
+	return fields&^refillStorage != 0
+}
+
 func newRefillCommand() *cobra.Command {
 	options := refillOptions{
 		Bucket: defaultBucket, Prefix: defaultPrefix, Region: defaultRegion,
+		Fields:      []string{"storage"},
 		EVMDenom:    defaultCronosEVMDenom,
 		Concurrency: defaultObjectConcurrency, Window: defaultObjectWindow,
 		IAVLCacheSize: defaultDumpCacheSize, IAVLConcurrency: defaultDirectIAVLConcurrency,
@@ -157,7 +221,10 @@ func newRefillCommand() *cobra.Command {
 		},
 	}
 	command.Flags().BoolVar(&options.Direct, "direct", false, "derive changes directly from the frozen archive IAVL")
-	command.Flags().BoolVar(&options.WorldState, "world-state", false, "replace account, deletion, code, and storage fields")
+	command.Flags().StringSliceVar(
+		&options.Fields, "fields", options.Fields,
+		"stateDiff fields to replace: new-accounts, deleted-accounts, storage, new-codes",
+	)
 	command.Flags().StringVar(&options.EVMDenom, "evm-denom", options.EVMDenom, "native EVM bank denom")
 	command.Flags().StringVar(&options.ZZFile, "zz", "", "changeset block-*.zz file")
 	command.Flags().StringVar(&options.ZZDir, "zz-dir", "", "directory of numerically ordered block-*.zz files")
@@ -191,11 +258,16 @@ func (options *refillOptions) prepare() error {
 	if sourceCount != 1 {
 		return fmt.Errorf("exactly one refill source is required: direct, zz, or zz-dir")
 	}
-	if options.WorldState && !options.Direct {
-		return fmt.Errorf("world-state refill requires direct mode")
+	selected, normalized, err := parseRefillFields(options.Fields)
+	if err != nil {
+		return err
 	}
-	if options.WorldState && options.EVMDenom == "" {
-		return fmt.Errorf("world-state refill requires an EVM denom")
+	options.selectedFields, options.Fields = selected, normalized
+	if selected.needsWorldState() && !options.Direct {
+		return fmt.Errorf("non-storage refill fields require direct mode")
+	}
+	if selected.needsAccounts() && options.EVMDenom == "" {
+		return fmt.Errorf("account refill fields require an EVM denom")
 	}
 	if !filepath.IsAbs(options.ArchiveHome) ||
 		(options.ZZFile != "" && !filepath.IsAbs(options.ZZFile)) ||
@@ -248,7 +320,7 @@ func (options *refillOptions) prepare() error {
 }
 
 func (options refillOptions) checkpointSchema() string {
-	if options.WorldState {
+	if options.selectedFields.needsWorldState() {
 		return refillWorldStateCheckpointSchema
 	}
 	if options.Direct {
@@ -261,8 +333,15 @@ func (options refillOptions) checkpointSchema() string {
 }
 
 func (options refillOptions) checkpointDenom() string {
-	if options.WorldState {
+	if options.selectedFields.needsAccounts() {
 		return options.EVMDenom
+	}
+	return ""
+}
+
+func (options refillOptions) checkpointFields() string {
+	if options.selectedFields.needsWorldState() {
+		return strings.Join(options.Fields, ",")
 	}
 	return ""
 }
@@ -290,25 +369,31 @@ func runRefill(ctx context.Context, options refillOptions, objects objectStore) 
 	}
 	var directIterator refillStorageIterator
 	var worldIterator refillWorldStateIterator
-	if options.WorldState {
+	if options.selectedFields.needsWorldState() {
 		worldIterator = func(
 			iterCtx context.Context,
 			first, last int64,
 			callback func(int64, expectedWorldState) error,
 		) error {
-			decoder, err := newWorldStateDecoder(options.EVMDenom)
-			if err != nil {
-				return err
+			projection := newWorldStateProjection()
+			if options.selectedFields.needsAccounts() {
+				decoder, err := newWorldStateDecoder(options.EVMDenom)
+				if err != nil {
+					return err
+				}
+				projection, _, err = initializeAccountProjection(
+					archive, decoder, first-1, options.IAVLCacheSize,
+				)
+				if err != nil {
+					return fmt.Errorf("initialize world-state refill at version %d: %w", first-1, err)
+				}
 			}
-			projection, _, _, err := initializeWorldStateProjection(
-				archive, decoder, first-1, options.IAVLCacheSize,
-			)
-			if err != nil {
-				return fmt.Errorf("initialize world-state refill at version %d: %w", first-1, err)
-			}
-			return iterateArchiveWorldStateDeltasWithStorageContext(
+			return iterateArchiveRefillWorldStateDeltasContext(
 				iterCtx, archive, options.EVMDenom, options.IAVLCacheSize,
 				options.IAVLConcurrency, options.IAVLRunHeights, first, last,
+				options.selectedFields.needsAccounts(),
+				options.selectedFields.has(refillNewCodes),
+				options.selectedFields.has(refillStorage),
 				func(delta worldStateDelta) error {
 					return callback(delta.height, projection.apply(delta))
 				},
@@ -364,10 +449,10 @@ func runRefillWithReadersAndIterators(
 	if ctx == nil || roots == nil || objects == nil {
 		return refillReport{}, fmt.Errorf("refill context, archive, and object store are required")
 	}
-	if options.WorldState && worldIterator == nil {
+	if options.selectedFields.needsWorldState() && worldIterator == nil {
 		return refillReport{}, fmt.Errorf("direct world-state refill iterator is required")
 	}
-	if options.Direct && !options.WorldState && directIterator == nil {
+	if options.Direct && !options.selectedFields.needsWorldState() && directIterator == nil {
 		return refillReport{}, fmt.Errorf("direct refill storage iterator is required")
 	}
 	if options.Direct {
@@ -381,7 +466,7 @@ func runRefillWithReadersAndIterators(
 	mode := "get-only"
 	checkpoint := refillCheckpoint{
 		Schema: options.checkpointSchema(), Mode: mode,
-		Direct: options.Direct, WorldState: options.WorldState, EVMDenom: options.checkpointDenom(),
+		Direct: options.Direct, Fields: options.checkpointFields(), EVMDenom: options.checkpointDenom(),
 		ZZFile: options.ZZFile, ZZDir: options.ZZDir, ArchiveHome: options.ArchiveHome,
 		ArchiveIdentity: options.ArchiveIdentity,
 		Bucket:          options.Bucket, Prefix: options.Prefix, Region: options.Region,
@@ -459,7 +544,7 @@ func runRefillWithReadersAndIterators(
 					previousHeight, previousRoot = height, root
 					return emit(sequence, task)
 				}
-				if options.WorldState {
+				if options.selectedFields.needsWorldState() {
 					return worldIterator(
 						pipelineCtx, startHeight, options.FinalHeight,
 						func(height int64, world expectedWorldState) error {
@@ -533,7 +618,7 @@ func runRefillWithReadersAndIterators(
 		rate = float64(invocationProcessed) / elapsed
 	}
 	return refillReport{
-		Mode: mode, Direct: options.Direct, WorldState: options.WorldState, EVMDenom: options.checkpointDenom(),
+		Mode: mode, Direct: options.Direct, Fields: options.Fields, EVMDenom: options.checkpointDenom(),
 		ZZFile: options.ZZFile, ZZDir: options.ZZDir, ArchiveHome: options.ArchiveHome,
 		ArchiveIdentity: options.ArchiveIdentity,
 		FirstHeight:     options.FirstHeight, FinalHeight: options.FinalHeight,
@@ -646,11 +731,11 @@ func processRefillTask(
 		return refillOutcome{}, fmt.Errorf("get height %d key %s: %w", task.height, task.key, err)
 	}
 	var newBody []byte
-	if options.WorldState {
+	if options.selectedFields.needsWorldState() {
 		if task.world == nil {
 			return refillOutcome{}, fmt.Errorf("height %d has no canonical world state", task.height)
 		}
-		newBody, err = replaceWorldStateRLP(object.Body, *task.world)
+		newBody, err = replaceWorldStateRLP(object.Body, *task.world, options.selectedFields)
 	} else {
 		newBody, err = replaceStorageDiffRLP(object.Body, task.canonical)
 	}
@@ -727,7 +812,7 @@ func loadRefillCheckpoint(path string, options refillOptions) (refillCheckpoint,
 		return refillCheckpoint{}, false, err
 	}
 	if checkpoint.Schema != options.checkpointSchema() || checkpoint.Mode != "write" ||
-		checkpoint.Direct != options.Direct || checkpoint.WorldState != options.WorldState ||
+		checkpoint.Direct != options.Direct || checkpoint.Fields != options.checkpointFields() ||
 		checkpoint.EVMDenom != options.checkpointDenom() ||
 		checkpoint.ZZFile != options.ZZFile || checkpoint.ZZDir != options.ZZDir ||
 		checkpoint.ArchiveHome != options.ArchiveHome ||
