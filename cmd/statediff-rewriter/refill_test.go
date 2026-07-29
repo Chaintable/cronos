@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/cosmos/iavl"
 	"github.com/ethereum/go-ethereum/common"
@@ -34,6 +35,80 @@ type refillTestPutCounter struct {
 	attemptsByKey map[string]int
 }
 
+type refillRetryPutStep struct {
+	err          error
+	commitTarget bool
+	visibleBody  []byte
+}
+
+type refillRetryObjectStore struct {
+	object storedObject
+	steps  []refillRetryPutStep
+	gets   int
+	puts   int
+}
+
+func (store *refillRetryObjectStore) Get(
+	ctx context.Context,
+	_, _ string,
+) (storedObject, error) {
+	if err := ctx.Err(); err != nil {
+		return storedObject{}, err
+	}
+	store.gets++
+	return cloneStoredObject(store.object), nil
+}
+
+func (store *refillRetryObjectStore) Put(
+	ctx context.Context,
+	_, _ string,
+	body []byte,
+	ifMatch string,
+	headers objectHeaders,
+) (putResult, error) {
+	if err := ctx.Err(); err != nil {
+		return putResult{}, err
+	}
+	if store.object.ETag != ifMatch {
+		return putResult{}, fmt.Errorf("%w: precondition failed", errObjectConflict)
+	}
+	var step refillRetryPutStep
+	if store.puts < len(store.steps) {
+		step = store.steps[store.puts]
+	}
+	store.puts++
+	if step.visibleBody != nil {
+		store.object = storedObject{
+			Body: append([]byte(nil), step.visibleBody...), ETag: fmt.Sprintf("etag-%d", store.puts),
+			Headers: cloneObjectHeaders(headers),
+		}
+	} else if step.err == nil || step.commitTarget {
+		store.object = storedObject{
+			Body: append([]byte(nil), body...), ETag: fmt.Sprintf("etag-%d", store.puts),
+			Headers: cloneObjectHeaders(headers),
+		}
+	}
+	if step.err != nil {
+		return putResult{}, step.err
+	}
+	return putResult{ETag: store.object.ETag}, nil
+}
+
+func runRefillRetryTest(
+	store objectStore,
+	source storedObject,
+	wait func(context.Context, time.Duration) error,
+) error {
+	return putRefillObjectWithRetry(
+		context.Background(), store, "bucket", "key", source, []byte("target"),
+		refillPUTRetryBackoffs[:], wait,
+	)
+}
+
+func unexpectedRefillRetryWait(context.Context, time.Duration) error {
+	return errors.New("wait must not be called")
+}
+
 func (store *refillTestPutCounter) Put(
 	ctx context.Context,
 	bucket, key string,
@@ -43,6 +118,154 @@ func (store *refillTestPutCounter) Put(
 ) (putResult, error) {
 	store.attemptsByKey[key]++
 	return store.fakeObjectStore.Put(ctx, bucket, key, body, ifMatch, headers)
+}
+
+func TestPutRefillObjectRetriesUncertainPUT(t *testing.T) {
+	uncertain := fmt.Errorf("%w: EOF", errObjectWriteUncertain)
+	source := storedObject{
+		Body: []byte("source"), ETag: "etag-source",
+		Headers: objectHeaders{Metadata: []byte(`{"source":"test"}`), ContentType: "application/rlp"},
+	}
+	store := &refillRetryObjectStore{
+		object: cloneStoredObject(source),
+		steps: []refillRetryPutStep{
+			{err: uncertain},
+			{err: uncertain},
+			{err: uncertain},
+			{},
+		},
+	}
+	var delays []time.Duration
+	err := runRefillRetryTest(
+		store, source,
+		func(_ context.Context, delay time.Duration) error {
+			delays = append(delays, delay)
+			return nil
+		},
+	)
+	require.NoError(t, err)
+	require.Equal(t, 4, store.puts)
+	require.Equal(t, 3, store.gets)
+	require.Equal(t, refillPUTRetryBackoffs[:], delays)
+	require.Equal(t, []byte("target"), store.object.Body)
+	require.Equal(t, source.Headers, store.object.Headers)
+}
+
+func TestPutRefillObjectReconcilesCommittedUncertainPUT(t *testing.T) {
+	uncertain := fmt.Errorf("%w: EOF", errObjectWriteUncertain)
+	source := storedObject{Body: []byte("source"), ETag: "etag-source"}
+	store := &refillRetryObjectStore{
+		object: cloneStoredObject(source),
+		steps:  []refillRetryPutStep{{err: uncertain, commitTarget: true}},
+	}
+	var delays []time.Duration
+	err := runRefillRetryTest(
+		store, source,
+		func(_ context.Context, delay time.Duration) error {
+			delays = append(delays, delay)
+			return nil
+		},
+	)
+	require.NoError(t, err)
+	require.Equal(t, 1, store.puts)
+	require.Equal(t, 1, store.gets)
+	require.Empty(t, delays)
+	require.Equal(t, []byte("target"), store.object.Body)
+}
+
+func TestPutRefillObjectStopsAfterUncertainPUTRetries(t *testing.T) {
+	uncertain := fmt.Errorf("%w: EOF", errObjectWriteUncertain)
+	source := storedObject{Body: []byte("source"), ETag: "etag-source"}
+	store := &refillRetryObjectStore{
+		object: cloneStoredObject(source),
+		steps: []refillRetryPutStep{
+			{err: uncertain},
+			{err: uncertain},
+			{err: uncertain},
+			{err: uncertain},
+		},
+	}
+	var delays []time.Duration
+	err := runRefillRetryTest(
+		store, source,
+		func(_ context.Context, delay time.Duration) error {
+			delays = append(delays, delay)
+			return nil
+		},
+	)
+	require.ErrorIs(t, err, errObjectWriteUncertain)
+	require.ErrorContains(t, err, "exhausted 3 retries")
+	require.Equal(t, 4, store.puts)
+	require.Equal(t, 4, store.gets)
+	require.Equal(t, refillPUTRetryBackoffs[:], delays)
+	require.Equal(t, source.Body, store.object.Body)
+}
+
+func TestPutRefillObjectStopsOnThirdContent(t *testing.T) {
+	uncertain := fmt.Errorf("%w: EOF", errObjectWriteUncertain)
+	source := storedObject{Body: []byte("source"), ETag: "etag-source"}
+	store := &refillRetryObjectStore{
+		object: cloneStoredObject(source),
+		steps: []refillRetryPutStep{{
+			err: uncertain, visibleBody: []byte("third"),
+		}},
+	}
+	err := runRefillRetryTest(store, source, unexpectedRefillRetryWait)
+	require.ErrorIs(t, err, errObjectWriteUncertain)
+	require.ErrorContains(t, err, "object changed after uncertain PUT")
+	require.Equal(t, 1, store.puts)
+	require.Equal(t, 1, store.gets)
+	require.Equal(t, []byte("third"), store.object.Body)
+}
+
+func TestPutRefillObjectStopsOnChangedSourceETag(t *testing.T) {
+	uncertain := fmt.Errorf("%w: EOF", errObjectWriteUncertain)
+	source := storedObject{Body: []byte("source"), ETag: "etag-source"}
+	store := &refillRetryObjectStore{
+		object: cloneStoredObject(source),
+		steps: []refillRetryPutStep{{
+			err: uncertain, visibleBody: []byte("source"),
+		}},
+	}
+	err := runRefillRetryTest(store, source, unexpectedRefillRetryWait)
+	require.ErrorIs(t, err, errObjectWriteUncertain)
+	require.ErrorContains(t, err, "source ETag changed after uncertain PUT")
+	require.Equal(t, 1, store.puts)
+	require.Equal(t, 1, store.gets)
+	require.Equal(t, []byte("source"), store.object.Body)
+	require.NotEqual(t, source.ETag, store.object.ETag)
+}
+
+func TestPutRefillObjectDoesNotRetryConflict(t *testing.T) {
+	conflict := fmt.Errorf("%w: precondition failed", errObjectConflict)
+	source := storedObject{Body: []byte("source"), ETag: "etag-source"}
+	store := &refillRetryObjectStore{
+		object: cloneStoredObject(source),
+		steps:  []refillRetryPutStep{{err: conflict}},
+	}
+	err := runRefillRetryTest(store, source, unexpectedRefillRetryWait)
+	require.ErrorIs(t, err, errObjectConflict)
+	require.Equal(t, 1, store.puts)
+	require.Zero(t, store.gets)
+}
+
+func TestPutRefillObjectStopsWhenRetryWaitIsCanceled(t *testing.T) {
+	uncertain := fmt.Errorf("%w: EOF", errObjectWriteUncertain)
+	source := storedObject{Body: []byte("source"), ETag: "etag-source"}
+	store := &refillRetryObjectStore{
+		object: cloneStoredObject(source),
+		steps:  []refillRetryPutStep{{err: uncertain}},
+	}
+	err := runRefillRetryTest(
+		store, source,
+		func(context.Context, time.Duration) error {
+			return context.Canceled
+		},
+	)
+	require.ErrorIs(t, err, context.Canceled)
+	require.ErrorIs(t, err, errObjectWriteUncertain)
+	require.Equal(t, 1, store.puts)
+	require.Equal(t, 1, store.gets)
 }
 
 func (roots *refillTestRoots) commitInfo(version int64) (*storetypes.CommitInfo, error) {

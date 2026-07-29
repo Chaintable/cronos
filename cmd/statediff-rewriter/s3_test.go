@@ -2,6 +2,7 @@ package main
 
 import (
 	"errors"
+	"io"
 	"net/http"
 	"testing"
 
@@ -80,5 +81,6 @@ func TestClassifyPutObjectError(t *testing.T) {
 	}
 	definite := responseError(http.StatusForbidden)
 	require.Same(t, definite, classifyPutObjectError(definite))
+	require.ErrorIs(t, classifyPutObjectError(io.EOF), errObjectWriteUncertain)
 	require.ErrorIs(t, classifyPutObjectError(errors.New("connection reset")), errObjectWriteUncertain)
 }

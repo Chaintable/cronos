@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"compress/zlib"
 	"context"
 	"errors"
@@ -9,6 +10,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -49,6 +51,12 @@ var refillFieldNames = []struct {
 	{"deleted-accounts", refillDeletedAccounts},
 	{"storage", refillStorage},
 	{"new-codes", refillNewCodes},
+}
+
+var refillPUTRetryBackoffs = [...]time.Duration{
+	time.Second,
+	10 * time.Second,
+	50 * time.Second,
 }
 
 type refillOptions struct {
@@ -745,12 +753,69 @@ func processRefillTask(
 	outcome.gets, outcome.wouldPUTs = 1, 1
 	outcome.oldBytes, outcome.newBytes = uint64(len(object.Body)), uint64(len(newBody))
 	if options.Write {
-		if _, err := objects.Put(ctx, options.Bucket, task.key, newBody, object.ETag, object.Headers); err != nil {
+		if err := putRefillObjectWithRetry(
+			ctx, objects, options.Bucket, task.key, object, newBody,
+			refillPUTRetryBackoffs[:], waitForRefillPUTRetry,
+		); err != nil {
 			return refillOutcome{}, fmt.Errorf("put height %d key %s: %w", task.height, task.key, err)
 		}
 		outcome.puts = 1
 	}
 	return outcome, nil
+}
+
+func putRefillObjectWithRetry(
+	ctx context.Context,
+	objects objectStore,
+	bucket, key string,
+	source storedObject,
+	target []byte,
+	backoffs []time.Duration,
+	wait func(context.Context, time.Duration) error,
+) error {
+	current := source
+	for attempt := 0; ; attempt++ {
+		_, putErr := objects.Put(ctx, bucket, key, target, current.ETag, current.Headers)
+		if putErr == nil {
+			return nil
+		}
+		if !errors.Is(putErr, errObjectWriteUncertain) {
+			return putErr
+		}
+
+		observed, getErr := objects.Get(ctx, bucket, key)
+		if getErr != nil {
+			return errors.Join(putErr, fmt.Errorf("reconcile GET after uncertain PUT: %w", getErr))
+		}
+		headersUnchanged := reflect.DeepEqual(observed.Headers, source.Headers)
+		if bytes.Equal(observed.Body, target) && headersUnchanged {
+			return nil
+		}
+		if !bytes.Equal(observed.Body, source.Body) || !headersUnchanged {
+			return errors.Join(putErr, errors.New("object changed after uncertain PUT"))
+		}
+		if observed.ETag != current.ETag {
+			return errors.Join(putErr, errors.New("source ETag changed after uncertain PUT"))
+		}
+		if attempt == len(backoffs) {
+			return fmt.Errorf("uncertain PUT exhausted %d retries: %w", len(backoffs), putErr)
+		}
+		if err := wait(ctx, backoffs[attempt]); err != nil {
+			return errors.Join(putErr, fmt.Errorf("wait before PUT retry %d: %w", attempt+1, err))
+		}
+		current = observed
+	}
+}
+
+func waitForRefillPUTRetry(ctx context.Context, delay time.Duration) error {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func iterateZZRangeFastContext(
