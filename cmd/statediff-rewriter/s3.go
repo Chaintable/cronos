@@ -184,7 +184,7 @@ func classifyPutObjectError(err error) error {
 		switch {
 		case status == http.StatusConflict || status == http.StatusPreconditionFailed:
 			return fmt.Errorf("%w: HTTP %d: %w", errObjectConflict, status, err)
-		case status == http.StatusRequestTimeout || status == http.StatusTooManyRequests || status >= http.StatusInternalServerError:
+		case status == 0 || status == http.StatusRequestTimeout || status == http.StatusTooManyRequests || status >= http.StatusInternalServerError:
 			return fmt.Errorf("%w: HTTP %d: %w", errObjectWriteUncertain, status, err)
 		default:
 			return err
