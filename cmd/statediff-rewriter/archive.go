@@ -41,16 +41,32 @@ func openArchive(home string) (*archiveReader, error) {
 
 func (a *archiveReader) Close() error { return a.db.Close() }
 
-func (a *archiveReader) evmIAVLDB() iavldb.DB {
-	return wrapper.NewDBWrapper(dbm.NewPrefixDB(a.db, []byte(evmIAVLPrefix)))
+func (a *archiveReader) iavlDB(storeName string) iavldb.DB {
+	return wrapper.NewDBWrapper(dbm.NewPrefixDB(a.db, []byte(iavlStorePrefix(storeName))))
+}
+
+func iavlStorePrefix(storeName string) string {
+	return "s/k:" + storeName + "/"
+}
+
+func (a *archiveReader) stateChangeSource(storeName string, cacheSize int) keyRangeStateChangeSource {
+	return iavl.NewImmutableTree(a.iavlDB(storeName), cacheSize, true, log.NewNopLogger())
+}
+
+func (a *archiveReader) versionedStateSource(storeName string, cacheSize int) *iavl.MutableTree {
+	return iavl.NewMutableTree(a.iavlDB(storeName), cacheSize, true, log.NewNopLogger())
 }
 
 func (a *archiveReader) evmStateChangeSource(cacheSize int) keyRangeStateChangeSource {
-	return iavl.NewImmutableTree(a.evmIAVLDB(), cacheSize, true, log.NewNopLogger())
+	return a.stateChangeSource("evm", cacheSize)
+}
+
+func (a *archiveReader) legacyLatestVersion(storeName string) (int64, error) {
+	return legacyLatestRootVersion(a.iavlDB(storeName))
 }
 
 func (a *archiveReader) evmLegacyLatestVersion() (int64, error) {
-	return legacyLatestRootVersion(a.evmIAVLDB())
+	return a.legacyLatestVersion("evm")
 }
 
 func (a *archiveReader) commitInfo(version int64) (*storetypes.CommitInfo, error) {

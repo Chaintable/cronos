@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/cosmos/iavl"
 	"github.com/ethereum/go-ethereum/common"
@@ -34,6 +35,80 @@ type refillTestPutCounter struct {
 	attemptsByKey map[string]int
 }
 
+type refillRetryPutStep struct {
+	err          error
+	commitTarget bool
+	visibleBody  []byte
+}
+
+type refillRetryObjectStore struct {
+	object storedObject
+	steps  []refillRetryPutStep
+	gets   int
+	puts   int
+}
+
+func (store *refillRetryObjectStore) Get(
+	ctx context.Context,
+	_, _ string,
+) (storedObject, error) {
+	if err := ctx.Err(); err != nil {
+		return storedObject{}, err
+	}
+	store.gets++
+	return cloneStoredObject(store.object), nil
+}
+
+func (store *refillRetryObjectStore) Put(
+	ctx context.Context,
+	_, _ string,
+	body []byte,
+	ifMatch string,
+	headers objectHeaders,
+) (putResult, error) {
+	if err := ctx.Err(); err != nil {
+		return putResult{}, err
+	}
+	if store.object.ETag != ifMatch {
+		return putResult{}, fmt.Errorf("%w: precondition failed", errObjectConflict)
+	}
+	var step refillRetryPutStep
+	if store.puts < len(store.steps) {
+		step = store.steps[store.puts]
+	}
+	store.puts++
+	if step.visibleBody != nil {
+		store.object = storedObject{
+			Body: append([]byte(nil), step.visibleBody...), ETag: fmt.Sprintf("etag-%d", store.puts),
+			Headers: cloneObjectHeaders(headers),
+		}
+	} else if step.err == nil || step.commitTarget {
+		store.object = storedObject{
+			Body: append([]byte(nil), body...), ETag: fmt.Sprintf("etag-%d", store.puts),
+			Headers: cloneObjectHeaders(headers),
+		}
+	}
+	if step.err != nil {
+		return putResult{}, step.err
+	}
+	return putResult{ETag: store.object.ETag}, nil
+}
+
+func runRefillRetryTest(
+	store objectStore,
+	source storedObject,
+	wait func(context.Context, time.Duration) error,
+) error {
+	return putRefillObjectWithRetry(
+		context.Background(), store, "bucket", "key", source, []byte("target"),
+		refillPUTRetryBackoffs[:], wait,
+	)
+}
+
+func unexpectedRefillRetryWait(context.Context, time.Duration) error {
+	return errors.New("wait must not be called")
+}
+
 func (store *refillTestPutCounter) Put(
 	ctx context.Context,
 	bucket, key string,
@@ -43,6 +118,154 @@ func (store *refillTestPutCounter) Put(
 ) (putResult, error) {
 	store.attemptsByKey[key]++
 	return store.fakeObjectStore.Put(ctx, bucket, key, body, ifMatch, headers)
+}
+
+func TestPutRefillObjectRetriesUncertainPUT(t *testing.T) {
+	uncertain := fmt.Errorf("%w: EOF", errObjectWriteUncertain)
+	source := storedObject{
+		Body: []byte("source"), ETag: "etag-source",
+		Headers: objectHeaders{Metadata: []byte(`{"source":"test"}`), ContentType: "application/rlp"},
+	}
+	store := &refillRetryObjectStore{
+		object: cloneStoredObject(source),
+		steps: []refillRetryPutStep{
+			{err: uncertain},
+			{err: uncertain},
+			{err: uncertain},
+			{},
+		},
+	}
+	var delays []time.Duration
+	err := runRefillRetryTest(
+		store, source,
+		func(_ context.Context, delay time.Duration) error {
+			delays = append(delays, delay)
+			return nil
+		},
+	)
+	require.NoError(t, err)
+	require.Equal(t, 4, store.puts)
+	require.Equal(t, 3, store.gets)
+	require.Equal(t, refillPUTRetryBackoffs[:], delays)
+	require.Equal(t, []byte("target"), store.object.Body)
+	require.Equal(t, source.Headers, store.object.Headers)
+}
+
+func TestPutRefillObjectReconcilesCommittedUncertainPUT(t *testing.T) {
+	uncertain := fmt.Errorf("%w: EOF", errObjectWriteUncertain)
+	source := storedObject{Body: []byte("source"), ETag: "etag-source"}
+	store := &refillRetryObjectStore{
+		object: cloneStoredObject(source),
+		steps:  []refillRetryPutStep{{err: uncertain, commitTarget: true}},
+	}
+	var delays []time.Duration
+	err := runRefillRetryTest(
+		store, source,
+		func(_ context.Context, delay time.Duration) error {
+			delays = append(delays, delay)
+			return nil
+		},
+	)
+	require.NoError(t, err)
+	require.Equal(t, 1, store.puts)
+	require.Equal(t, 1, store.gets)
+	require.Empty(t, delays)
+	require.Equal(t, []byte("target"), store.object.Body)
+}
+
+func TestPutRefillObjectStopsAfterUncertainPUTRetries(t *testing.T) {
+	uncertain := fmt.Errorf("%w: EOF", errObjectWriteUncertain)
+	source := storedObject{Body: []byte("source"), ETag: "etag-source"}
+	store := &refillRetryObjectStore{
+		object: cloneStoredObject(source),
+		steps: []refillRetryPutStep{
+			{err: uncertain},
+			{err: uncertain},
+			{err: uncertain},
+			{err: uncertain},
+		},
+	}
+	var delays []time.Duration
+	err := runRefillRetryTest(
+		store, source,
+		func(_ context.Context, delay time.Duration) error {
+			delays = append(delays, delay)
+			return nil
+		},
+	)
+	require.ErrorIs(t, err, errObjectWriteUncertain)
+	require.ErrorContains(t, err, "exhausted 3 retries")
+	require.Equal(t, 4, store.puts)
+	require.Equal(t, 4, store.gets)
+	require.Equal(t, refillPUTRetryBackoffs[:], delays)
+	require.Equal(t, source.Body, store.object.Body)
+}
+
+func TestPutRefillObjectStopsOnThirdContent(t *testing.T) {
+	uncertain := fmt.Errorf("%w: EOF", errObjectWriteUncertain)
+	source := storedObject{Body: []byte("source"), ETag: "etag-source"}
+	store := &refillRetryObjectStore{
+		object: cloneStoredObject(source),
+		steps: []refillRetryPutStep{{
+			err: uncertain, visibleBody: []byte("third"),
+		}},
+	}
+	err := runRefillRetryTest(store, source, unexpectedRefillRetryWait)
+	require.ErrorIs(t, err, errObjectWriteUncertain)
+	require.ErrorContains(t, err, "object changed after uncertain PUT")
+	require.Equal(t, 1, store.puts)
+	require.Equal(t, 1, store.gets)
+	require.Equal(t, []byte("third"), store.object.Body)
+}
+
+func TestPutRefillObjectStopsOnChangedSourceETag(t *testing.T) {
+	uncertain := fmt.Errorf("%w: EOF", errObjectWriteUncertain)
+	source := storedObject{Body: []byte("source"), ETag: "etag-source"}
+	store := &refillRetryObjectStore{
+		object: cloneStoredObject(source),
+		steps: []refillRetryPutStep{{
+			err: uncertain, visibleBody: []byte("source"),
+		}},
+	}
+	err := runRefillRetryTest(store, source, unexpectedRefillRetryWait)
+	require.ErrorIs(t, err, errObjectWriteUncertain)
+	require.ErrorContains(t, err, "source ETag changed after uncertain PUT")
+	require.Equal(t, 1, store.puts)
+	require.Equal(t, 1, store.gets)
+	require.Equal(t, []byte("source"), store.object.Body)
+	require.NotEqual(t, source.ETag, store.object.ETag)
+}
+
+func TestPutRefillObjectDoesNotRetryConflict(t *testing.T) {
+	conflict := fmt.Errorf("%w: precondition failed", errObjectConflict)
+	source := storedObject{Body: []byte("source"), ETag: "etag-source"}
+	store := &refillRetryObjectStore{
+		object: cloneStoredObject(source),
+		steps:  []refillRetryPutStep{{err: conflict}},
+	}
+	err := runRefillRetryTest(store, source, unexpectedRefillRetryWait)
+	require.ErrorIs(t, err, errObjectConflict)
+	require.Equal(t, 1, store.puts)
+	require.Zero(t, store.gets)
+}
+
+func TestPutRefillObjectStopsWhenRetryWaitIsCanceled(t *testing.T) {
+	uncertain := fmt.Errorf("%w: EOF", errObjectWriteUncertain)
+	source := storedObject{Body: []byte("source"), ETag: "etag-source"}
+	store := &refillRetryObjectStore{
+		object: cloneStoredObject(source),
+		steps:  []refillRetryPutStep{{err: uncertain}},
+	}
+	err := runRefillRetryTest(
+		store, source,
+		func(context.Context, time.Duration) error {
+			return context.Canceled
+		},
+	)
+	require.ErrorIs(t, err, context.Canceled)
+	require.ErrorIs(t, err, errObjectWriteUncertain)
+	require.Equal(t, 1, store.puts)
+	require.Equal(t, 1, store.gets)
 }
 
 func (roots *refillTestRoots) commitInfo(version int64) (*storetypes.CommitInfo, error) {
@@ -404,6 +627,108 @@ func TestRunRefillDirectWriteUsesCanonicalIterator(t *testing.T) {
 	}
 }
 
+func TestRunRefillDirectSelectedWorldStateFieldsPreserveStorage(t *testing.T) {
+	const first, last = int64(100), int64(101)
+	roots := newRefillTestRoots(first, last)
+	objects, keys, canonical := refillTestObjects(t, roots, "prefix", first, last, nil)
+	original := make(map[string]storedObject, len(objects))
+	for key, object := range objects {
+		original[key] = cloneStoredObject(object)
+	}
+	store := &fakeObjectStore{objects: objects}
+	options := refillTestDirectOptions(t, first, last, true)
+	options.Fields = []string{"new-accounts", "deleted-accounts", "new-codes"}
+	options.EVMDenom = "basecro"
+	require.NoError(t, options.prepare())
+	address := common.HexToHash("0x1234")
+	worldByHeight := map[int64]expectedWorldState{
+		first: {
+			newAccounts: []dtypes.NewAccount{{
+				Address: address, Balance: uint256.NewInt(9), Nonce: 10,
+				CodeHash: common.HexToHash("0x5678"),
+			}},
+			deletedAccounts: []common.Hash{common.HexToHash("0x90")},
+			storage:         canonical[first],
+			codeWrites:      []dtypes.NewCode{{CodeHash: common.HexToHash("0xab"), Code: []byte{0x60}}},
+		},
+		last: {},
+	}
+	var starts []int64
+	iterator := func(
+		ctx context.Context,
+		rangeFirst, rangeLast int64,
+		callback func(int64, expectedWorldState) error,
+	) error {
+		starts = append(starts, rangeFirst)
+		for height := rangeFirst; height <= rangeLast; height++ {
+			if err := callback(height, worldByHeight[height]); err != nil {
+				return err
+			}
+		}
+		return ctx.Err()
+	}
+
+	report, err := runRefillWithReadersAndIterators(
+		context.Background(), options, roots, store, nil, iterator,
+	)
+	require.NoError(t, err)
+	require.Equal(t, options.Fields, report.Fields)
+	require.Equal(t, "basecro", report.EVMDenom)
+	require.Equal(t, []int64{first}, starts)
+	for height := first; height <= last; height++ {
+		require.Equal(t, original[keys[height]].Headers, store.objects[keys[height]].Headers)
+		requireWorldStateRootsRawUnchanged(t,
+			original[keys[height]].Body, store.objects[keys[height]].Body,
+		)
+		oldFields, err := blockStorageDiffRawFields(original[keys[height]].Body)
+		require.NoError(t, err)
+		newFields, err := blockStorageDiffRawFields(store.objects[keys[height]].Body)
+		require.NoError(t, err)
+		require.Equal(t,
+			[]byte(oldFields[storageDiffFieldIndex]),
+			[]byte(newFields[storageDiffFieldIndex]),
+		)
+		var got dtypes.BlockStorageDiff
+		require.NoError(t, rlp.DecodeBytes(store.objects[keys[height]].Body, &got))
+		var old dtypes.BlockStorageDiff
+		require.NoError(t, rlp.DecodeBytes(original[keys[height]].Body, &old))
+		require.Equal(t, old.StorageDiff, got.StorageDiff)
+		if height == last {
+			require.Empty(t, got.NewAccounts)
+			require.Empty(t, got.DeletedAccounts)
+			require.Empty(t, got.NewCodes)
+		} else {
+			require.Equal(t, worldByHeight[height].newAccounts, got.NewAccounts)
+			require.Equal(t, worldByHeight[height].deletedAccounts, got.DeletedAccounts)
+			require.Equal(t, worldByHeight[height].codeWrites, got.NewCodes)
+		}
+	}
+
+	checkpoint, found, err := loadRefillCheckpoint(options.Checkpoint, options)
+	require.NoError(t, err)
+	require.True(t, found)
+	require.Equal(t, refillWorldStateCheckpointSchema, checkpoint.Schema)
+	require.Equal(t, strings.Join(options.Fields, ","), checkpoint.Fields)
+	require.Equal(t, "basecro", checkpoint.EVMDenom)
+	otherDenom := options
+	otherDenom.EVMDenom = "other"
+	_, _, err = loadRefillCheckpoint(options.Checkpoint, otherDenom)
+	require.ErrorContains(t, err, "checkpoint does not match")
+
+	reordered := options
+	reordered.Fields = []string{"new-codes", "deleted-accounts", "new-accounts"}
+	require.NoError(t, reordered.prepare())
+	_, found, err = loadRefillCheckpoint(options.Checkpoint, reordered)
+	require.NoError(t, err)
+	require.True(t, found)
+
+	otherFields := options
+	otherFields.Fields = []string{"new-accounts"}
+	require.NoError(t, otherFields.prepare())
+	_, _, err = loadRefillCheckpoint(options.Checkpoint, otherFields)
+	require.ErrorContains(t, err, "checkpoint does not match")
+}
+
 func TestRefillOptionsRejectsMoreThanTenThousandHeights(t *testing.T) {
 	options := refillOptions{
 		ZZFile: "/tmp/block.zz", ArchiveHome: "/tmp/archive",
@@ -412,6 +737,7 @@ func TestRefillOptionsRejectsMoreThanTenThousandHeights(t *testing.T) {
 		Concurrency: 1, Window: 1,
 	}
 	require.NoError(t, options.prepare())
+	require.Equal(t, []string{"storage"}, options.Fields)
 
 	options.FinalHeight++
 	require.ErrorContains(t, options.prepare(), "refill range exceeds 10000 heights")
@@ -441,6 +767,30 @@ func TestRefillOptionsRejectsMoreThanTenThousandHeights(t *testing.T) {
 	options.IAVLConcurrency = 1
 	options.IAVLRunHeights = directIAVLShardSize + 1
 	require.ErrorContains(t, options.prepare(), "iavl-run-heights")
+
+	options.IAVLRunHeights = defaultDirectIAVLRunHeights
+	options.Direct = false
+	options.Fields = []string{"new-accounts"}
+	options.EVMDenom = "basecro"
+	options.ZZFile = "/tmp/block.zz"
+	require.ErrorContains(t, options.prepare(), "non-storage refill fields require direct")
+
+	options.ZZFile = ""
+	options.Direct = true
+	options.EVMDenom = ""
+	require.ErrorContains(t, options.prepare(), "account refill fields require an EVM denom")
+
+	options.EVMDenom = "basecro"
+	options.Fields = []string{"unknown"}
+	require.ErrorContains(t, options.prepare(), "unknown refill field")
+
+	options.Fields = []string{"storage", "storage"}
+	require.ErrorContains(t, options.prepare(), "duplicate refill field")
+
+	options.Fields = []string{"new-codes"}
+	options.EVMDenom = ""
+	require.NoError(t, options.prepare(), "code-only refill does not need an EVM denom")
+	require.Empty(t, options.checkpointDenom())
 }
 
 func TestRunRefillWriteResumesFromPersistedCheckpointAfterFailure(t *testing.T) {

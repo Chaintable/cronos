@@ -2,6 +2,7 @@ package main
 
 import (
 	"errors"
+	"io"
 	"net/http"
 	"testing"
 
@@ -78,7 +79,13 @@ func TestClassifyPutObjectError(t *testing.T) {
 	for _, status := range []int{http.StatusRequestTimeout, http.StatusTooManyRequests, http.StatusInternalServerError, http.StatusServiceUnavailable} {
 		require.ErrorIs(t, classifyPutObjectError(responseError(status)), errObjectWriteUncertain)
 	}
+	noResponse := &smithyhttp.ResponseError{
+		Response: &smithyhttp.Response{Response: &http.Response{StatusCode: 0}},
+		Err:      io.EOF,
+	}
+	require.ErrorIs(t, classifyPutObjectError(noResponse), errObjectWriteUncertain)
 	definite := responseError(http.StatusForbidden)
 	require.Same(t, definite, classifyPutObjectError(definite))
+	require.ErrorIs(t, classifyPutObjectError(io.EOF), errObjectWriteUncertain)
 	require.ErrorIs(t, classifyPutObjectError(errors.New("connection reset")), errObjectWriteUncertain)
 }
