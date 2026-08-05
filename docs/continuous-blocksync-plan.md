@@ -6,8 +6,8 @@ Implementation:
 
 - CometBFT: [Chaintable/cometbft#1](https://github.com/Chaintable/cometbft/pull/1),
   commit `1940ba94e3ef084ec16d9d6597122a176d463e8c`.
-- Cronos: pins the CometBFT commit above; PR link is added after this branch is
-  published.
+- Cronos: [Chaintable/cronos#9](https://github.com/Chaintable/cronos/pull/9),
+  pinning the CometBFT commit above.
 
 ## 1. Decision
 
