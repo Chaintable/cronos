@@ -661,6 +661,8 @@ github.com/Chaintable/cometbft v0.0.0-20260805031933-1940ba94e3ef h1:s1tQHWy8KlO
 github.com/Chaintable/cometbft v0.0.0-20260805031933-1940ba94e3ef/go.mod h1:khbgmtxbgwJfMqDmnGY4rl2sQpTdzpPb1f9nqnfpy1o=
 github.com/Chaintable/ethermint-cronos v0.22.1-0.20260807063213-9e21f2ac042e h1:3E2idmVVnpLkhaSqZMxNu30y3ihIONFqKWxfkJ16Pr8=
 github.com/Chaintable/ethermint-cronos v0.22.1-0.20260807063213-9e21f2ac042e/go.mod h1:sAlk6BoHuMuVsCpaO15q7FEfXZLL+fD9IPDtpjtSuvg=
+github.com/Chaintable/ethermint-cronos v0.22.1-0.20260812080554-715a7fb601fc h1:oQi6X53UPphnp4qbjoExl21zHcqw2ybpJOIn/C6mu/Y=
+github.com/Chaintable/ethermint-cronos v0.22.1-0.20260812080554-715a7fb601fc/go.mod h1:sAlk6BoHuMuVsCpaO15q7FEfXZLL+fD9IPDtpjtSuvg=
 github.com/DataDog/datadog-go v3.2.0+incompatible/go.mod h1:LButxg5PwREeZtORoXG3tL4fMGNddJ+vMq1mwgfaqoQ=
 github.com/DataDog/datadog-go v4.8.3+incompatible h1:fNGaYSuObuQb5nzeTQqowRAd9bpDIRRV4/gUtIBjh8Q=
 github.com/DataDog/datadog-go v4.8.3+incompatible/go.mod h1:LButxg5PwREeZtORoXG3tL4fMGNddJ+vMq1mwgfaqoQ=
