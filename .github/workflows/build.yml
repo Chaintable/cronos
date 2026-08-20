@@ -368,13 +368,13 @@ jobs:
         run: |
           set +e
           (git diff --no-ext-diff --exit-code)
-          echo "name=changed::$?" >> $GITHUB_OUTPUT
+          echo "changed=$?" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@v4
-        if: steps.changes.outputs.changed == 1
+        if: steps.changes.outputs.changed == '1'
         with:
           name: gomod2nix.toml
           path: ./gomod2nix.toml
-      - if: steps.changes.outputs.changed == 1
+      - if: steps.changes.outputs.changed == '1'
         run: echo "Working directory is dirty" && exit 1
 
   contracts:
@@ -411,12 +411,12 @@ jobs:
         run: |
           set +e
           (git diff --no-ext-diff --exit-code)
-          echo "name=changed::$?" >> $GITHUB_OUTPUT
+          echo "changed=$?" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@v4
-        if: steps.changes.outputs.changed == 1
+        if: steps.changes.outputs.changed == '1'
         with:
           name: contracts_out
           path: ./contracts/out
           if-no-files-found: ignore
-      - if: steps.changes.outputs.changed == 1
+      - if: steps.changes.outputs.changed == '1'
         run: echo "Working directory is dirty" && exit 1
