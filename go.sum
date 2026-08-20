@@ -659,10 +659,8 @@ github.com/BurntSushi/toml v0.3.1/go.mod h1:xHWCNGjB5oqiDr8zfno3MHue2Ht5sIBksp03
 github.com/BurntSushi/xgb v0.0.0-20160522181843-27f122750802/go.mod h1:IVnqGOEym/WlBOVXweHU+Q+/VP0lqqI8lqeDx9IjBqo=
 github.com/Chaintable/cometbft v0.0.0-20260805031933-1940ba94e3ef h1:s1tQHWy8KlOpChF2lI0pP1ISpWKpeUzpfs7jeoqWW0M=
 github.com/Chaintable/cometbft v0.0.0-20260805031933-1940ba94e3ef/go.mod h1:khbgmtxbgwJfMqDmnGY4rl2sQpTdzpPb1f9nqnfpy1o=
-github.com/Chaintable/ethermint-cronos v0.22.1-0.20260807063213-9e21f2ac042e h1:3E2idmVVnpLkhaSqZMxNu30y3ihIONFqKWxfkJ16Pr8=
-github.com/Chaintable/ethermint-cronos v0.22.1-0.20260807063213-9e21f2ac042e/go.mod h1:sAlk6BoHuMuVsCpaO15q7FEfXZLL+fD9IPDtpjtSuvg=
-github.com/Chaintable/ethermint-cronos v0.22.1-0.20260812080554-715a7fb601fc h1:oQi6X53UPphnp4qbjoExl21zHcqw2ybpJOIn/C6mu/Y=
-github.com/Chaintable/ethermint-cronos v0.22.1-0.20260812080554-715a7fb601fc/go.mod h1:sAlk6BoHuMuVsCpaO15q7FEfXZLL+fD9IPDtpjtSuvg=
+github.com/Chaintable/ethermint-cronos v0.22.1-cronos-v1.7.8-ct.1 h1:0h9d1VOXvXubus4WSxdYXb8Wm7BX5QPBTEABfZi6xyE=
+github.com/Chaintable/ethermint-cronos v0.22.1-cronos-v1.7.8-ct.1/go.mod h1:sAlk6BoHuMuVsCpaO15q7FEfXZLL+fD9IPDtpjtSuvg=
 github.com/DataDog/datadog-go v3.2.0+incompatible/go.mod h1:LButxg5PwREeZtORoXG3tL4fMGNddJ+vMq1mwgfaqoQ=
 github.com/DataDog/datadog-go v4.8.3+incompatible h1:fNGaYSuObuQb5nzeTQqowRAd9bpDIRRV4/gUtIBjh8Q=
 github.com/DataDog/datadog-go v4.8.3+incompatible/go.mod h1:LButxg5PwREeZtORoXG3tL4fMGNddJ+vMq1mwgfaqoQ=
