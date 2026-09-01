@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"fmt"
 	"testing"
 
 	cmtdb "github.com/cometbft/cometbft-db"
@@ -27,7 +28,7 @@ func TestTrimCometIndexes(t *testing.T) {
 	require.NoError(t, blockIndexer.Index(indexTestBlockEvents(10)))
 	require.NoError(t, blockIndexer.Index(indexTestBlockEvents(11)))
 
-	stats, err := trimCometIndexes(db, 10, nil)
+	stats, err := trimCometIndexes(db, 10, indexTestFinalizeLoader(lowTx, highTx), nil)
 	require.NoError(t, err)
 	require.EqualValues(t, 1, stats.TxHeightKeys)
 	require.EqualValues(t, 1, stats.TxEventKeys)
@@ -53,6 +54,41 @@ func TestTrimCometIndexes(t *testing.T) {
 	highBlocks, err := blockIndexer.Search(t.Context(), cmtquery.MustCompile("block.height = 11"))
 	require.NoError(t, err)
 	require.Empty(t, highBlocks)
+}
+
+func TestTrimCometIndexesRestoresRetainedDuplicateTransaction(t *testing.T) {
+	db := cmtdb.NewMemDB()
+	txIndexer := cmttxidxkv.NewTxIndex(db)
+
+	lowTx := indexTestTxResultWithTx(10, "same transaction", "low/value")
+	highTx := indexTestTxResultWithTx(11, "same transaction", "high/value")
+	require.NoError(t, txIndexer.Index(lowTx))
+	require.NoError(t, txIndexer.Index(highTx))
+
+	stats, err := trimCometIndexes(db, 10, indexTestFinalizeLoader(lowTx, highTx), nil)
+	require.NoError(t, err)
+	require.EqualValues(t, 1, stats.TxHeightKeys)
+	require.EqualValues(t, 1, stats.TxEventKeys)
+	require.EqualValues(t, 0, stats.TxHashKeys)
+	require.EqualValues(t, 1, stats.TxHashesRestored)
+
+	hash := cmttypes.Tx(lowTx.Tx).Hash()
+	result, err := txIndexer.Get(hash)
+	require.NoError(t, err)
+	require.Equal(t, lowTx, result)
+	lowTransactions, err := txIndexer.Search(t.Context(), cmtquery.MustCompile("test.value = 'low/value'"))
+	require.NoError(t, err)
+	require.Len(t, lowTransactions, 1)
+	highTransactions, err := txIndexer.Search(t.Context(), cmtquery.MustCompile("test.value = 'high/value'"))
+	require.NoError(t, err)
+	require.Empty(t, highTransactions)
+
+	stats, err = trimCometIndexes(db, 10, indexTestFinalizeLoader(lowTx, highTx), nil)
+	require.NoError(t, err)
+	require.Zero(t, stats.TxHeightKeys)
+	require.Zero(t, stats.TxEventKeys)
+	require.Zero(t, stats.TxHashKeys)
+	require.Zero(t, stats.TxHashesRestored)
 }
 
 func TestTrimEVMIndexes(t *testing.T) {
@@ -84,9 +120,13 @@ func TestPrefixEnd(t *testing.T) {
 }
 
 func indexTestTxResult(height int64, value string) *cmtabci.TxResult {
+	return indexTestTxResultWithTx(height, value, value)
+}
+
+func indexTestTxResultWithTx(height int64, tx, value string) *cmtabci.TxResult {
 	return &cmtabci.TxResult{
 		Height: height,
-		Tx:     []byte(value),
+		Tx:     []byte(tx),
 		Result: cmtabci.ExecTxResult{
 			Events: []cmtabci.Event{{
 				Type: "test",
@@ -95,6 +135,30 @@ func indexTestTxResult(height int64, value string) *cmtabci.TxResult {
 				}},
 			}},
 		},
+	}
+}
+
+func indexTestFinalizeLoader(results ...*cmtabci.TxResult) func(int64) (*cmtabci.ResponseFinalizeBlock, error) {
+	responses := make(map[int64]*cmtabci.ResponseFinalizeBlock)
+	for _, result := range results {
+		response := responses[result.Height]
+		if response == nil {
+			response = &cmtabci.ResponseFinalizeBlock{}
+			responses[result.Height] = response
+		}
+		for uint32(len(response.TxResults)) <= result.Index {
+			response.TxResults = append(response.TxResults, nil)
+		}
+		execResult := result.Result
+		response.TxResults[result.Index] = &execResult
+	}
+
+	return func(height int64) (*cmtabci.ResponseFinalizeBlock, error) {
+		response := responses[height]
+		if response == nil {
+			return nil, fmt.Errorf("missing response at height %d", height)
+		}
+		return response, nil
 	}
 }
 
