@@ -51,6 +51,13 @@ type stateTrimStats struct {
 	ConsensusParams int64
 }
 
+type evidenceTrimStats struct {
+	Scanned   int64
+	Pending   int64
+	Committed int64
+	Deleted   int64
+}
+
 // RewindIndexesCmd removes transaction and block-event index entries above a
 // target height. It is idempotent and must be run with cronosd stopped.
 func RewindIndexesCmd() *cobra.Command {
@@ -144,6 +151,22 @@ func RewindIndexesCmd() *cobra.Command {
 				return fmt.Errorf("close EVM index database: %w", closeErr)
 			}
 
+			evidenceDB, err := cmtcfg.DefaultDBProvider(&cmtcfg.DBContext{ID: "evidence", Config: cfg})
+			if err != nil {
+				_ = stateDB.Close()
+				return fmt.Errorf("open CometBFT evidence database: %w", err)
+			}
+			evidenceStats, err := trimEvidence(evidenceDB, target)
+			evidenceCloseErr := evidenceDB.Close()
+			if err != nil {
+				_ = stateDB.Close()
+				return err
+			}
+			if evidenceCloseErr != nil {
+				_ = stateDB.Close()
+				return fmt.Errorf("close CometBFT evidence database: %w", evidenceCloseErr)
+			}
+
 			stateStats, err := trimCometStateHistory(stateDB, target, sourceHeight, targetResponse)
 			stateCloseErr := stateDB.Close()
 			if err != nil {
@@ -156,7 +179,7 @@ func RewindIndexesCmd() *cobra.Command {
 			stats.EVMTxIndexKeys = evmStats.EVMTxIndexKeys
 			stats.EVMTxHashKeys = evmStats.EVMTxHashKeys
 			cmd.Printf(
-				"rewound indexes and state history to height %d scanned=%d tx_heights=%d tx_events=%d tx_hashes=%d tx_hashes_restored=%d block_events=%d evm_tx_indexes=%d evm_tx_hashes=%d state_abci_responses=%d state_validators=%d state_consensus_params=%d\n",
+				"rewound indexes and state history to height %d scanned=%d tx_heights=%d tx_events=%d tx_hashes=%d tx_hashes_restored=%d block_events=%d evm_tx_indexes=%d evm_tx_hashes=%d evidence_scanned=%d evidence_pending=%d evidence_committed=%d evidence_deleted=%d state_abci_responses=%d state_validators=%d state_consensus_params=%d\n",
 				target,
 				stats.Scanned,
 				stats.TxHeightKeys,
@@ -166,6 +189,10 @@ func RewindIndexesCmd() *cobra.Command {
 				stats.BlockEventKeys,
 				stats.EVMTxIndexKeys,
 				stats.EVMTxHashKeys,
+				evidenceStats.Scanned,
+				evidenceStats.Pending,
+				evidenceStats.Committed,
+				evidenceStats.Deleted,
 				stateStats.ABCIResponses,
 				stateStats.Validators,
 				stateStats.ConsensusParams,
@@ -173,6 +200,62 @@ func RewindIndexesCmd() *cobra.Command {
 			return nil
 		},
 	}
+}
+
+func trimEvidence(db cmtdb.DB, target int64) (evidenceTrimStats, error) {
+	var stats evidenceTrimStats
+	var deleteKeys [][]byte
+	iterator, err := db.Iterator(nil, nil)
+	if err != nil {
+		return stats, fmt.Errorf("iterate CometBFT evidence: %w", err)
+	}
+	for ; iterator.Valid(); iterator.Next() {
+		key := iterator.Key()
+		stats.Scanned++
+		if len(key) <= 18 || key[17] != '/' {
+			_ = iterator.Close()
+			return stats, fmt.Errorf("evidence key has invalid format: %X", key)
+		}
+		switch key[0] {
+		case 0:
+			stats.Committed++
+		case 1:
+			stats.Pending++
+		default:
+			_ = iterator.Close()
+			return stats, fmt.Errorf("evidence key has invalid prefix: %X", key)
+		}
+		height, err := strconv.ParseInt(string(key[1:17]), 16, 64)
+		if err != nil || height <= 0 {
+			_ = iterator.Close()
+			return stats, fmt.Errorf("evidence key has invalid height: %X", key)
+		}
+		if height > target {
+			deleteKeys = append(deleteKeys, bytes.Clone(key))
+			stats.Deleted++
+		}
+	}
+	if err := iterator.Error(); err != nil {
+		_ = iterator.Close()
+		return stats, fmt.Errorf("scan CometBFT evidence: %w", err)
+	}
+	if err := iterator.Close(); err != nil {
+		return stats, fmt.Errorf("close CometBFT evidence iterator: %w", err)
+	}
+
+	if err := writeDeleteBatches(func() indexBatch { return db.NewBatch() }, deleteKeys); err != nil {
+		return stats, fmt.Errorf("delete CometBFT evidence suffix: %w", err)
+	}
+	for _, key := range deleteKeys {
+		present, err := db.Has(key)
+		if err != nil {
+			return stats, fmt.Errorf("verify deleted evidence key %X: %w", key, err)
+		}
+		if present {
+			return stats, fmt.Errorf("evidence key %X still exists after deletion", key)
+		}
+	}
+	return stats, nil
 }
 
 func trimCometStateHistory(

@@ -193,6 +193,41 @@ func TestTrimCometStateHistoryRejectsInvalidInput(t *testing.T) {
 	require.EqualError(t, err, "target FinalizeBlockResponse is nil")
 }
 
+func TestTrimEvidence(t *testing.T) {
+	db := cmtdb.NewMemDB()
+	lowCommitted := evidenceTestKey(0, 10, "AABB")
+	lowPending := evidenceTestKey(1, 10, "CCDD")
+	highCommitted := evidenceTestKey(0, 11, "EEFF")
+	highPending := evidenceTestKey(1, 12, "0011")
+
+	for _, key := range [][]byte{lowCommitted, lowPending, highCommitted, highPending} {
+		require.NoError(t, db.Set(key, []byte("evidence")))
+	}
+
+	stats, err := trimEvidence(db, 10)
+	require.NoError(t, err)
+	require.EqualValues(t, 4, stats.Scanned)
+	require.EqualValues(t, 2, stats.Committed)
+	require.EqualValues(t, 2, stats.Pending)
+	require.EqualValues(t, 2, stats.Deleted)
+	require.True(t, cometDBHas(t, db, lowCommitted))
+	require.True(t, cometDBHas(t, db, lowPending))
+	require.False(t, cometDBHas(t, db, highCommitted))
+	require.False(t, cometDBHas(t, db, highPending))
+}
+
+func TestTrimEvidenceRejectsMalformedKey(t *testing.T) {
+	db := cmtdb.NewMemDB()
+	require.NoError(t, db.Set([]byte("invalid"), []byte("evidence")))
+
+	_, err := trimEvidence(db, 10)
+	require.EqualError(t, err, "evidence key has invalid format: 696E76616C6964")
+}
+
+func evidenceTestKey(prefix byte, height int64, hash string) []byte {
+	return append([]byte{prefix}, []byte(fmt.Sprintf("%016X/%s", height, hash))...)
+}
+
 func indexTestTxResult(height int64, value string) *cmtabci.TxResult {
 	return indexTestTxResultWithTx(height, value, value)
 }
