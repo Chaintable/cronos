@@ -10,11 +10,13 @@ import (
 	cmtdb "github.com/cometbft/cometbft-db"
 	cmtabci "github.com/cometbft/cometbft/abci/types"
 	cmtcfg "github.com/cometbft/cometbft/config"
+	cmtstateproto "github.com/cometbft/cometbft/proto/tendermint/state"
 	cmtstate "github.com/cometbft/cometbft/state"
 	cmttypes "github.com/cometbft/cometbft/types"
 	cosmosdb "github.com/cosmos/cosmos-db"
 	"github.com/cosmos/cosmos-sdk/server"
 	ethermintserver "github.com/evmos/ethermint/server"
+	"github.com/google/orderedcode"
 	"github.com/spf13/cobra"
 
 	"github.com/cosmos/gogoproto/proto"
@@ -76,9 +78,16 @@ func RewindIndexesCmd() *cobra.Command {
 			stateStore := cmtstate.NewStore(stateDB, cmtstate.StoreOptions{
 				DiscardABCIResponses: cfg.Storage.DiscardABCIResponses,
 			})
+			sourceHeight, err := lastFinalizeBlockHeight(stateDB)
+			if err != nil {
+				_ = txIndexDB.Close()
+				_ = stateDB.Close()
+				return err
+			}
 
-			stats, err := trimCometIndexes(txIndexDB, target, stateStore.LoadFinalizeBlockResponse, func(stage string, scanned int64) {
-				if scanned%indexScanInterval == 0 {
+			stats, err := trimCometIndexes(txIndexDB, target, sourceHeight, stateStore.LoadFinalizeBlockResponse, func(stage string, scanned int64) {
+				if stage == "block-height" && scanned%rewindProgressInterval == 0 ||
+					stage != "block-height" && scanned%indexScanInterval == 0 {
 					cmd.Printf("CometBFT %s scan progress keys=%d\n", stage, scanned)
 				}
 			})
@@ -141,10 +150,14 @@ type indexValue struct {
 func trimCometIndexes(
 	db cmtdb.DB,
 	target int64,
+	sourceHeight int64,
 	loadFinalizeBlock func(int64) (*cmtabci.ResponseFinalizeBlock, error),
 	progress func(stage string, scanned int64),
 ) (indexTrimStats, error) {
 	var stats indexTrimStats
+	if sourceHeight < target {
+		return stats, fmt.Errorf("source height %d is below target %d", sourceHeight, target)
+	}
 	var deleteDataKeys [][]byte
 	var deleteHeightKeys [][]byte
 	var restoreValues []indexValue
@@ -233,7 +246,7 @@ func trimCometIndexes(
 		}
 	}
 
-	if len(transactions) > 0 && loadFinalizeBlock == nil {
+	if sourceHeight > target && loadFinalizeBlock == nil {
 		return stats, fmt.Errorf("load FinalizeBlockResponse callback is required")
 	}
 	var cachedHeight int64 = -1
@@ -348,37 +361,21 @@ func trimCometIndexes(
 		}
 	}
 
-	blockIterator, err := db.Iterator(blockEventPrefix, prefixEnd(blockEventPrefix))
-	if err != nil {
-		return stats, fmt.Errorf("iterate CometBFT block events: %w", err)
-	}
-	var blockScanned int64
-	for ; blockIterator.Valid(); blockIterator.Next() {
-		blockScanned++
-		stats.Scanned++
+	for height := target + 1; height <= sourceHeight; height++ {
+		response, err := loadFinalizeBlock(height)
+		if err != nil {
+			return stats, fmt.Errorf("load FinalizeBlockResponse at height %d for block indexes: %w", height, err)
+		}
+		keys, err := indexedBlockEventKeys(db, height, response.GetEvents())
+		if err != nil {
+			return stats, err
+		}
+		deleteDataKeys = append(deleteDataKeys, keys...)
+		stats.BlockEventKeys += int64(len(keys))
+		stats.Scanned += int64(len(keys))
 		if progress != nil {
-			progress("block-event", blockScanned)
+			progress("block-height", height-target)
 		}
-		height, n := binary.Varint(blockIterator.Value())
-		if n <= 0 {
-			_ = blockIterator.Close()
-			return stats, fmt.Errorf(
-				"decode block-event index height key=%X value=%X",
-				blockIterator.Key(),
-				blockIterator.Value(),
-			)
-		}
-		if height > target {
-			deleteDataKeys = append(deleteDataKeys, bytes.Clone(blockIterator.Key()))
-			stats.BlockEventKeys++
-		}
-	}
-	if err := blockIterator.Error(); err != nil {
-		_ = blockIterator.Close()
-		return stats, fmt.Errorf("scan CometBFT block events: %w", err)
-	}
-	if err := blockIterator.Close(); err != nil {
-		return stats, fmt.Errorf("close CometBFT block-event iterator: %w", err)
 	}
 
 	if err := writeSetBatches(func() indexBatch { return db.NewBatch() }, restoreValues); err != nil {
@@ -464,6 +461,95 @@ func txEventPrefixes(result *cmtabci.TxResult) [][]byte {
 	return resultPrefixes
 }
 
+func indexedBlockEventKeys(db cmtdb.DB, height int64, events []cmtabci.Event) ([][]byte, error) {
+	var keys [][]byte
+	heightKey, err := orderedcode.Append(nil, cmttypes.BlockHeightKey, height)
+	if err != nil {
+		return nil, fmt.Errorf("encode block-height index at height %d: %w", height, err)
+	}
+	heightKey = append(bytes.Clone(blockEventPrefix), heightKey...)
+	value, err := db.Get(heightKey)
+	if err != nil {
+		return nil, fmt.Errorf("read block-height index at height %d: %w", height, err)
+	}
+	if value != nil {
+		if err := validateBlockEventHeight(heightKey, value, height); err != nil {
+			return nil, err
+		}
+		keys = append(keys, heightKey)
+	}
+
+	prefixes, err := blockEventPrefixes(events, height)
+	if err != nil {
+		return nil, err
+	}
+	for _, prefix := range prefixes {
+		prefix = append(bytes.Clone(blockEventPrefix), prefix...)
+		iterator, err := db.Iterator(prefix, prefixEnd(prefix))
+		if err != nil {
+			return nil, fmt.Errorf("iterate block-event prefix %X: %w", prefix, err)
+		}
+		for ; iterator.Valid(); iterator.Next() {
+			if err := validateBlockEventHeight(iterator.Key(), iterator.Value(), height); err != nil {
+				_ = iterator.Close()
+				return nil, err
+			}
+			keys = append(keys, bytes.Clone(iterator.Key()))
+		}
+		if err := iterator.Error(); err != nil {
+			_ = iterator.Close()
+			return nil, fmt.Errorf("scan block-event prefix %X: %w", prefix, err)
+		}
+		if err := iterator.Close(); err != nil {
+			return nil, fmt.Errorf("close block-event iterator: %w", err)
+		}
+	}
+	return keys, nil
+}
+
+func blockEventPrefixes(events []cmtabci.Event, height int64) ([][]byte, error) {
+	prefixes := make(map[string][]byte)
+	for _, event := range events {
+		if len(event.Type) == 0 {
+			continue
+		}
+		for _, attribute := range event.Attributes {
+			if len(attribute.Key) == 0 || !attribute.GetIndex() {
+				continue
+			}
+			compositeKey := fmt.Sprintf("%s.%s", event.Type, attribute.Key)
+			if compositeKey == cmttypes.BlockHeightKey {
+				return nil, fmt.Errorf("block event uses reserved index key %q at height %d", compositeKey, height)
+			}
+			prefix, err := orderedcode.Append(nil, compositeKey, attribute.Value, height)
+			if err != nil {
+				return nil, fmt.Errorf("encode block-event index at height %d: %w", height, err)
+			}
+			prefixes[string(prefix)] = prefix
+		}
+	}
+
+	result := make([][]byte, 0, len(prefixes))
+	for _, prefix := range prefixes {
+		result = append(result, prefix)
+	}
+	return result, nil
+}
+
+func validateBlockEventHeight(key, value []byte, expected int64) error {
+	height, n := binary.Varint(value)
+	if n <= 0 || height != expected {
+		return fmt.Errorf(
+			"block-event index %X has height %d (value=%X), expected %d",
+			key,
+			height,
+			value,
+			expected,
+		)
+	}
+	return nil
+}
+
 func prefixEnd(prefix []byte) []byte {
 	end := bytes.Clone(prefix)
 	for index := len(end) - 1; index >= 0; index-- {
@@ -473,6 +559,24 @@ func prefixEnd(prefix []byte) []byte {
 		}
 	}
 	return nil
+}
+
+func lastFinalizeBlockHeight(db cmtdb.DB) (int64, error) {
+	value, err := db.Get([]byte("lastABCIResponseKey"))
+	if err != nil {
+		return 0, fmt.Errorf("read last FinalizeBlockResponse: %w", err)
+	}
+	if value == nil {
+		return 0, fmt.Errorf("last FinalizeBlockResponse is missing")
+	}
+	var info cmtstateproto.ABCIResponsesInfo
+	if err := info.Unmarshal(value); err != nil {
+		return 0, fmt.Errorf("decode last FinalizeBlockResponse: %w", err)
+	}
+	if info.Height <= 0 {
+		return 0, fmt.Errorf("last FinalizeBlockResponse has invalid height %d", info.Height)
+	}
+	return info.Height, nil
 }
 
 func txHeightOccurrence(key, value []byte) (int64, uint32, error) {
