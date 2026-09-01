@@ -93,7 +93,7 @@ func TestRewindCometBFT(t *testing.T) {
 	require.Equal(t, testAppHash(2), state.AppHash)
 }
 
-func TestRewindCometBFTRejectsFutureTarget(t *testing.T) {
+func TestRewindCometBFTRejectsMissingState(t *testing.T) {
 	blockStore := cmtstore.NewBlockStore(dbm.NewMemDB())
 	stateStore := cmtstate.NewStore(dbm.NewMemDB(), cmtstate.StoreOptions{})
 

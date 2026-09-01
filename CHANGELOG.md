@@ -4,7 +4,7 @@
 
 ### Improvements
 
-* Add `rewind-cometbft` for removing the CometBFT block and consensus-state suffix above a recovery height.
+* Add recovery commands for removing CometBFT block/state and transaction-index suffixes above a target height.
 * [#9](https://github.com/Chaintable/cronos/pull/9) feat(blocksync): add an opt-in continuous sync mode for non-validator nodes.
 * [#2095](https://github.com/crypto-org-chain/cronos/pull/2095) feat: add hardcoded unblockable address list that is filtered out of both the mempool and consensus blocklists.
 
