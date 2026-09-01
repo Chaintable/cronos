@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"math"
 	"strconv"
 
 	cmtdb "github.com/cometbft/cometbft-db"
@@ -24,12 +25,14 @@ const (
 
 var (
 	blockEventPrefix = []byte("block_events")
+	txHeightPrefix   = []byte("tx.height/")
 	evmTxHashPrefix  = byte(1)
 	evmTxIndexPrefix = byte(2)
 )
 
 type indexTrimStats struct {
 	Scanned        int64
+	TxHeightKeys   int64
 	TxEventKeys    int64
 	TxHashKeys     int64
 	BlockEventKeys int64
@@ -62,9 +65,9 @@ func RewindIndexesCmd() *cobra.Command {
 			if err != nil {
 				return fmt.Errorf("open CometBFT index database: %w", err)
 			}
-			stats, err := trimCometIndexes(txIndexDB, target, func(scanned int64) {
+			stats, err := trimCometIndexes(txIndexDB, target, func(stage string, scanned int64) {
 				if scanned%indexScanInterval == 0 {
-					cmd.Printf("CometBFT index scan progress keys=%d\n", scanned)
+					cmd.Printf("CometBFT %s scan progress keys=%d\n", stage, scanned)
 				}
 			})
 			closeErr := txIndexDB.Close()
@@ -91,9 +94,10 @@ func RewindIndexesCmd() *cobra.Command {
 			stats.EVMTxIndexKeys = evmStats.EVMTxIndexKeys
 			stats.EVMTxHashKeys = evmStats.EVMTxHashKeys
 			cmd.Printf(
-				"rewound indexes to height %d scanned=%d tx_events=%d tx_hashes=%d block_events=%d evm_tx_indexes=%d evm_tx_hashes=%d\n",
+				"rewound indexes to height %d scanned=%d tx_heights=%d tx_events=%d tx_hashes=%d block_events=%d evm_tx_indexes=%d evm_tx_hashes=%d\n",
 				target,
 				stats.Scanned,
+				stats.TxHeightKeys,
 				stats.TxEventKeys,
 				stats.TxHashKeys,
 				stats.BlockEventKeys,
@@ -105,67 +109,133 @@ func RewindIndexesCmd() *cobra.Command {
 	}
 }
 
-func trimCometIndexes(db cmtdb.DB, target int64, progress func(scanned int64)) (indexTrimStats, error) {
+type indexedTransaction struct {
+	height    int64
+	heightKey []byte
+	hash      []byte
+}
+
+func trimCometIndexes(
+	db cmtdb.DB,
+	target int64,
+	progress func(stage string, scanned int64),
+) (indexTrimStats, error) {
 	var stats indexTrimStats
 	var deleteKeys [][]byte
-	txHashes := make(map[string][]byte)
+	var transactions []indexedTransaction
 
-	iterator, err := db.Iterator(nil, nil)
+	txIterator, err := db.Iterator(txHeightPrefix, prefixEnd(txHeightPrefix))
 	if err != nil {
-		return stats, fmt.Errorf("iterate CometBFT indexes: %w", err)
+		return stats, fmt.Errorf("iterate CometBFT transaction heights: %w", err)
 	}
-	for ; iterator.Valid(); iterator.Next() {
+	var txScanned int64
+	for ; txIterator.Valid(); txIterator.Next() {
+		txScanned++
 		stats.Scanned++
 		if progress != nil {
-			progress(stats.Scanned)
+			progress("tx-height", txScanned)
 		}
 
-		key := iterator.Key()
-		value := iterator.Value()
-		if bytes.HasPrefix(key, blockEventPrefix) {
-			height, n := binary.Varint(value)
-			if n <= 0 {
-				_ = iterator.Close()
-				return stats, fmt.Errorf("decode block-event index height key=%X value=%X", key, value)
-			}
-			if height > target {
-				deleteKeys = append(deleteKeys, bytes.Clone(key))
-				stats.BlockEventKeys++
-			}
+		height, ok := txEventHeight(txIterator.Key(), txIterator.Value())
+		if !ok || height <= target {
 			continue
 		}
+		transactions = append(transactions, indexedTransaction{
+			height:    height,
+			heightKey: bytes.Clone(txIterator.Key()),
+			hash:      bytes.Clone(txIterator.Value()),
+		})
+		stats.TxHeightKeys++
+	}
+	if err := txIterator.Error(); err != nil {
+		_ = txIterator.Close()
+		return stats, fmt.Errorf("scan CometBFT transaction heights: %w", err)
+	}
+	if err := txIterator.Close(); err != nil {
+		return stats, fmt.Errorf("close CometBFT transaction-height iterator: %w", err)
+	}
 
-		height, ok := txEventHeight(key, value)
-		if ok && height > target {
-			deleteKeys = append(deleteKeys, bytes.Clone(key))
-			txHashes[string(value)] = bytes.Clone(value)
-			stats.TxEventKeys++
-		}
-	}
-	if err := iterator.Error(); err != nil {
-		_ = iterator.Close()
-		return stats, fmt.Errorf("scan CometBFT indexes: %w", err)
-	}
-	if err := iterator.Close(); err != nil {
-		return stats, fmt.Errorf("close CometBFT index iterator: %w", err)
-	}
-
-	for _, hash := range txHashes {
-		value, err := db.Get(hash)
+	for _, transaction := range transactions {
+		value, err := db.Get(transaction.hash)
 		if err != nil {
-			return stats, fmt.Errorf("read transaction index %X: %w", hash, err)
+			return stats, fmt.Errorf("read transaction index %X: %w", transaction.hash, err)
 		}
 		if value == nil {
-			continue
+			return stats, fmt.Errorf("transaction index %X is missing", transaction.hash)
 		}
 		var result cmtabci.TxResult
 		if err := proto.Unmarshal(value, &result); err != nil {
-			return stats, fmt.Errorf("decode transaction index %X: %w", hash, err)
+			return stats, fmt.Errorf("decode transaction index %X: %w", transaction.hash, err)
 		}
-		if result.Height > target {
-			deleteKeys = append(deleteKeys, hash)
-			stats.TxHashKeys++
+		if result.Height != transaction.height {
+			return stats, fmt.Errorf(
+				"transaction index %X height mismatch: height key=%d result=%d",
+				transaction.hash,
+				transaction.height,
+				result.Height,
+			)
 		}
+
+		deleteKeys = append(deleteKeys, transaction.heightKey, transaction.hash)
+		stats.TxHashKeys++
+		for _, eventPrefix := range txEventPrefixes(&result) {
+			eventIterator, err := db.Iterator(eventPrefix, prefixEnd(eventPrefix))
+			if err != nil {
+				return stats, fmt.Errorf("iterate transaction event prefix %X: %w", eventPrefix, err)
+			}
+			for ; eventIterator.Valid(); eventIterator.Next() {
+				if !bytes.Equal(eventIterator.Value(), transaction.hash) {
+					_ = eventIterator.Close()
+					return stats, fmt.Errorf(
+						"transaction event %X points to unexpected hash %X",
+						eventIterator.Key(),
+						eventIterator.Value(),
+					)
+				}
+				deleteKeys = append(deleteKeys, bytes.Clone(eventIterator.Key()))
+				stats.TxEventKeys++
+			}
+			if err := eventIterator.Error(); err != nil {
+				_ = eventIterator.Close()
+				return stats, fmt.Errorf("scan transaction event prefix %X: %w", eventPrefix, err)
+			}
+			if err := eventIterator.Close(); err != nil {
+				return stats, fmt.Errorf("close transaction event iterator: %w", err)
+			}
+		}
+	}
+
+	blockIterator, err := db.Iterator(blockEventPrefix, prefixEnd(blockEventPrefix))
+	if err != nil {
+		return stats, fmt.Errorf("iterate CometBFT block events: %w", err)
+	}
+	var blockScanned int64
+	for ; blockIterator.Valid(); blockIterator.Next() {
+		blockScanned++
+		stats.Scanned++
+		if progress != nil {
+			progress("block-event", blockScanned)
+		}
+		height, n := binary.Varint(blockIterator.Value())
+		if n <= 0 {
+			_ = blockIterator.Close()
+			return stats, fmt.Errorf(
+				"decode block-event index height key=%X value=%X",
+				blockIterator.Key(),
+				blockIterator.Value(),
+			)
+		}
+		if height > target {
+			deleteKeys = append(deleteKeys, bytes.Clone(blockIterator.Key()))
+			stats.BlockEventKeys++
+		}
+	}
+	if err := blockIterator.Error(); err != nil {
+		_ = blockIterator.Close()
+		return stats, fmt.Errorf("scan CometBFT block events: %w", err)
+	}
+	if err := blockIterator.Close(); err != nil {
+		return stats, fmt.Errorf("close CometBFT block-event iterator: %w", err)
 	}
 
 	if err := writeDeleteBatches(func() deleteBatch { return db.NewBatch() }, deleteKeys); err != nil {
@@ -177,8 +247,14 @@ func trimCometIndexes(db cmtdb.DB, target int64, progress func(scanned int64)) (
 func trimEVMIndexes(db cosmosdb.DB, target int64) (indexTrimStats, error) {
 	var stats indexTrimStats
 	var deleteKeys [][]byte
+	if target == math.MaxInt64 {
+		return stats, nil
+	}
 
-	iterator, err := db.Iterator([]byte{evmTxIndexPrefix}, []byte{evmTxIndexPrefix + 1})
+	start := make([]byte, 9)
+	start[0] = evmTxIndexPrefix
+	binary.BigEndian.PutUint64(start[1:], uint64(target)+1)
+	iterator, err := db.Iterator(start, []byte{evmTxIndexPrefix + 1})
 	if err != nil {
 		return stats, fmt.Errorf("iterate EVM indexes: %w", err)
 	}
@@ -208,6 +284,46 @@ func trimEVMIndexes(db cosmosdb.DB, target int64) (indexTrimStats, error) {
 		return stats, fmt.Errorf("delete EVM index suffix: %w", err)
 	}
 	return stats, nil
+}
+
+func txEventPrefixes(result *cmtabci.TxResult) [][]byte {
+	prefixes := make(map[string][]byte)
+	for _, event := range result.Result.Events {
+		if len(event.Type) == 0 {
+			continue
+		}
+		for _, attribute := range event.Attributes {
+			if len(attribute.Key) == 0 || !attribute.GetIndex() {
+				continue
+			}
+			prefix := []byte(fmt.Sprintf(
+				"%s.%s/%s/%d/%d$es$",
+				event.Type,
+				attribute.Key,
+				attribute.Value,
+				result.Height,
+				result.Index,
+			))
+			prefixes[string(prefix)] = prefix
+		}
+	}
+
+	resultPrefixes := make([][]byte, 0, len(prefixes))
+	for _, prefix := range prefixes {
+		resultPrefixes = append(resultPrefixes, prefix)
+	}
+	return resultPrefixes
+}
+
+func prefixEnd(prefix []byte) []byte {
+	end := bytes.Clone(prefix)
+	for index := len(end) - 1; index >= 0; index-- {
+		if end[index] != math.MaxUint8 {
+			end[index]++
+			return end[:index+1]
+		}
+	}
+	return nil
 }
 
 func txEventHeight(key, value []byte) (int64, bool) {

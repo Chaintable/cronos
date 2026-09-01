@@ -29,7 +29,8 @@ func TestTrimCometIndexes(t *testing.T) {
 
 	stats, err := trimCometIndexes(db, 10, nil)
 	require.NoError(t, err)
-	require.EqualValues(t, 2, stats.TxEventKeys)
+	require.EqualValues(t, 1, stats.TxHeightKeys)
+	require.EqualValues(t, 1, stats.TxEventKeys)
 	require.EqualValues(t, 1, stats.TxHashKeys)
 	require.EqualValues(t, 2, stats.BlockEventKeys)
 
@@ -39,6 +40,12 @@ func TestTrimCometIndexes(t *testing.T) {
 	result, err = txIndexer.Get(cmttypes.Tx(highTx.Tx).Hash())
 	require.NoError(t, err)
 	require.Nil(t, result)
+	lowTransactions, err := txIndexer.Search(t.Context(), cmtquery.MustCompile("test.value = 'low/value'"))
+	require.NoError(t, err)
+	require.Len(t, lowTransactions, 1)
+	highTransactions, err := txIndexer.Search(t.Context(), cmtquery.MustCompile("test.value = 'high/value'"))
+	require.NoError(t, err)
+	require.Empty(t, highTransactions)
 
 	lowBlocks, err := blockIndexer.Search(t.Context(), cmtquery.MustCompile("block.height = 10"))
 	require.NoError(t, err)
@@ -57,6 +64,7 @@ func TestTrimEVMIndexes(t *testing.T) {
 	require.NoError(t, db.Set(ethindexer.TxHashKey(lowHash), []byte("low")))
 	require.NoError(t, db.Set(ethindexer.TxIndexKey(11, 0), highHash.Bytes()))
 	require.NoError(t, db.Set(ethindexer.TxHashKey(highHash), []byte("high")))
+	require.NoError(t, db.Set([]byte{evmTxIndexPrefix, 0}, []byte("older malformed entry")))
 
 	stats, err := trimEVMIndexes(db, 10)
 	require.NoError(t, err)
@@ -67,6 +75,12 @@ func TestTrimEVMIndexes(t *testing.T) {
 	require.True(t, dbHas(t, db, ethindexer.TxHashKey(lowHash)))
 	require.False(t, dbHas(t, db, ethindexer.TxIndexKey(11, 0)))
 	require.False(t, dbHas(t, db, ethindexer.TxHashKey(highHash)))
+	require.True(t, dbHas(t, db, []byte{evmTxIndexPrefix, 0}))
+}
+
+func TestPrefixEnd(t *testing.T) {
+	require.Equal(t, []byte{0x01, 0x03}, prefixEnd([]byte{0x01, 0x02, 0xFF}))
+	require.Nil(t, prefixEnd([]byte{0xFF, 0xFF}))
 }
 
 func indexTestTxResult(height int64, value string) *cmtabci.TxResult {
