@@ -45,6 +45,12 @@ type indexTrimStats struct {
 	EVMTxHashKeys    int64
 }
 
+type stateTrimStats struct {
+	ABCIResponses   int64
+	Validators      int64
+	ConsensusParams int64
+}
+
 // RewindIndexesCmd removes transaction and block-event index entries above a
 // target height. It is idempotent and must be run with cronosd stopped.
 func RewindIndexesCmd() *cobra.Command {
@@ -78,11 +84,32 @@ func RewindIndexesCmd() *cobra.Command {
 			stateStore := cmtstate.NewStore(stateDB, cmtstate.StoreOptions{
 				DiscardABCIResponses: cfg.Storage.DiscardABCIResponses,
 			})
+			currentState, err := stateStore.Load()
+			if err != nil {
+				_ = txIndexDB.Close()
+				_ = stateDB.Close()
+				return fmt.Errorf("load CometBFT state: %w", err)
+			}
+			if currentState.LastBlockHeight != target {
+				_ = txIndexDB.Close()
+				_ = stateDB.Close()
+				return fmt.Errorf(
+					"CometBFT state height %d does not match target %d",
+					currentState.LastBlockHeight,
+					target,
+				)
+			}
 			sourceHeight, err := lastFinalizeBlockHeight(stateDB)
 			if err != nil {
 				_ = txIndexDB.Close()
 				_ = stateDB.Close()
 				return err
+			}
+			targetResponse, err := stateStore.LoadFinalizeBlockResponse(target)
+			if err != nil {
+				_ = txIndexDB.Close()
+				_ = stateDB.Close()
+				return fmt.Errorf("load target FinalizeBlockResponse at height %d: %w", target, err)
 			}
 
 			stats, err := trimCometIndexes(txIndexDB, target, sourceHeight, stateStore.LoadFinalizeBlockResponse, func(stage string, scanned int64) {
@@ -92,34 +119,44 @@ func RewindIndexesCmd() *cobra.Command {
 				}
 			})
 			txCloseErr := txIndexDB.Close()
-			stateCloseErr := stateDB.Close()
 			if err != nil {
+				_ = stateDB.Close()
 				return err
 			}
 			if txCloseErr != nil {
+				_ = stateDB.Close()
 				return fmt.Errorf("close CometBFT index database: %w", txCloseErr)
-			}
-			if stateCloseErr != nil {
-				return fmt.Errorf("close CometBFT state database: %w", stateCloseErr)
 			}
 
 			evmIndexDB, err := ethermintserver.OpenIndexerDB(cfg.RootDir, server.GetAppDBBackend(ctx.Viper))
 			if err != nil {
+				_ = stateDB.Close()
 				return fmt.Errorf("open EVM index database: %w", err)
 			}
 			evmStats, err := trimEVMIndexes(evmIndexDB, target)
 			closeErr := evmIndexDB.Close()
 			if err != nil {
+				_ = stateDB.Close()
 				return err
 			}
 			if closeErr != nil {
+				_ = stateDB.Close()
 				return fmt.Errorf("close EVM index database: %w", closeErr)
+			}
+
+			stateStats, err := trimCometStateHistory(stateDB, target, sourceHeight, targetResponse)
+			stateCloseErr := stateDB.Close()
+			if err != nil {
+				return err
+			}
+			if stateCloseErr != nil {
+				return fmt.Errorf("close CometBFT state database: %w", stateCloseErr)
 			}
 
 			stats.EVMTxIndexKeys = evmStats.EVMTxIndexKeys
 			stats.EVMTxHashKeys = evmStats.EVMTxHashKeys
 			cmd.Printf(
-				"rewound indexes to height %d scanned=%d tx_heights=%d tx_events=%d tx_hashes=%d tx_hashes_restored=%d block_events=%d evm_tx_indexes=%d evm_tx_hashes=%d\n",
+				"rewound indexes and state history to height %d scanned=%d tx_heights=%d tx_events=%d tx_hashes=%d tx_hashes_restored=%d block_events=%d evm_tx_indexes=%d evm_tx_hashes=%d state_abci_responses=%d state_validators=%d state_consensus_params=%d\n",
 				target,
 				stats.Scanned,
 				stats.TxHeightKeys,
@@ -129,10 +166,97 @@ func RewindIndexesCmd() *cobra.Command {
 				stats.BlockEventKeys,
 				stats.EVMTxIndexKeys,
 				stats.EVMTxHashKeys,
+				stateStats.ABCIResponses,
+				stateStats.Validators,
+				stateStats.ConsensusParams,
 			)
 			return nil
 		},
 	}
+}
+
+func trimCometStateHistory(
+	db cmtdb.DB,
+	target int64,
+	sourceHeight int64,
+	targetResponse *cmtabci.ResponseFinalizeBlock,
+) (stateTrimStats, error) {
+	var stats stateTrimStats
+	if sourceHeight < target {
+		return stats, fmt.Errorf("source height %d is below target %d", sourceHeight, target)
+	}
+	if targetResponse == nil {
+		return stats, fmt.Errorf("target FinalizeBlockResponse is nil")
+	}
+
+	var deleteKeys [][]byte
+	appendIfPresent := func(key []byte, count *int64) error {
+		present, err := db.Has(key)
+		if err != nil {
+			return err
+		}
+		if present {
+			deleteKeys = append(deleteKeys, key)
+			*count = *count + 1
+		}
+		return nil
+	}
+
+	for height := target + 1; height <= sourceHeight; height++ {
+		if err := appendIfPresent(cometStateHeightKey("abciResponsesKey", height), &stats.ABCIResponses); err != nil {
+			return stats, fmt.Errorf("inspect FinalizeBlockResponse at height %d: %w", height, err)
+		}
+	}
+	// Saving CometBFT state at height H writes validator metadata for H+2 and
+	// consensus parameters for H+1. The final hard rollback recreated those
+	// boundary entries, so only keys beyond them belong to the discarded suffix.
+	for height := target + 3; height <= sourceHeight+2; height++ {
+		if err := appendIfPresent(cometStateHeightKey("validatorsKey", height), &stats.Validators); err != nil {
+			return stats, fmt.Errorf("inspect validators at height %d: %w", height, err)
+		}
+	}
+	for height := target + 2; height <= sourceHeight+1; height++ {
+		if err := appendIfPresent(cometStateHeightKey("consensusParamsKey", height), &stats.ConsensusParams); err != nil {
+			return stats, fmt.Errorf("inspect consensus params at height %d: %w", height, err)
+		}
+	}
+
+	if err := writeDeleteBatches(func() indexBatch { return db.NewBatch() }, deleteKeys); err != nil {
+		return stats, fmt.Errorf("delete CometBFT state history suffix: %w", err)
+	}
+	for _, key := range deleteKeys {
+		present, err := db.Has(key)
+		if err != nil {
+			return stats, fmt.Errorf("verify deleted CometBFT state key %q: %w", key, err)
+		}
+		if present {
+			return stats, fmt.Errorf("CometBFT state key %q still exists after deletion", key)
+		}
+	}
+
+	responseInfo := &cmtstateproto.ABCIResponsesInfo{
+		ResponseFinalizeBlock: targetResponse,
+		Height:                target,
+	}
+	value, err := responseInfo.Marshal()
+	if err != nil {
+		return stats, fmt.Errorf("encode last FinalizeBlockResponse at height %d: %w", target, err)
+	}
+	if err := db.SetSync([]byte("lastABCIResponseKey"), value); err != nil {
+		return stats, fmt.Errorf("set last FinalizeBlockResponse at height %d: %w", target, err)
+	}
+	lastHeight, err := lastFinalizeBlockHeight(db)
+	if err != nil {
+		return stats, err
+	}
+	if lastHeight != target {
+		return stats, fmt.Errorf("last FinalizeBlockResponse height %d does not match target %d", lastHeight, target)
+	}
+	return stats, nil
+}
+
+func cometStateHeightKey(prefix string, height int64) []byte {
+	return []byte(fmt.Sprintf("%s:%d", prefix, height))
 }
 
 type indexedTransaction struct {

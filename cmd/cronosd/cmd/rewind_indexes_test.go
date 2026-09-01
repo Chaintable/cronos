@@ -135,6 +135,64 @@ func TestLastFinalizeBlockHeight(t *testing.T) {
 	require.EqualValues(t, 11, height)
 }
 
+func TestTrimCometStateHistory(t *testing.T) {
+	db := cmtdb.NewMemDB()
+	target := int64(10)
+	sourceHeight := int64(12)
+	targetResponse := &cmtabci.ResponseFinalizeBlock{AppHash: []byte("target")}
+
+	for height := int64(9); height <= sourceHeight; height++ {
+		require.NoError(t, db.Set(cometStateHeightKey("abciResponsesKey", height), []byte("response")))
+	}
+	for height := int64(9); height <= sourceHeight+2; height++ {
+		require.NoError(t, db.Set(cometStateHeightKey("validatorsKey", height), []byte("validators")))
+	}
+	for height := int64(9); height <= sourceHeight+1; height++ {
+		require.NoError(t, db.Set(cometStateHeightKey("consensusParamsKey", height), []byte("params")))
+	}
+	sourceInfo := &cmtstateproto.ABCIResponsesInfo{
+		ResponseFinalizeBlock: &cmtabci.ResponseFinalizeBlock{AppHash: []byte("source")},
+		Height:                sourceHeight,
+	}
+	value, err := sourceInfo.Marshal()
+	require.NoError(t, err)
+	require.NoError(t, db.Set([]byte("lastABCIResponseKey"), value))
+	require.NoError(t, db.Set([]byte("unrelated"), []byte("keep")))
+
+	stats, err := trimCometStateHistory(db, target, sourceHeight, targetResponse)
+	require.NoError(t, err)
+	require.EqualValues(t, 2, stats.ABCIResponses)
+	require.EqualValues(t, 2, stats.Validators)
+	require.EqualValues(t, 2, stats.ConsensusParams)
+
+	for height := target + 1; height <= sourceHeight; height++ {
+		require.False(t, cometDBHas(t, db, cometStateHeightKey("abciResponsesKey", height)))
+	}
+	for height := target + 3; height <= sourceHeight+2; height++ {
+		require.False(t, cometDBHas(t, db, cometStateHeightKey("validatorsKey", height)))
+	}
+	for height := target + 2; height <= sourceHeight+1; height++ {
+		require.False(t, cometDBHas(t, db, cometStateHeightKey("consensusParamsKey", height)))
+	}
+	require.True(t, cometDBHas(t, db, cometStateHeightKey("abciResponsesKey", target)))
+	require.True(t, cometDBHas(t, db, cometStateHeightKey("validatorsKey", target+2)))
+	require.True(t, cometDBHas(t, db, cometStateHeightKey("consensusParamsKey", target+1)))
+	require.True(t, cometDBHas(t, db, []byte("unrelated")))
+
+	lastHeight, err := lastFinalizeBlockHeight(db)
+	require.NoError(t, err)
+	require.Equal(t, target, lastHeight)
+}
+
+func TestTrimCometStateHistoryRejectsInvalidInput(t *testing.T) {
+	db := cmtdb.NewMemDB()
+
+	_, err := trimCometStateHistory(db, 10, 9, &cmtabci.ResponseFinalizeBlock{})
+	require.EqualError(t, err, "source height 9 is below target 10")
+	_, err = trimCometStateHistory(db, 10, 10, nil)
+	require.EqualError(t, err, "target FinalizeBlockResponse is nil")
+}
+
 func indexTestTxResult(height int64, value string) *cmtabci.TxResult {
 	return indexTestTxResultWithTx(height, value, value)
 }
@@ -193,6 +251,13 @@ func indexTestBlockEvents(height int64) cmttypes.EventDataNewBlockEvents {
 }
 
 func dbHas(t *testing.T, db cosmosdb.DB, key []byte) bool {
+	t.Helper()
+	found, err := db.Has(key)
+	require.NoError(t, err)
+	return found
+}
+
+func cometDBHas(t *testing.T, db cmtdb.DB, key []byte) bool {
 	t.Helper()
 	found, err := db.Has(key)
 	require.NoError(t, err)
