@@ -184,7 +184,7 @@ func initRootCmd(
 		rootCmd.AddCommand(changeSetCmd)
 	}
 
-	rootCmd.AddCommand(RollbackToVersionCmd())
+	rootCmd.AddCommand(RollbackToVersionCmd(), RewindCometBFTCmd(), RewindIndexesCmd())
 
 	// add keybase, auxiliary RPC, query, and tx child commands
 	rootCmd.AddCommand(

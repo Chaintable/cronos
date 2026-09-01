@@ -1,0 +1,300 @@
+package cmd
+
+import (
+	"fmt"
+	"testing"
+
+	cmtdb "github.com/cometbft/cometbft-db"
+	cmtabci "github.com/cometbft/cometbft/abci/types"
+	cmtquery "github.com/cometbft/cometbft/libs/pubsub/query"
+	cmtstateproto "github.com/cometbft/cometbft/proto/tendermint/state"
+	cmtblockidxkv "github.com/cometbft/cometbft/state/indexer/block/kv"
+	cmttxidxkv "github.com/cometbft/cometbft/state/txindex/kv"
+	cmttypes "github.com/cometbft/cometbft/types"
+	cosmosdb "github.com/cosmos/cosmos-db"
+	"github.com/ethereum/go-ethereum/common"
+	ethindexer "github.com/evmos/ethermint/indexer"
+	"github.com/stretchr/testify/require"
+)
+
+func TestTrimCometIndexes(t *testing.T) {
+	db := cmtdb.NewMemDB()
+	txIndexer := cmttxidxkv.NewTxIndex(db)
+	blockIndexer := cmtblockidxkv.New(cmtdb.NewPrefixDB(db, blockEventPrefix))
+
+	lowTx := indexTestTxResult(10, "low/value")
+	highTx := indexTestTxResult(11, "high/value")
+	require.NoError(t, txIndexer.Index(lowTx))
+	require.NoError(t, txIndexer.Index(highTx))
+	require.NoError(t, blockIndexer.Index(indexTestBlockEvents(10)))
+	require.NoError(t, blockIndexer.Index(indexTestBlockEvents(11)))
+
+	stats, err := trimCometIndexes(db, 10, 11, indexTestFinalizeLoader(lowTx, highTx), nil)
+	require.NoError(t, err)
+	require.EqualValues(t, 1, stats.TxHeightKeys)
+	require.EqualValues(t, 1, stats.TxEventKeys)
+	require.EqualValues(t, 1, stats.TxHashKeys)
+	require.EqualValues(t, 2, stats.BlockEventKeys)
+
+	result, err := txIndexer.Get(cmttypes.Tx(lowTx.Tx).Hash())
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	result, err = txIndexer.Get(cmttypes.Tx(highTx.Tx).Hash())
+	require.NoError(t, err)
+	require.Nil(t, result)
+	lowTransactions, err := txIndexer.Search(t.Context(), cmtquery.MustCompile("test.value = 'low/value'"))
+	require.NoError(t, err)
+	require.Len(t, lowTransactions, 1)
+	highTransactions, err := txIndexer.Search(t.Context(), cmtquery.MustCompile("test.value = 'high/value'"))
+	require.NoError(t, err)
+	require.Empty(t, highTransactions)
+
+	lowBlocks, err := blockIndexer.Search(t.Context(), cmtquery.MustCompile("block.height = 10"))
+	require.NoError(t, err)
+	require.Equal(t, []int64{10}, lowBlocks)
+	highBlocks, err := blockIndexer.Search(t.Context(), cmtquery.MustCompile("block.height = 11"))
+	require.NoError(t, err)
+	require.Empty(t, highBlocks)
+	indexedBlocks, err := blockIndexer.Search(t.Context(), cmtquery.MustCompile("test.height = 'indexed'"))
+	require.NoError(t, err)
+	require.Equal(t, []int64{10}, indexedBlocks)
+}
+
+func TestTrimCometIndexesRestoresRetainedDuplicateTransaction(t *testing.T) {
+	db := cmtdb.NewMemDB()
+	txIndexer := cmttxidxkv.NewTxIndex(db)
+
+	lowTx := indexTestTxResultWithTx(10, "same transaction", "low/value")
+	highTx := indexTestTxResultWithTx(11, "same transaction", "high/value")
+	require.NoError(t, txIndexer.Index(lowTx))
+	require.NoError(t, txIndexer.Index(highTx))
+
+	stats, err := trimCometIndexes(db, 10, 11, indexTestFinalizeLoader(lowTx, highTx), nil)
+	require.NoError(t, err)
+	require.EqualValues(t, 1, stats.TxHeightKeys)
+	require.EqualValues(t, 1, stats.TxEventKeys)
+	require.EqualValues(t, 0, stats.TxHashKeys)
+	require.EqualValues(t, 1, stats.TxHashesRestored)
+
+	hash := cmttypes.Tx(lowTx.Tx).Hash()
+	result, err := txIndexer.Get(hash)
+	require.NoError(t, err)
+	require.Equal(t, lowTx, result)
+	lowTransactions, err := txIndexer.Search(t.Context(), cmtquery.MustCompile("test.value = 'low/value'"))
+	require.NoError(t, err)
+	require.Len(t, lowTransactions, 1)
+	highTransactions, err := txIndexer.Search(t.Context(), cmtquery.MustCompile("test.value = 'high/value'"))
+	require.NoError(t, err)
+	require.Empty(t, highTransactions)
+
+	stats, err = trimCometIndexes(db, 10, 11, indexTestFinalizeLoader(lowTx, highTx), nil)
+	require.NoError(t, err)
+	require.Zero(t, stats.TxHeightKeys)
+	require.Zero(t, stats.TxEventKeys)
+	require.Zero(t, stats.TxHashKeys)
+	require.Zero(t, stats.TxHashesRestored)
+}
+
+func TestTrimEVMIndexes(t *testing.T) {
+	db := cosmosdb.NewMemDB()
+	lowHash := common.HexToHash("0x10")
+	highHash := common.HexToHash("0x11")
+
+	require.NoError(t, db.Set(ethindexer.TxIndexKey(10, 0), lowHash.Bytes()))
+	require.NoError(t, db.Set(ethindexer.TxHashKey(lowHash), []byte("low")))
+	require.NoError(t, db.Set(ethindexer.TxIndexKey(11, 0), highHash.Bytes()))
+	require.NoError(t, db.Set(ethindexer.TxHashKey(highHash), []byte("high")))
+	require.NoError(t, db.Set([]byte{evmTxIndexPrefix, 0}, []byte("older malformed entry")))
+
+	stats, err := trimEVMIndexes(db, 10)
+	require.NoError(t, err)
+	require.EqualValues(t, 1, stats.EVMTxIndexKeys)
+	require.EqualValues(t, 1, stats.EVMTxHashKeys)
+
+	require.True(t, dbHas(t, db, ethindexer.TxIndexKey(10, 0)))
+	require.True(t, dbHas(t, db, ethindexer.TxHashKey(lowHash)))
+	require.False(t, dbHas(t, db, ethindexer.TxIndexKey(11, 0)))
+	require.False(t, dbHas(t, db, ethindexer.TxHashKey(highHash)))
+	require.True(t, dbHas(t, db, []byte{evmTxIndexPrefix, 0}))
+}
+
+func TestPrefixEnd(t *testing.T) {
+	require.Equal(t, []byte{0x01, 0x03}, prefixEnd([]byte{0x01, 0x02, 0xFF}))
+	require.Nil(t, prefixEnd([]byte{0xFF, 0xFF}))
+}
+
+func TestLastFinalizeBlockHeight(t *testing.T) {
+	db := cmtdb.NewMemDB()
+	info := &cmtstateproto.ABCIResponsesInfo{Height: 11}
+	value, err := info.Marshal()
+	require.NoError(t, err)
+	require.NoError(t, db.Set([]byte("lastABCIResponseKey"), value))
+
+	height, err := lastFinalizeBlockHeight(db)
+	require.NoError(t, err)
+	require.EqualValues(t, 11, height)
+}
+
+func TestTrimCometStateHistory(t *testing.T) {
+	db := cmtdb.NewMemDB()
+	target := int64(10)
+	sourceHeight := int64(12)
+	targetResponse := &cmtabci.ResponseFinalizeBlock{AppHash: []byte("target")}
+
+	for height := int64(9); height <= sourceHeight; height++ {
+		require.NoError(t, db.Set(cometStateHeightKey("abciResponsesKey", height), []byte("response")))
+	}
+	for height := int64(9); height <= sourceHeight+2; height++ {
+		require.NoError(t, db.Set(cometStateHeightKey("validatorsKey", height), []byte("validators")))
+	}
+	for height := int64(9); height <= sourceHeight+1; height++ {
+		require.NoError(t, db.Set(cometStateHeightKey("consensusParamsKey", height), []byte("params")))
+	}
+	sourceInfo := &cmtstateproto.ABCIResponsesInfo{
+		ResponseFinalizeBlock: &cmtabci.ResponseFinalizeBlock{AppHash: []byte("source")},
+		Height:                sourceHeight,
+	}
+	value, err := sourceInfo.Marshal()
+	require.NoError(t, err)
+	require.NoError(t, db.Set([]byte("lastABCIResponseKey"), value))
+	require.NoError(t, db.Set([]byte("unrelated"), []byte("keep")))
+
+	stats, err := trimCometStateHistory(db, target, sourceHeight, targetResponse)
+	require.NoError(t, err)
+	require.EqualValues(t, 2, stats.ABCIResponses)
+	require.EqualValues(t, 2, stats.Validators)
+	require.EqualValues(t, 2, stats.ConsensusParams)
+
+	for height := target + 1; height <= sourceHeight; height++ {
+		require.False(t, cometDBHas(t, db, cometStateHeightKey("abciResponsesKey", height)))
+	}
+	for height := target + 3; height <= sourceHeight+2; height++ {
+		require.False(t, cometDBHas(t, db, cometStateHeightKey("validatorsKey", height)))
+	}
+	for height := target + 2; height <= sourceHeight+1; height++ {
+		require.False(t, cometDBHas(t, db, cometStateHeightKey("consensusParamsKey", height)))
+	}
+	require.True(t, cometDBHas(t, db, cometStateHeightKey("abciResponsesKey", target)))
+	require.True(t, cometDBHas(t, db, cometStateHeightKey("validatorsKey", target+2)))
+	require.True(t, cometDBHas(t, db, cometStateHeightKey("consensusParamsKey", target+1)))
+	require.True(t, cometDBHas(t, db, []byte("unrelated")))
+
+	lastHeight, err := lastFinalizeBlockHeight(db)
+	require.NoError(t, err)
+	require.Equal(t, target, lastHeight)
+}
+
+func TestTrimCometStateHistoryRejectsInvalidInput(t *testing.T) {
+	db := cmtdb.NewMemDB()
+
+	_, err := trimCometStateHistory(db, 10, 9, &cmtabci.ResponseFinalizeBlock{})
+	require.EqualError(t, err, "source height 9 is below target 10")
+	_, err = trimCometStateHistory(db, 10, 10, nil)
+	require.EqualError(t, err, "target FinalizeBlockResponse is nil")
+}
+
+func TestTrimEvidence(t *testing.T) {
+	db := cmtdb.NewMemDB()
+	lowCommitted := evidenceTestKey(0, 10, "AABB")
+	lowPending := evidenceTestKey(1, 10, "CCDD")
+	highCommitted := evidenceTestKey(0, 11, "EEFF")
+	highPending := evidenceTestKey(1, 12, "0011")
+
+	for _, key := range [][]byte{lowCommitted, lowPending, highCommitted, highPending} {
+		require.NoError(t, db.Set(key, []byte("evidence")))
+	}
+
+	stats, err := trimEvidence(db, 10)
+	require.NoError(t, err)
+	require.EqualValues(t, 4, stats.Scanned)
+	require.EqualValues(t, 2, stats.Committed)
+	require.EqualValues(t, 2, stats.Pending)
+	require.EqualValues(t, 2, stats.Deleted)
+	require.True(t, cometDBHas(t, db, lowCommitted))
+	require.True(t, cometDBHas(t, db, lowPending))
+	require.False(t, cometDBHas(t, db, highCommitted))
+	require.False(t, cometDBHas(t, db, highPending))
+}
+
+func TestTrimEvidenceRejectsMalformedKey(t *testing.T) {
+	db := cmtdb.NewMemDB()
+	require.NoError(t, db.Set([]byte("invalid"), []byte("evidence")))
+
+	_, err := trimEvidence(db, 10)
+	require.EqualError(t, err, "evidence key has invalid format: 696E76616C6964")
+}
+
+func evidenceTestKey(prefix byte, height int64, hash string) []byte {
+	return append([]byte{prefix}, []byte(fmt.Sprintf("%016X/%s", height, hash))...)
+}
+
+func indexTestTxResult(height int64, value string) *cmtabci.TxResult {
+	return indexTestTxResultWithTx(height, value, value)
+}
+
+func indexTestTxResultWithTx(height int64, tx, value string) *cmtabci.TxResult {
+	return &cmtabci.TxResult{
+		Height: height,
+		Tx:     []byte(tx),
+		Result: cmtabci.ExecTxResult{
+			Events: []cmtabci.Event{{
+				Type: "test",
+				Attributes: []cmtabci.EventAttribute{{
+					Key: "value", Value: value, Index: true,
+				}},
+			}},
+		},
+	}
+}
+
+func indexTestFinalizeLoader(results ...*cmtabci.TxResult) func(int64) (*cmtabci.ResponseFinalizeBlock, error) {
+	responses := make(map[int64]*cmtabci.ResponseFinalizeBlock)
+	for _, result := range results {
+		response := responses[result.Height]
+		if response == nil {
+			response = &cmtabci.ResponseFinalizeBlock{
+				Events: indexTestBlockEvents(result.Height).Events,
+			}
+			responses[result.Height] = response
+		}
+		for uint32(len(response.TxResults)) <= result.Index {
+			response.TxResults = append(response.TxResults, nil)
+		}
+		execResult := result.Result
+		response.TxResults[result.Index] = &execResult
+	}
+
+	return func(height int64) (*cmtabci.ResponseFinalizeBlock, error) {
+		response := responses[height]
+		if response == nil {
+			return nil, fmt.Errorf("missing response at height %d", height)
+		}
+		return response, nil
+	}
+}
+
+func indexTestBlockEvents(height int64) cmttypes.EventDataNewBlockEvents {
+	return cmttypes.EventDataNewBlockEvents{
+		Height: height,
+		Events: []cmtabci.Event{{
+			Type: "test",
+			Attributes: []cmtabci.EventAttribute{{
+				Key: "height", Value: "indexed", Index: true,
+			}},
+		}},
+	}
+}
+
+func dbHas(t *testing.T, db cosmosdb.DB, key []byte) bool {
+	t.Helper()
+	found, err := db.Has(key)
+	require.NoError(t, err)
+	return found
+}
+
+func cometDBHas(t *testing.T, db cmtdb.DB, key []byte) bool {
+	t.Helper()
+	found, err := db.Has(key)
+	require.NoError(t, err)
+	return found
+}
