@@ -240,9 +240,9 @@ schema = 3
     version = "v0.0.0-20250429170803-42689b6311bb"
     hash = "sha256-ONv0/mLeHiYi/a/7b6TDdqL/iYYW+/87FtniXoYPOhQ="
   [mod."github.com/cometbft/cometbft"]
-    version = "v0.0.0-20260729145603-14b7b93046e3"
-    hash = "sha256-ZCq2ZZJjQmDfhprnG1AJvV4/gLDEZwRbjoOhJXsimcM="
-    replaced = "github.com/crypto-org-chain/cometbft"
+    version = "v0.0.0-20261022082704-613622821d5a"
+    hash = "sha256-Lpx+OwVy4YdUpKHMDeLGcvZz6vuFontnQJyIs6GUopI="
+    replaced = "github.com/Chaintable/cometbft"
   [mod."github.com/cometbft/cometbft-db"]
     version = "v1.0.4"
     hash = "sha256-sRDmCP2jCvaMUjE4g3SRaWIvN0TQMwokDMIBA2lbT8M="
@@ -378,9 +378,9 @@ schema = 3
     version = "v0.2.2"
     hash = "sha256-0MLfSJKdeK3Z7tWAXTdzwB4091dmyxIX38S5SKH5QAw="
   [mod."github.com/evmos/ethermint"]
-    version = "v0.24.0"
-    hash = "sha256-1YGuMDKYIsyDdeh6xm36HV6gM4k0dMBX/qFyYjQhHfk="
-    replaced = "github.com/crypto-org-chain/ethermint"
+    version = "v0.22.1-cronos-v1.7.8-ct.1.0.20261022082657-c22af9d38d9c"
+    hash = "sha256-Hn8+1l8F1+J7Nl5n8/fEk8GuZicUo98XC8khCgfj3Y4="
+    replaced = "github.com/Chaintable/ethermint-cronos"
   [mod."github.com/fatih/color"]
     version = "v1.18.0"
     hash = "sha256-pP5y72FSbi4j/BjyVq/XbAOFjzNjMxZt2R/lFFxGWvY="

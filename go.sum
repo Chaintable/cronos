@@ -65,6 +65,10 @@ github.com/Azure/go-ansiterm v0.0.0-20250102033503-faa5f7b0171c h1:udKWzYgxTojEK
 github.com/Azure/go-ansiterm v0.0.0-20250102033503-faa5f7b0171c/go.mod h1:xomTg63KZ2rFqZQzSB4Vz2SUXa1BpHTVz9L5PTmPC4E=
 github.com/BurntSushi/toml v0.3.1/go.mod h1:xHWCNGjB5oqiDr8zfno3MHue2Ht5sIBksp03qcyfWMU=
 github.com/BurntSushi/xgb v0.0.0-20160522181843-27f122750802/go.mod h1:IVnqGOEym/WlBOVXweHU+Q+/VP0lqqI8lqeDx9IjBqo=
+github.com/Chaintable/cometbft v0.0.0-20261022082704-613622821d5a h1:hvQfDYVjBTvkaU9LnM2ka1w6d2V32zn52qBIVR4+ZVA=
+github.com/Chaintable/cometbft v0.0.0-20261022082704-613622821d5a/go.mod h1:KcZvZTqdLgOisktAoWwwcS2fgO4E110r44KxEGyq8SI=
+github.com/Chaintable/ethermint-cronos v0.22.1-cronos-v1.7.8-ct.1.0.20261022082657-c22af9d38d9c h1:WkD8eSp/3cFsTDtAhV9Tx+QIDZMLtJG5KJf/DxOhoAI=
+github.com/Chaintable/ethermint-cronos v0.22.1-cronos-v1.7.8-ct.1.0.20261022082657-c22af9d38d9c/go.mod h1:4OIplP1UVBA2OwhPf3MB7+sT79o5CBLPYa6GwmtpdMc=
 github.com/DataDog/datadog-go v4.8.3+incompatible h1:fNGaYSuObuQb5nzeTQqowRAd9bpDIRRV4/gUtIBjh8Q=
 github.com/DataDog/datadog-go v4.8.3+incompatible/go.mod h1:LButxg5PwREeZtORoXG3tL4fMGNddJ+vMq1mwgfaqoQ=
 github.com/DataDog/zstd v1.5.7 h1:ybO8RBeh29qrxIhCA9E8gKY6xfONU9T6G6aP9DTKfLE=
@@ -288,8 +292,6 @@ github.com/creachadair/tomledit v0.0.29 h1:dB5CbdwJMpn/fmfAPTAAleXF/KJwY0Ggc1eL/
 github.com/creachadair/tomledit v0.0.29/go.mod h1:4SoTXxzHgvzHRMIJPw+o6zK/yXii4VjLrb6/3gCQnyA=
 github.com/creack/pty v1.1.7/go.mod h1:lj5s0c3V2DBrqTV7llrYr5NG6My20zk30Fl46Y7DoTY=
 github.com/creack/pty v1.1.9/go.mod h1:oKZEueFk5CKHvIhNR5MUki03XCEU+Q6VDXinZuGJ33E=
-github.com/crypto-org-chain/cometbft v0.0.0-20260729145603-14b7b93046e3 h1:kw6+G2l6M09MF0YAGkzKPDna/iw2hFYDaGr5aN2B8kM=
-github.com/crypto-org-chain/cometbft v0.0.0-20260729145603-14b7b93046e3/go.mod h1:KcZvZTqdLgOisktAoWwwcS2fgO4E110r44KxEGyq8SI=
 github.com/crypto-org-chain/cosmos-sdk v0.54.4-0.20260806150823-1e7193afaaf8 h1:rGxTbchn3zh1ZOHVYRuHyu0aNTPibrWgwahrIkX/Cyw=
 github.com/crypto-org-chain/cosmos-sdk v0.54.4-0.20260806150823-1e7193afaaf8/go.mod h1:d+mzrQ+PV+6t63HomWzLx+OoFeprkjO/b+0ih+LfvIo=
 github.com/crypto-org-chain/cronos-store/memiavl v0.0.0-20260923061457-2d12c238d139 h1:PZhDeIWkyn5O5FnPLip+5peb6smC8/bK2Ufkq06PggQ=
@@ -298,8 +300,6 @@ github.com/crypto-org-chain/cronos-store/store v0.0.0-20260923061457-2d12c238d13
 github.com/crypto-org-chain/cronos-store/store v0.0.0-20260923061457-2d12c238d139/go.mod h1:nbT4YcTZJqW0EY1zNO/o7hx+a0q2hCEjsnZi5vQy2N4=
 github.com/crypto-org-chain/cronos-store/versiondb v0.0.0-20260923061457-2d12c238d139 h1:9mCdXbf9c8wCkJcjGpLBRubxPdLTCrdK9OhYLKYsiWw=
 github.com/crypto-org-chain/cronos-store/versiondb v0.0.0-20260923061457-2d12c238d139/go.mod h1:vNigSKdbXLtFT5wQMaOyLMMXJn3DxL8GRG8cnOZbfUc=
-github.com/crypto-org-chain/ethermint v0.24.0 h1:4DnT4n/AYmwlj7Vf2XPVF9bj6GHOqvCKyIM1OlCRSJg=
-github.com/crypto-org-chain/ethermint v0.24.0/go.mod h1:dnk62oZ22GUvyW8w56BTEqa20Nc8Rl+s6nkAEo1OAU0=
 github.com/crypto-org-chain/go-ethereum v1.10.20-0.20260521015249-663dca6c618e h1:ftyRRWDiXKWsnp3PxLNbfVLzrqkx+aDNZdkPconawWk=
 github.com/crypto-org-chain/go-ethereum v1.10.20-0.20260521015249-663dca6c618e/go.mod h1:Fs6QebQbavneQTYcA39PEKv2+zIjX7rPUZ14DER46wk=
 github.com/danieljoos/wincred v1.2.3 h1:v7dZC2x32Ut3nEfRH+vhoZGvN72+dQ/snVXo/vMFLdQ=
