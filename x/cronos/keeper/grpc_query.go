@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math/big"
+	"sync/atomic"
 
 	"github.com/crypto-org-chain/cronos/x/cronos/types"
 	"github.com/ethereum/go-ethereum/common"
@@ -17,6 +18,25 @@ import (
 
 	sdk "github.com/cosmos/cosmos-sdk/types"
 )
+
+const (
+	// ReplayBlockGasCap caps per-message EVM gas in a ReplayBlock query.
+	// Since historical blocks may have used different limits, we use a fixed upper bound value.
+	ReplayBlockGasCap = 60_000_000
+
+	// replayBlockConcurrency bounds how many ReplayBlock queries may run their
+	// EVM replay loop at once.
+	replayBlockConcurrency = 4
+
+	// replayBlockMaxQueued bounds how many callers may wait for a free slot.
+	replayBlockMaxQueued = 4 * replayBlockConcurrency
+)
+
+// replayBlockSem limits concurrent ReplayBlock executions across all calls to this process.
+var replayBlockSem = make(chan struct{}, replayBlockConcurrency)
+
+// replayBlockQueued counts callers currently running or waiting for a slot.
+var replayBlockQueued int32
 
 var _ types.QueryServer = Keeper{}
 
@@ -52,6 +72,28 @@ func (k Keeper) DenomByContract(goCtx context.Context, req *types.DenomByContrac
 
 // ReplayBlock replay the eth messages in the block to recover the results of false-failed txs.
 func (k Keeper) ReplayBlock(goCtx context.Context, req *types.ReplayBlockRequest) (*types.ReplayBlockResponse, error) {
+	// bound the batch size on this public gRPC endpoint
+	if len(req.Msgs) > types.MaxReplayBlockMsgs {
+		return nil, status.Errorf(codes.InvalidArgument,
+			"too many messages in ReplayBlock request: %d (max %d)", len(req.Msgs), types.MaxReplayBlockMsgs)
+	}
+
+	// Reject once too many callers are already running or queued.
+	if atomic.AddInt32(&replayBlockQueued, 1) > replayBlockMaxQueued {
+		atomic.AddInt32(&replayBlockQueued, -1)
+		return nil, status.Error(codes.ResourceExhausted, "too many concurrent ReplayBlock queries")
+	}
+	defer atomic.AddInt32(&replayBlockQueued, -1)
+
+	// Wait for a free execution slot; a client disconnect frees the caller
+	// without consuming a slot.
+	select {
+	case replayBlockSem <- struct{}{}:
+		defer func() { <-replayBlockSem }()
+	case <-goCtx.Done():
+		return nil, status.FromContextError(goCtx.Err()).Err()
+	}
+
 	rsps := make([]*evmtypes.MsgEthereumTxResponse, 0, len(req.Msgs))
 
 	// prepare the block context, the multistore version should be setup already in grpc query context.
@@ -59,6 +101,10 @@ func (k Keeper) ReplayBlock(goCtx context.Context, req *types.ReplayBlockRequest
 		WithBlockHeight(req.BlockNumber).
 		WithBlockTime(req.BlockTime).
 		WithHeaderHash(common.Hex2Bytes(req.BlockHash))
+
+	// Per-message gas cap. A committed tx already fits within the block gas
+	// limit, so legitimate replay is unaffected.
+	gasCap := uint64(ReplayBlockGasCap)
 
 	// load parameters
 	params := k.evmKeeper.GetParams(ctx)
@@ -73,8 +119,29 @@ func (k Keeper) ReplayBlock(goCtx context.Context, req *types.ReplayBlockRequest
 	evmDenom := params.EvmDenom
 	baseFee := k.evmKeeper.GetBaseFee(ctx, ethCfg)
 
+	// gas budget is 2 times the gas cap because the last transaction can be overload the gas limit in case of legacy blocks
+	gasBudget := gasCap * 2
+	var cumulativeGas uint64
+	for _, msg := range req.Msgs {
+		gas := msg.GetGas()
+		if gas > gasCap {
+			return nil, status.Errorf(codes.InvalidArgument,
+				"message gas limit %d exceeds ReplayBlock cap %d", gas, gasCap)
+		}
+		if gas > gasBudget-cumulativeGas {
+			return nil, status.Errorf(codes.InvalidArgument,
+				"cumulative message gas exceeds ReplayBlock budget %d", gasBudget)
+		}
+		cumulativeGas += gas
+	}
+
 	// we assume the message executions are successful, they are filtered in json-rpc api
 	for _, msg := range req.Msgs {
+		// abort if the caller is already gone
+		if err := ctx.Err(); err != nil {
+			return nil, status.FromContextError(err).Err()
+		}
+
 		// deduct fee
 		// populate the `From` field
 		if _, err := msg.GetSenderLegacy(ethtypes.LatestSignerForChainID(chainID)); err != nil {

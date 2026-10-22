@@ -22,7 +22,13 @@ result
 # yaml for test
 integration_tests/configs/*.yaml
 
+# integration test coverage output
+integration_tests/coverage/
+
 # direnv
 .envrc
 .direnv
 chain-main-*
+
+# Corporate CA certs (environment-specific, not for public repo)
+testground/corp-ca.crt

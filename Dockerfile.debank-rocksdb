@@ -1,6 +1,6 @@
 # RocksDB build of the DeBank cronos writer image.
-# Builds RocksDB from source to match the version cronos v1.7.x pins
-# (nix/rocksdb.nix: v10.5.1) and links cronosd with COSMOS_BUILD_OPTIONS=rocksdb.
+# Builds RocksDB from source to match the version cronos v1.8.x pins
+# (nix/rocksdb.nix: v10.9.1) and links cronosd with COSMOS_BUILD_OPTIONS=rocksdb.
 # The trace_debankBlock emitter is pulled via the go.mod replace
 # (github.com/evmos/ethermint => github.com/Chaintable/ethermint-cronos).
 
@@ -11,13 +11,13 @@ RUN apt-get update && \
     apt-get install -y libgflags-dev libsnappy-dev zlib1g-dev libbz2-dev liblz4-dev libzstd-dev && \
     rm -rf /var/lib/apt/lists/*
 
-# Build RocksDB v10.5.1 from source (matches grocksdb v1.10.3 / cronos nix pin).
+# Build RocksDB v10.9.1 from source (matches grocksdb v1.10.8 / cronos nix pin).
 # PORTABLE=1: baseline -march so the .so runs across CPU generations and avoids the
 # GCC AVX512 intrinsic codegen path. DISABLE_WARNING_AS_ERROR=1: drop -Werror, which
 # trips on a GCC self-init warning in avx512fintrin.h.
 RUN git clone https://github.com/facebook/rocksdb.git /tmp/rocksdb && \
     cd /tmp/rocksdb && \
-    git checkout v10.5.1 && \
+    git checkout v10.9.1 && \
     PORTABLE=1 DISABLE_WARNING_AS_ERROR=1 make -j$(nproc) install-shared && \
     ldconfig && \
     rm -rf /tmp/rocksdb
@@ -29,7 +29,7 @@ COPY . /code/
 RUN GOPRIVATE='github.com/Chaintable/*' make install COSMOS_BUILD_OPTIONS=rocksdb
 
 # --------------------------------------------------------
-FROM ubuntu:22.04
+FROM debian:bookworm-slim
 
 RUN apt-get update \
     && apt-get install -y libsnappy1v5 libgflags2.2 zlib1g libbz2-1.0 liblz4-1 libzstd1 ca-certificates curl jq \

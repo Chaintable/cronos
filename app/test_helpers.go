@@ -20,7 +20,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"cosmossdk.io/errors"
-	"cosmossdk.io/log"
+	"cosmossdk.io/log/v2"
 	sdkmath "cosmossdk.io/math"
 
 	baseapp "github.com/cosmos/cosmos-sdk/baseapp"
@@ -67,14 +67,19 @@ var DefaultConsensusParams = &tmproto.ConsensusParams{
 	},
 }
 
-func setup(withGenesis bool, invCheckPeriod uint) (*App, GenesisState) {
-	db := dbm.NewMemDB()
-	opts := simtestutil.AppOptionsMap{
+// baseTestAppOpts lets callers layer extra flags on before calling New().
+func baseTestAppOpts(invCheckPeriod uint) simtestutil.AppOptionsMap {
+	return simtestutil.AppOptionsMap{
 		flags.FlagHome:            app.DefaultNodeHome,
 		server.FlagInvCheckPeriod: invCheckPeriod,
 	}
+}
+
+func setup(withGenesis bool, invCheckPeriod uint) (*App, GenesisState) {
+	db := dbm.NewMemDB()
+	opts := baseTestAppOpts(invCheckPeriod)
 	app := New(
-		log.NewNopLogger(), db, nil, true,
+		log.NewNopLogger(), db, true,
 		opts,
 		baseapp.SetChainID(TestAppChainID),
 	)

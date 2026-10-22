@@ -24,18 +24,19 @@ const DefaultGasCap uint64 = 25000000
 func (k Keeper) CallEVM(ctx sdk.Context, to *common.Address, data []byte, value *big.Int, gasLimit uint64) (*core.Message, *evmtypes.EVMResult, error) {
 	nonce := k.evmKeeper.GetNonce(ctx, types.EVMModuleAddress)
 	msg := &core.Message{
-		From:             types.EVMModuleAddress,
-		To:               to,
-		Nonce:            nonce,
-		Value:            value, // amount
-		GasLimit:         gasLimit,
-		GasPrice:         big.NewInt(0),
-		GasFeeCap:        nil,
-		GasTipCap:        nil, // gasPrice
-		Data:             data,
-		AccessList:       nil, // accessList
-		SkipNonceChecks:  false,
-		SkipFromEOACheck: false,
+		From:            types.EVMModuleAddress,
+		To:              to,
+		Nonce:           nonce,
+		Value:           value, // amount
+		GasLimit:        gasLimit,
+		GasPrice:        big.NewInt(0),
+		GasFeeCap:       nil,
+		GasTipCap:       nil, // gasPrice
+		Data:            data,
+		AccessList:      nil, // accessList
+		SkipNonceChecks: false,
+		// Internal module calls are not real transactions, skip the limit checks.
+		SkipTransactionChecks: true,
 	}
 	ret, err := k.evmKeeper.ApplyMessage(ctx, msg, nil, true)
 	if err != nil {
@@ -104,7 +105,9 @@ func (k Keeper) ConvertCoinFromNativeToCRC21(ctx sdk.Context, sender common.Addr
 		if err != nil {
 			return err
 		}
-		k.SetAutoContractForDenom(ctx, coin.Denom, contract)
+		if err = k.SetAutoContractForDenom(ctx, coin.Denom, contract); err != nil {
+			return err
+		}
 
 		k.Logger(ctx).Info(fmt.Sprintf("contract address %s created for coin denom %s", contract.String(), coin.Denom))
 	}

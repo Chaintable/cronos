@@ -9,7 +9,7 @@ import (
 	"github.com/crypto-org-chain/cronos-store/versiondb"
 	"github.com/crypto-org-chain/cronos-store/versiondb/tsrocksdb"
 
-	storetypes "cosmossdk.io/store/types"
+	storetypes "github.com/cosmos/cosmos-sdk/store/v2/types"
 )
 
 func (app *App) setupVersionDB(
@@ -17,7 +17,7 @@ func (app *App) setupVersionDB(
 	keys map[string]*storetypes.KVStoreKey,
 	tkeys map[string]*storetypes.TransientStoreKey,
 	okeys map[string]*storetypes.ObjectStoreKey,
-) (storetypes.RootMultiStore, error) {
+) (storetypes.MultiStore, error) {
 	dataDir := filepath.Join(homePath, "data", "versiondb")
 	if err := os.MkdirAll(dataDir, os.ModePerm); err != nil {
 		return nil, err

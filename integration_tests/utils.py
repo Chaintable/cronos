@@ -112,6 +112,16 @@ def wait_for_fn(name, fn, *, timeout=240, interval=1):
         raise TimeoutError(f"wait for {name} timeout")
 
 
+def mempool_type(cronos, i=0) -> str:
+    """Mempool type from node i's rendered config.toml. Absent type == flood.
+
+    Under mempool.type=app txs live in the SDK pool, so CometBFT's UnconfirmedTxs
+    RPC (eth "pending" filter, dup-tx detection) behaves differently from flood.
+    """
+    cfg = toml.load(cronos.node_home(i) / "config" / "config.toml")
+    return cfg.get("mempool", {}).get("type") or "flood"
+
+
 def get_sync_info(s):
     return s.get("SyncInfo") or s.get("sync_info")
 
@@ -202,7 +212,8 @@ def approve_proposal(
             )
             assert rsp["code"] == 0, rsp["raw_log"]
 
-        wait_for_new_blocks(cli, 1)
+        # wait for 3 blocks to ensure all votes are counted (to prevent flakiness)
+        wait_for_new_blocks(cli, 3)
         assert (
             int(cli.query_tally(proposal_id)[vote_option + "_count"])
             == cli.staking_pool()
@@ -874,6 +885,7 @@ def remove_cancun_prague_params(cronos):
     p = cli.query_params("evm")
     del p["chain_config"]["cancun_time"]
     del p["chain_config"]["prague_time"]
+    del p["chain_config"]["osaka_time"]
     authority = cosmos_module_address("gov")
     msg = "/ethermint.evm.v1.MsgUpdateParams"
     submit_gov_proposal(
@@ -890,3 +902,4 @@ def remove_cancun_prague_params(cronos):
     p = cli.query_params("evm")
     assert not p["chain_config"]["cancun_time"]
     assert not p["chain_config"]["prague_time"]
+    assert not p["chain_config"]["osaka_time"]

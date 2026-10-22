@@ -7,6 +7,9 @@
       db_backend: 'rocksdb',
       mempool: {
         version: 'v1',
+        type: 'app',
+        // cometbft v0.39 fork requires reap_interval>0 when type=app.
+        reap_interval: '500ms',
       },
     },
     'app-config': {
@@ -22,9 +25,13 @@
         'feehistory-cap': 100,
         'block-range-cap': 10000,
         'logs-cap': 10000,
+        'txfee-cap': 2,
       },
       evm: {
         'block-executor': 'sequential',
+      },
+      grpc: {
+        'skip-check-header': true,
       },
       mempool: {
         'max-txs': 1000,
@@ -85,11 +92,13 @@
       name: 'community',
       coins: '10000000000000000000000basetcro',
       mnemonic: '${COMMUNITY_MNEMONIC}',
-    }, {
+    }, 
+    {
       name: 'signer1',
       coins: '20000000000000000000000basetcro',
       mnemonic: '${SIGNER1_MNEMONIC}',
-    }, {
+    },
+    {
       name: 'signer2',
       coins: '30000000000000000000000basetcro',
       mnemonic: '${SIGNER2_MNEMONIC}',

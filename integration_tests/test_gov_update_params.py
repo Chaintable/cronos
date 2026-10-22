@@ -20,6 +20,7 @@ def test_evm_update_param(cronos, tmp_path):
     del p["chain_config"]["shanghai_time"]
     del p["chain_config"]["cancun_time"]
     del p["chain_config"]["prague_time"]
+    del p["chain_config"]["osaka_time"]
     authority = module_address("gov")
     msg = "/ethermint.evm.v1.MsgUpdateParams"
     submit_gov_proposal(
@@ -38,6 +39,7 @@ def test_evm_update_param(cronos, tmp_path):
     assert not p["chain_config"]["shanghai_time"]
     assert not p["chain_config"]["cancun_time"]
     assert not p["chain_config"]["prague_time"]
+    assert not p["chain_config"]["osaka_time"]
     invalid_msg = "invalid opcode: PUSH0"
     with pytest.raises(exceptions.Web3RPCError) as e_info:
         contract.caller.randomTokenId()
@@ -50,6 +52,7 @@ def test_evm_update_param(cronos, tmp_path):
 def test_gov_update_params(cronos):
     params = {
         "cronos_admin": "crc12luku6uxehhak02py4rcz65zu0swh7wjsrw0pp",
+        "cro_bridge_contract_addresses": [],
         "enable_auto_deployment": False,
         "ibc_cro_denom": "ibc/6411AE2ADA1E73DB59DB151"
         "A8988F9B7D5E7E233D8414DB6817F8F1A01600000",
