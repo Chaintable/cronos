@@ -35,7 +35,10 @@ func RollbackToVersionCmd() *cobra.Command {
 			}
 			defer db.Close()
 
-			cronosApp := app.New(ctx.Logger, db, nil, false, ctx.Viper, server.DefaultBaseappOptions(ctx.Viper)...)
+			cronosApp := app.New(
+				ctx.Logger, db, false, ctx.Viper,
+				server.DefaultBaseappOptions(ctx.Viper)...,
+			)
 			// Load at the target version (every store has it) to populate the loaded
 			// store set that RollbackToVersion iterates over.
 			if err := cronosApp.LoadHeight(target); err != nil {

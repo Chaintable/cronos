@@ -5,10 +5,10 @@ import (
 	"math/big"
 
 	tmbytes "github.com/cometbft/cometbft/libs/bytes"
-	"github.com/cosmos/ibc-go/v10/modules/apps/transfer/types"
-	clienttypes "github.com/cosmos/ibc-go/v10/modules/core/02-client/types"
-	connectiontypes "github.com/cosmos/ibc-go/v10/modules/core/03-connection/types"
-	channeltypes "github.com/cosmos/ibc-go/v10/modules/core/04-channel/types"
+	"github.com/cosmos/ibc-go/v11/modules/apps/transfer/types"
+	clienttypes "github.com/cosmos/ibc-go/v11/modules/core/02-client/types"
+	connectiontypes "github.com/cosmos/ibc-go/v11/modules/core/03-connection/types"
+	channeltypes "github.com/cosmos/ibc-go/v11/modules/core/04-channel/types"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/tracing"
@@ -60,6 +60,7 @@ type EvmKeeper interface {
 	GetNonce(ctx sdk.Context, addr common.Address) uint64
 	ApplyMessage(ctx sdk.Context, msg *core.Message, tracer *tracing.Hooks, commit bool) (*evmtypes.EVMResult, error)
 	GetParams(ctx sdk.Context) evmtypes.Params
+	Code(goCtx context.Context, req *evmtypes.QueryCodeRequest) (*evmtypes.QueryCodeResponse, error)
 
 	// to replay the messages
 	EthereumTx(goCtx context.Context, msg *evmtypes.MsgEthereumTx) (*evmtypes.MsgEthereumTxResponse, error)

@@ -1,0 +1,824 @@
+package mempool
+
+import (
+	"context"
+	"errors"
+	"strconv"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	abci "github.com/cometbft/cometbft/abci/types"
+	dbm "github.com/cosmos/cosmos-db"
+	protov2 "google.golang.org/protobuf/proto"
+
+	errorsmod "cosmossdk.io/errors"
+	"cosmossdk.io/log/v2"
+
+	"github.com/cosmos/cosmos-sdk/baseapp"
+	storetypes "github.com/cosmos/cosmos-sdk/store/v2/types"
+	sdk "github.com/cosmos/cosmos-sdk/types"
+	sdkmempool "github.com/cosmos/cosmos-sdk/types/mempool"
+)
+
+// ptrTx is a minimal pointer-typed sdk.Tx. EncoderCache keys on the sdk.Tx
+// interface value, which for pointer types is pointer equality, so a pointer
+// receiver is needed. The id field gives it non-zero size so distinct
+// allocations get distinct addresses (zero-size structs share runtime.zerobase).
+type ptrTx struct {
+	id      int
+	timeout uint64 // GetTimeoutHeight; 0 = no timeout
+}
+
+func (*ptrTx) GetMsgs() []sdk.Msg                    { return nil }
+func (*ptrTx) GetMsgsV2() ([]protov2.Message, error) { return nil, nil }
+func (t *ptrTx) GetTimeoutHeight() uint64            { return t.timeout }
+
+// noopEncoder is a non-nil txEncoder for tests that don't assert on bytes.
+var noopEncoder sdk.TxEncoder = func(sdk.Tx) ([]byte, error) { return nil, nil }
+
+// stubRunner is a test double for txRunner.
+type stubRunner struct {
+	runTx func([]byte) error
+	calls atomic.Int64
+}
+
+func (s *stubRunner) RunTx(mode sdk.ExecMode, txBytes []byte, tx sdk.Tx, txIndex int, ms storetypes.MultiStore, cache map[string]any) (sdk.GasInfo, *sdk.Result, []abci.Event, error) {
+	s.calls.Add(1)
+	if s.runTx != nil {
+		return sdk.GasInfo{}, nil, nil, s.runTx(txBytes)
+	}
+	return sdk.GasInfo{}, &sdk.Result{}, nil, nil
+}
+
+func insertHandler(runner txRunner) sdk.InsertTxHandler {
+	return newManager(runner, nil, noopEncoder, nil).InsertTxHandler()
+}
+
+func TestInsertTxHandler_AcceptsValidTx(t *testing.T) {
+	runner := &stubRunner{}
+	h := insertHandler(runner)
+
+	resp, err := h(&abci.RequestInsertTx{Tx: []byte("good-tx")})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if resp.Code != abci.CodeTypeOK {
+		t.Fatalf("expected CodeTypeOK, got %d", resp.Code)
+	}
+	if runner.calls.Load() != 1 {
+		t.Fatalf("expected 1 RunTx call, got %d", runner.calls.Load())
+	}
+}
+
+func TestInsertTxHandler_RejectsInvalidTx(t *testing.T) {
+	anteErr := errorsmod.Register("test", 1, "bad sig")
+	runner := &stubRunner{runTx: func(_ []byte) error { return anteErr }}
+	h := insertHandler(runner)
+
+	resp, err := h(&abci.RequestInsertTx{Tx: []byte("bad-tx")})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if resp.Code == abci.CodeTypeOK {
+		t.Fatal("expected non-OK code for rejected tx")
+	}
+}
+
+func TestInsertTxHandler_RetryOnMempoolFull(t *testing.T) {
+	runner := &stubRunner{runTx: func(_ []byte) error {
+		return sdkmempool.ErrMempoolTxMaxCapacity
+	}}
+	h := insertHandler(runner)
+
+	resp, err := h(&abci.RequestInsertTx{Tx: []byte("any-tx")})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if resp.Code != abci.CodeTypeRetry {
+		t.Fatalf("expected CodeTypeRetry, got %d", resp.Code)
+	}
+}
+
+func TestInsertTxHandler_ExecModeIsCheck(t *testing.T) {
+	var capturedMode sdk.ExecMode
+	var captureRunner captureExecModeRunner
+	captureRunner.mode = &capturedMode
+	h := insertHandler(&captureRunner)
+
+	h(&abci.RequestInsertTx{Tx: []byte("tx")}) //nolint:errcheck
+
+	if capturedMode != sdk.ExecModeCheck {
+		t.Fatalf("expected ExecModeCheck, got %v", capturedMode)
+	}
+}
+
+type captureExecModeRunner struct {
+	mode *sdk.ExecMode
+}
+
+func (r *captureExecModeRunner) RunTx(mode sdk.ExecMode, _ []byte, _ sdk.Tx, _ int, _ storetypes.MultiStore, _ map[string]any) (sdk.GasInfo, *sdk.Result, []abci.Event, error) {
+	*r.mode = mode
+	return sdk.GasInfo{}, &sdk.Result{}, nil, nil
+}
+
+func TestInsertTxHandler_RetryOnWrappedMempoolFull(t *testing.T) {
+	runner := &stubRunner{runTx: func(_ []byte) error {
+		return errors.Join(errors.New("outer"), sdkmempool.ErrMempoolTxMaxCapacity)
+	}}
+	h := insertHandler(runner)
+
+	resp, _ := h(&abci.RequestInsertTx{Tx: []byte("tx")})
+	if resp.Code != abci.CodeTypeRetry {
+		t.Fatalf("expected CodeTypeRetry for wrapped ErrMempoolTxMaxCapacity, got %d", resp.Code)
+	}
+}
+
+func assertPanics(t *testing.T, name string, fn func()) {
+	t.Helper()
+	defer func() {
+		if recover() == nil {
+			t.Fatalf("%s: expected panic, got none", name)
+		}
+	}()
+	fn()
+}
+
+func TestNewManager_PanicsOnMissingDeps(t *testing.T) {
+	enc := NewEncoderCache(0, 0)
+	noopDecoder := func([]byte) (sdk.Tx, error) { return &ptrTx{}, nil }
+
+	assertPanics(t, "nil txEncoder with encCache", func() {
+		newManager(&stubRunner{}, enc, nil, noopDecoder)
+	})
+	assertPanics(t, "nil decoder with encCache", func() {
+		newManager(&stubRunner{}, enc, noopEncoder, nil)
+	})
+}
+
+func TestInsertTxHandler_RegistersCanonicalBytes(t *testing.T) {
+	runner := &stubRunner{}
+	tx := &ptrTx{}
+	raw := []byte("non-canonical-gossip-bytes")
+	canonical := []byte("canonical")
+
+	decoder := func(bz []byte) (sdk.Tx, error) {
+		if string(bz) != string(raw) {
+			t.Fatalf("decoder got %q, want raw req.Tx %q", bz, raw)
+		}
+		return tx, nil
+	}
+	txEncoder := func(got sdk.Tx) ([]byte, error) {
+		if got != sdk.Tx(tx) {
+			t.Fatal("txEncoder called with a tx other than the one decoder returned")
+		}
+		return canonical, nil
+	}
+	enc := NewEncoderCache(0, 0)
+	h := newManager(runner, enc, txEncoder, decoder).InsertTxHandler()
+
+	resp, err := h(&abci.RequestInsertTx{Tx: raw})
+	if err != nil || resp.Code != abci.CodeTypeOK {
+		t.Fatalf("admit failed: code=%d err=%v", resp.Code, err)
+	}
+	got, ok := enc.Get(tx)
+	if !ok {
+		t.Fatal("admitted tx was not registered in encCache")
+	}
+	if string(got) != string(canonical) {
+		t.Fatalf("registered %q, want canonical bytes %q (raw must not be stored)", got, canonical)
+	}
+}
+
+func TestInsertTxHandler_RegistersRawBytesOnEncoderError(t *testing.T) {
+	runner := &stubRunner{}
+	tx := &ptrTx{}
+	raw := []byte("raw-bytes")
+
+	decoder := func([]byte) (sdk.Tx, error) { return tx, nil }
+	txEncoder := func(sdk.Tx) ([]byte, error) { return nil, errors.New("encode fail") }
+	enc := NewEncoderCache(0, 0)
+	h := newManager(runner, enc, txEncoder, decoder).InsertTxHandler()
+
+	if _, err := h(&abci.RequestInsertTx{Tx: raw}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	got, ok := enc.Get(tx)
+	if !ok || string(got) != string(raw) {
+		t.Fatalf("expected raw fallback %q, got %q (ok=%v)", raw, got, ok)
+	}
+}
+
+func TestInsertTxHandler_NoRegisterOnReject(t *testing.T) {
+	anteErr := errorsmod.Register("test-encreg", 1, "bad sig")
+	runner := &stubRunner{runTx: func([]byte) error { return anteErr }}
+	tx := &ptrTx{}
+
+	decoder := func([]byte) (sdk.Tx, error) { return tx, nil }
+	txEncoder := func(sdk.Tx) ([]byte, error) { return []byte("x"), nil }
+	enc := NewEncoderCache(0, 0)
+	h := newManager(runner, enc, txEncoder, decoder).InsertTxHandler()
+
+	if _, err := h(&abci.RequestInsertTx{Tx: []byte("bad")}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if _, ok := enc.Get(tx); ok {
+		t.Fatal("rejected tx must not be registered in encCache")
+	}
+}
+
+// raceRunner models the real txRunner: RunTx mutates shared, non-thread-safe
+// state (a plain Go map, standing in for baseapp's checkState multistore) with
+// NO internal lock, so the Manager MUST serialize admission. Run under -race
+// to expose a missing mutex.
+type raceRunner struct {
+	state map[string]struct{} // intentionally lock-free
+}
+
+func (r *raceRunner) RunTx(_ sdk.ExecMode, txBytes []byte, _ sdk.Tx, _ int, _ storetypes.MultiStore, _ map[string]any) (sdk.GasInfo, *sdk.Result, []abci.Event, error) {
+	// Unsynchronized read+write, mirroring cacheTxContext + msCache.Write into
+	// the shared checkState. Safe only because the Manager holds its mutex.
+	r.state[string(txBytes)] = struct{}{}
+	return sdk.GasInfo{}, &sdk.Result{}, nil, nil
+}
+
+func TestInsertTxHandler_ConcurrentAdmissionIsSerialized(t *testing.T) {
+	runner := &raceRunner{state: make(map[string]struct{})}
+	h := insertHandler(runner)
+
+	const goroutines = 16
+	const perG = 64
+	var wg sync.WaitGroup
+	wg.Add(goroutines)
+	for g := range goroutines {
+		go func(g int) {
+			defer wg.Done()
+			for i := range perG {
+				tx := []byte(strconv.Itoa(g) + ":" + strconv.Itoa(i))
+				if _, err := h(&abci.RequestInsertTx{Tx: tx}); err != nil {
+					t.Errorf("g%d i%d: unexpected error: %v", g, i, err)
+					return
+				}
+			}
+		}(g)
+	}
+	wg.Wait()
+
+	if got := len(runner.state); got != goroutines*perG {
+		t.Fatalf("expected %d distinct txs admitted, got %d", goroutines*perG, got)
+	}
+}
+
+func TestCheckTxHandler_MapsSuccess(t *testing.T) {
+	a := newManager(&stubRunner{}, nil, noopEncoder, nil)
+	check := a.CheckTxHandler()
+
+	runTx := func([]byte, sdk.Tx) (sdk.GasInfo, *sdk.Result, []abci.Event, error) {
+		return sdk.GasInfo{GasWanted: 100, GasUsed: 42}, &sdk.Result{Log: "ok", Data: []byte("d")}, nil, nil
+	}
+	resp, err := check(runTx, &abci.RequestCheckTx{Tx: []byte("tx")})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if resp.Code != abci.CodeTypeOK {
+		t.Fatalf("expected CodeTypeOK, got %d", resp.Code)
+	}
+	if resp.GasWanted != 100 || resp.GasUsed != 42 {
+		t.Fatalf("gas mismatch: wanted=%d used=%d", resp.GasWanted, resp.GasUsed)
+	}
+	if resp.Log != "ok" || string(resp.Data) != "d" {
+		t.Fatalf("log/data mismatch: log=%q data=%q", resp.Log, resp.Data)
+	}
+}
+
+func TestCheckTxHandler_InvalidatesPendingCache(t *testing.T) {
+	a := newManager(&stubRunner{}, nil, noopEncoder, nil)
+	check := a.CheckTxHandler()
+	before := a.pendingTxCache.epoch.Load()
+
+	runTx := func([]byte, sdk.Tx) (sdk.GasInfo, *sdk.Result, []abci.Event, error) {
+		return sdk.GasInfo{}, &sdk.Result{}, nil, nil
+	}
+	resp, err := check(runTx, &abci.RequestCheckTx{Tx: []byte("tx")})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if resp.Code != abci.CodeTypeOK {
+		t.Fatalf("expected CodeTypeOK, got %d", resp.Code)
+	}
+	if got := a.pendingTxCache.epoch.Load(); got != before+1 {
+		t.Fatalf("CheckTxHandler must invalidate the pending cache without waiting for a block boundary; epoch %d -> %d", before, got)
+	}
+}
+
+func TestCheckTxHandler_MapsError(t *testing.T) {
+	a := newManager(&stubRunner{}, nil, noopEncoder, nil)
+	check := a.CheckTxHandler()
+
+	anteErr := errorsmod.Register("test-check", 1, "bad sig")
+	runTx := func([]byte, sdk.Tx) (sdk.GasInfo, *sdk.Result, []abci.Event, error) {
+		return sdk.GasInfo{}, nil, nil, anteErr
+	}
+	resp, err := check(runTx, &abci.RequestCheckTx{Tx: []byte("bad")})
+	if err != nil {
+		t.Fatalf("handler must not surface a transport error, got %v", err)
+	}
+	if resp.Code == abci.CodeTypeOK {
+		t.Fatal("expected non-OK code for rejected tx")
+	}
+}
+
+func TestCheckTxHandler_RegistersCanonicalBytes(t *testing.T) {
+	tx := &ptrTx{}
+	raw := []byte("rpc-gossip-bytes")
+	canonical := []byte("canonical")
+
+	decoder := func(bz []byte) (sdk.Tx, error) {
+		if string(bz) != string(raw) {
+			t.Fatalf("decoder got %q, want %q", bz, raw)
+		}
+		return tx, nil
+	}
+	txEncoder := func(sdk.Tx) ([]byte, error) { return canonical, nil }
+	enc := NewEncoderCache(0, 0)
+	a := newManager(&stubRunner{}, enc, txEncoder, decoder)
+	check := a.CheckTxHandler()
+
+	runTx := func([]byte, sdk.Tx) (sdk.GasInfo, *sdk.Result, []abci.Event, error) {
+		return sdk.GasInfo{}, &sdk.Result{}, nil, nil
+	}
+	if _, err := check(runTx, &abci.RequestCheckTx{Tx: raw}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	got, ok := enc.Get(tx)
+	if !ok {
+		t.Fatal("RPC-admitted tx was not registered in encCache")
+	}
+	if string(got) != string(canonical) {
+		t.Fatalf("registered %q, want canonical %q", got, canonical)
+	}
+}
+
+func TestCheckTxHandler_NoRegisterOnReject(t *testing.T) {
+	tx := &ptrTx{}
+	decoder := func([]byte) (sdk.Tx, error) { return tx, nil }
+	enc := NewEncoderCache(0, 0)
+	a := newManager(&stubRunner{}, enc, noopEncoder, decoder)
+	check := a.CheckTxHandler()
+
+	anteErr := errorsmod.Register("test-check-rej", 1, "bad")
+	runTx := func([]byte, sdk.Tx) (sdk.GasInfo, *sdk.Result, []abci.Event, error) {
+		return sdk.GasInfo{}, nil, nil, anteErr
+	}
+	if _, err := check(runTx, &abci.RequestCheckTx{Tx: []byte("bad")}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if _, ok := enc.Get(tx); ok {
+		t.Fatal("rejected tx must not be registered")
+	}
+}
+
+func TestManager_InsertAndCheckShareMutex(t *testing.T) {
+	runner := &raceRunner{state: make(map[string]struct{})}
+	a := newManager(runner, nil, noopEncoder, nil)
+	insert := a.InsertTxHandler()
+	check := a.CheckTxHandler()
+
+	// CheckTx's runTx closure mirrors BaseApp: it drives the same lock-free
+	// runner/state that InsertTx writes through a.runner.
+	runTx := func(txBytes []byte, _ sdk.Tx) (sdk.GasInfo, *sdk.Result, []abci.Event, error) {
+		return runner.RunTx(sdk.ExecModeCheck, txBytes, nil, -1, nil, nil)
+	}
+
+	const goroutines = 16
+	const perG = 64
+	var wg sync.WaitGroup
+	wg.Add(goroutines)
+	for g := range goroutines {
+		go func(g int) {
+			defer wg.Done()
+			for i := range perG {
+				tx := []byte(strconv.Itoa(g) + ":" + strconv.Itoa(i))
+				var err error
+				if g%2 == 0 {
+					_, err = insert(&abci.RequestInsertTx{Tx: tx})
+				} else {
+					_, err = check(runTx, &abci.RequestCheckTx{Tx: tx})
+				}
+				if err != nil {
+					t.Errorf("g%d i%d: unexpected error: %v", g, i, err)
+					return
+				}
+			}
+		}(g)
+	}
+	wg.Wait()
+
+	if got := len(runner.state); got != goroutines*perG {
+		t.Fatalf("expected %d distinct txs, got %d", goroutines*perG, got)
+	}
+}
+
+func TestManager_AdmissionMutexGatesAdmission(t *testing.T) {
+	a := newManager(&stubRunner{}, nil, noopEncoder, nil)
+	insert := a.InsertTxHandler()
+	mu := a.AdmissionMutex()
+
+	mu.Lock() // simulate App.Commit holding the admission mutex
+	admitted := make(chan struct{})
+	go func() {
+		insert(&abci.RequestInsertTx{Tx: []byte("tx")}) //nolint:errcheck
+		close(admitted)
+	}()
+
+	select {
+	case <-admitted:
+		t.Fatal("admission ran while AdmissionMutex held; Commit would race checkState")
+	case <-time.After(50 * time.Millisecond):
+		// expected: admission blocked behind the mutex
+	}
+
+	mu.Unlock()
+	select {
+	case <-admitted:
+		// admission proceeds once Commit releases the mutex
+	case <-time.After(time.Second):
+		t.Fatal("admission did not proceed after AdmissionMutex released")
+	}
+}
+
+func BenchmarkInsertTxHandler_Admit(b *testing.B) {
+	runner := &stubRunner{}
+	h := insertHandler(runner)
+
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := range b.N {
+		tx := make([]byte, 32)
+		tx[0] = byte(i)
+		tx[1] = byte(i >> 8)
+		h(&abci.RequestInsertTx{Tx: tx}) //nolint:errcheck
+	}
+}
+
+func TestManagerInsertTx_AcceptsValidTx(t *testing.T) {
+	runner := &stubRunner{}
+	a := newManager(runner, nil, noopEncoder, nil)
+
+	resp, _ := a.InsertTx([]byte("good-tx"))
+	if resp.Code != abci.CodeTypeOK {
+		t.Fatalf("expected CodeTypeOK, got %d (codespace=%q log=%q)", resp.Code, resp.Codespace, resp.RawLog)
+	}
+	if resp.Codespace != "" || resp.RawLog != "" {
+		t.Fatalf("expected empty codespace/log on success, got %q/%q", resp.Codespace, resp.RawLog)
+	}
+	if runner.calls.Load() != 1 {
+		t.Fatalf("expected 1 RunTx call, got %d", runner.calls.Load())
+	}
+}
+
+func TestManagerInsertTx_RejectsInvalidTx(t *testing.T) {
+	anteErr := errorsmod.Register("test-inserttx-rej", 1, "bad sig")
+	runner := &stubRunner{runTx: func([]byte) error { return anteErr }}
+	a := newManager(runner, nil, noopEncoder, nil)
+
+	resp, _ := a.InsertTx([]byte("bad-tx"))
+	if resp.Code == abci.CodeTypeOK {
+		t.Fatal("expected non-OK code for rejected tx")
+	}
+	if resp.Codespace == "" || resp.RawLog == "" {
+		t.Fatalf("expected codespace+log on reject, got %q/%q", resp.Codespace, resp.RawLog)
+	}
+}
+
+func TestManagerInsertTx_RetryOnMempoolFull(t *testing.T) {
+	runner := &stubRunner{runTx: func([]byte) error { return sdkmempool.ErrMempoolTxMaxCapacity }}
+	a := newManager(runner, nil, noopEncoder, nil)
+
+	resp, _ := a.InsertTx([]byte("any-tx"))
+	if resp.Code != abci.CodeTypeRetry {
+		t.Fatalf("expected CodeTypeRetry, got %d", resp.Code)
+	}
+	if resp.RawLog != "mempool is full" {
+		t.Fatalf("expected back-pressure log, got %q", resp.RawLog)
+	}
+}
+
+func TestManagerInsertTx_RetryOnWrappedMempoolFull(t *testing.T) {
+	runner := &stubRunner{runTx: func([]byte) error {
+		return errors.Join(errors.New("outer"), sdkmempool.ErrMempoolTxMaxCapacity)
+	}}
+	a := newManager(runner, nil, noopEncoder, nil)
+
+	if resp, _ := a.InsertTx([]byte("tx")); resp.Code != abci.CodeTypeRetry {
+		t.Fatalf("expected CodeTypeRetry for wrapped ErrMempoolTxMaxCapacity, got %d", resp.Code)
+	}
+}
+
+func TestManagerInsertTx_InvalidatesPendingCache(t *testing.T) {
+	a := newManager(&stubRunner{}, nil, noopEncoder, nil)
+	before := a.pendingTxCache.epoch.Load()
+
+	if resp, _ := a.InsertTx([]byte("tx")); resp.Code != abci.CodeTypeOK {
+		t.Fatalf("expected CodeTypeOK, got %d", resp.Code)
+	}
+	if got := a.pendingTxCache.epoch.Load(); got != before+1 {
+		t.Fatalf("admit must invalidate the pending cache without waiting for a block boundary; epoch %d -> %d", before, got)
+	}
+}
+
+func TestManagerInsertTx_RegistersCanonicalBytes(t *testing.T) {
+	runner := &stubRunner{}
+	tx := &ptrTx{}
+	raw := []byte("non-canonical-rpc-bytes")
+	canonical := []byte("canonical")
+
+	decoder := func([]byte) (sdk.Tx, error) { return tx, nil }
+	txEncoder := func(sdk.Tx) ([]byte, error) { return canonical, nil }
+	enc := NewEncoderCache(0, 0)
+	a := newManager(runner, enc, txEncoder, decoder)
+
+	if resp, _ := a.InsertTx(raw); resp.Code != abci.CodeTypeOK {
+		t.Fatalf("admit failed: code=%d", resp.Code)
+	}
+	got, ok := enc.Get(tx)
+	if !ok || string(got) != string(canonical) {
+		t.Fatalf("expected canonical %q registered, got %q (ok=%v)", canonical, got, ok)
+	}
+}
+
+func TestManagerInsertTx_NoRegisterOnReject(t *testing.T) {
+	anteErr := errorsmod.Register("test-inserttx-encreg", 1, "bad sig")
+	runner := &stubRunner{runTx: func([]byte) error { return anteErr }}
+	tx := &ptrTx{}
+	decoder := func([]byte) (sdk.Tx, error) { return tx, nil }
+	txEncoder := func(sdk.Tx) ([]byte, error) { return []byte("x"), nil }
+	enc := NewEncoderCache(0, 0)
+	a := newManager(runner, enc, txEncoder, decoder)
+
+	if resp, _ := a.InsertTx([]byte("bad")); resp.Code == abci.CodeTypeOK {
+		t.Fatal("expected non-OK code")
+	}
+	if _, ok := enc.Get(tx); ok {
+		t.Fatal("rejected tx must not be registered in encCache")
+	}
+}
+
+// TestManagerInsertTx_SharesAdmitWithHandler proves the RPC InsertTx and the
+// gossip InsertTxHandler run the same admission body under one mutex: both drive
+// the lock-free raceRunner concurrently, which -race flags if a path skips a.mu.
+func TestManagerInsertTx_SharesAdmitWithHandler(t *testing.T) {
+	runner := &raceRunner{state: make(map[string]struct{})}
+	a := newManager(runner, nil, noopEncoder, nil)
+	insert := a.InsertTxHandler()
+
+	const goroutines = 16
+	const perG = 64
+	var wg sync.WaitGroup
+	wg.Add(goroutines)
+	for g := range goroutines {
+		go func(g int) {
+			defer wg.Done()
+			for i := range perG {
+				tx := []byte(strconv.Itoa(g) + ":" + strconv.Itoa(i))
+				if g%2 == 0 {
+					if _, err := insert(&abci.RequestInsertTx{Tx: tx}); err != nil {
+						t.Errorf("g%d i%d: gossip insert error: %v", g, i, err)
+						return
+					}
+				} else if resp, _ := a.InsertTx(tx); resp.Code != abci.CodeTypeOK {
+					t.Errorf("g%d i%d: rpc insert code=%d", g, i, resp.Code)
+					return
+				}
+			}
+		}(g)
+	}
+	wg.Wait()
+
+	if got := len(runner.state); got != goroutines*perG {
+		t.Fatalf("expected %d distinct txs admitted, got %d", goroutines*perG, got)
+	}
+}
+
+// fakePool is a minimal ExtMempool: PoolSnapshot iterates it via SelectBy.
+type fakePool struct{ txs []sdk.Tx }
+
+func (p *fakePool) Insert(context.Context, sdk.Tx) error                 { return nil }
+func (p *fakePool) Select(context.Context, [][]byte) sdkmempool.Iterator { return nil }
+func (p *fakePool) CountTx() int                                         { return len(p.txs) }
+func (p *fakePool) Remove(sdk.Tx) error                                  { return nil }
+func (p *fakePool) RemoveWithReason(context.Context, sdk.Tx, sdkmempool.RemoveReason) error {
+	return nil
+}
+
+func (p *fakePool) SelectBy(_ context.Context, _ [][]byte, cb func(sdk.Tx) bool) {
+	for _, tx := range p.txs {
+		if !cb(tx) {
+			return
+		}
+	}
+}
+
+func (p *fakePool) UnorderedTxs(context.Context) []sdk.Tx {
+	txs := make([]sdk.Tx, len(p.txs))
+	copy(txs, p.txs)
+	return txs
+}
+
+func TestManagerPendingTxs(t *testing.T) {
+	a := newManager(&stubRunner{}, nil, noopEncoder, nil)
+	if got := a.PendingTxs(); got != nil {
+		t.Fatalf("nil mpool must report no pending txs, got %d", len(got))
+	}
+
+	tx1, tx2 := &ptrTx{}, &ptrTx{}
+	a.mpool = &fakePool{txs: []sdk.Tx{tx1, tx2}}
+
+	got := a.PendingTxs()
+	if len(got) != 2 || got[0] != tx1 || got[1] != tx2 {
+		t.Fatalf("want both pool txs, got %d", len(got))
+	}
+}
+
+func newCachedManager(enabled bool, pool *fakePool) *Manager {
+	a := newManager(&stubRunner{}, nil, noopEncoder, nil)
+	a.pendingTxCache.enabled = enabled
+	a.mpool = pool
+	return a
+}
+
+func TestManagerPendingTxsCache(t *testing.T) {
+	tx1, tx2 := &ptrTx{id: 1}, &ptrTx{id: 2}
+
+	t.Run("nil mpool ignores cache", func(t *testing.T) {
+		a := newCachedManager(true, nil)
+		a.mpool = nil
+		if got := a.PendingTxs(); got != nil {
+			t.Fatalf("nil mpool must report no pending txs regardless of cache, got %d", len(got))
+		}
+	})
+
+	t.Run("hit until invalidated", func(t *testing.T) {
+		pool := &fakePool{txs: []sdk.Tx{tx1}}
+		a := newCachedManager(true, pool)
+
+		if got := a.PendingTxs(); len(got) != 1 || got[0] != tx1 {
+			t.Fatalf("want [tx1], got %d", len(got))
+		}
+		pool.txs = append(pool.txs, tx2)
+		if got := a.PendingTxs(); len(got) != 1 || got[0] != tx1 {
+			t.Fatalf("expected stale cached snapshot [tx1], got %d entries", len(got))
+		}
+	})
+
+	t.Run("empty pool caches", func(t *testing.T) {
+		pool := &fakePool{}
+		a := newCachedManager(true, pool)
+
+		if got := a.PendingTxs(); len(got) != 0 {
+			t.Fatalf("want empty snapshot, got %d", len(got))
+		}
+		pool.txs = []sdk.Tx{tx1}
+		if got := a.PendingTxs(); len(got) != 0 {
+			t.Fatalf("empty snapshot must still be a cache hit, got %d", len(got))
+		}
+	})
+
+	t.Run("block boundary invalidates", func(t *testing.T) {
+		pool := &fakePool{txs: []sdk.Tx{tx1}}
+		a := newCachedManager(true, pool)
+
+		if got := a.PendingTxs(); len(got) != 1 {
+			t.Fatalf("want 1 tx, got %d", len(got))
+		}
+		pool.txs = append(pool.txs, tx2)
+		a.StageRecheckSenders(1, nil)
+		if got := a.PendingTxs(); len(got) != 2 {
+			t.Fatalf("expected re-scan after commit invalidation, got %d", len(got))
+		}
+	})
+
+	t.Run("invalidation during load is not swallowed", func(t *testing.T) {
+		pool := &hookPool{fakePool: fakePool{txs: []sdk.Tx{tx1}}}
+		a := newCachedManager(true, nil)
+		a.mpool = pool
+		// A block committing while the walk is in flight: the snapshot it produces
+		// already predates the invalidation.
+		pool.onScan = func() { a.StageRecheckSenders(1, nil) }
+
+		if got := a.PendingTxs(); len(got) != 1 {
+			t.Fatalf("want 1 tx, got %d", len(got))
+		}
+		pool.txs = append(pool.txs, tx2)
+		if got := a.PendingTxs(); len(got) != 2 {
+			t.Fatalf("snapshot loaded across an invalidation must not be served, got %d", len(got))
+		}
+	})
+
+	t.Run("disabled cache always re-scans", func(t *testing.T) {
+		pool := &fakePool{txs: []sdk.Tx{tx1}}
+		a := newCachedManager(false, pool)
+
+		if got := a.PendingTxs(); len(got) != 1 {
+			t.Fatalf("want 1 tx, got %d", len(got))
+		}
+		pool.txs = append(pool.txs, tx2)
+		if got := a.PendingTxs(); len(got) != 2 {
+			t.Fatalf("disabled cache must re-scan every call, got %d", len(got))
+		}
+	})
+}
+
+func TestManagerPendingTxsSingleFlight(t *testing.T) {
+	var loads atomic.Int64
+	pool := &countingPool{fakePool: fakePool{txs: []sdk.Tx{&ptrTx{id: 1}, &ptrTx{id: 2}}}, scans: &loads}
+	a := newCachedManager(true, nil)
+	a.mpool = pool
+
+	const goroutines = 16
+	var wg sync.WaitGroup
+	wg.Add(goroutines)
+	for range goroutines {
+		go func() {
+			defer wg.Done()
+			for range 64 {
+				if got := a.PendingTxs(); len(got) != 2 {
+					t.Errorf("want 2 txs, got %d", len(got))
+				}
+			}
+		}()
+	}
+	wg.Wait()
+
+	if got := loads.Load(); got != 1 {
+		t.Fatalf("expected concurrent callers to single-flight onto 1 pool scan, got %d", got)
+	}
+}
+
+// countingPool counts pool scans, to distinguish cache hits from re-walks.
+type countingPool struct {
+	fakePool
+	scans *atomic.Int64
+}
+
+func (p *countingPool) SelectBy(ctx context.Context, txs [][]byte, cb func(sdk.Tx) bool) {
+	p.scans.Add(1)
+	p.fakePool.SelectBy(ctx, txs, cb)
+}
+
+func (p *countingPool) UnorderedTxs(ctx context.Context) []sdk.Tx {
+	p.scans.Add(1)
+	return p.fakePool.UnorderedTxs(ctx)
+}
+
+// hookPool runs onScan once, mid-walk, to interleave an event with a pool scan.
+type hookPool struct {
+	fakePool
+	onScan func()
+}
+
+func (p *hookPool) SelectBy(ctx context.Context, txs [][]byte, cb func(sdk.Tx) bool) {
+	if p.onScan != nil {
+		hook := p.onScan
+		p.onScan = nil
+		hook()
+	}
+	p.fakePool.SelectBy(ctx, txs, cb)
+}
+
+func (p *hookPool) UnorderedTxs(ctx context.Context) []sdk.Tx {
+	if p.onScan != nil {
+		hook := p.onScan
+		p.onScan = nil
+		hook()
+	}
+	return p.fakePool.UnorderedTxs(ctx)
+}
+
+func TestNewManagerWiresPendingCache(t *testing.T) {
+	var scans atomic.Int64
+	pool := &countingPool{fakePool: fakePool{txs: []sdk.Tx{&ptrTx{id: 1}}}, scans: &scans}
+	app := baseapp.NewBaseApp("test", log.NewNopLogger(), dbm.NewMemDB(), nil)
+
+	a := NewManager(app, nil, noopEncoder, pool, nil, nil, 0, 0, true, true)
+	defer a.Close()
+
+	a.PendingTxs()
+	a.PendingTxs()
+	if got := scans.Load(); got != 1 {
+		t.Fatalf("NewManager must wire the pending cache; want 1 pool scan, got %d", got)
+	}
+}
+
+func TestManagerCountTx(t *testing.T) {
+	a := newManager(&stubRunner{}, nil, noopEncoder, nil)
+	if got := a.CountTx(); got != 0 {
+		t.Fatalf("nil mpool must report 0, got %d", got)
+	}
+
+	a.mpool = &fakePool{txs: []sdk.Tx{&ptrTx{}, &ptrTx{}, &ptrTx{}}}
+	if got := a.CountTx(); got != 3 {
+		t.Fatalf("want 3, got %d", got)
+	}
+}

@@ -1,10 +1,10 @@
 package middleware
 
 import (
-	transferTypes "github.com/cosmos/ibc-go/v10/modules/apps/transfer/types"
-	channeltypes "github.com/cosmos/ibc-go/v10/modules/core/04-channel/types"
-	porttypes "github.com/cosmos/ibc-go/v10/modules/core/05-port/types"
-	"github.com/cosmos/ibc-go/v10/modules/core/exported"
+	transferTypes "github.com/cosmos/ibc-go/v11/modules/apps/transfer/types"
+	channeltypes "github.com/cosmos/ibc-go/v11/modules/core/04-channel/types"
+	porttypes "github.com/cosmos/ibc-go/v11/modules/core/05-port/types"
+	"github.com/cosmos/ibc-go/v11/modules/core/exported"
 	cronoskeeper "github.com/crypto-org-chain/cronos/x/cronos/keeper"
 
 	"cosmossdk.io/errors"
@@ -26,6 +26,16 @@ func NewIBCConversionModule(app porttypes.IBCModule, ck cronoskeeper.Keeper) IBC
 		app:          app,
 		cronoskeeper: ck,
 	}
+}
+
+// SetICS4Wrapper implements porttypes.IBCModule.SetICS4Wrapper (required by
+// ibc-go v11). IBCConversionModule does NOT implement porttypes.Middleware:
+// it omits ICS4Wrapper embedding and SetUnderlyingApplication, so it is
+// incompatible with IBCStackBuilder.Next which expects a full Middleware.
+// This method only forwards the wrapper to the underlying app; callers that
+// need full Middleware semantics must use a type that satisfies that interface.
+func (im IBCConversionModule) SetICS4Wrapper(wrapper porttypes.ICS4Wrapper) {
+	im.app.SetICS4Wrapper(wrapper)
 }
 
 // OnChanOpenInit implements the IBCModule interface
@@ -99,30 +109,40 @@ func (im IBCConversionModule) OnRecvPacket(
 	packet channeltypes.Packet,
 	relayer sdk.AccAddress,
 ) exported.Acknowledgement {
-	ack := im.app.OnRecvPacket(ctx, channelVersion, packet, relayer)
-	if ack.Success() {
-		data, err := transferTypes.UnmarshalPacketData(packet.GetData(), channelVersion, "")
-		if err != nil {
-			return channeltypes.NewErrorAcknowledgement(errors.Wrap(sdkerrors.ErrUnknownRequest,
-				"cannot unmarshal ICS-20 transfer packet data in middleware"))
-		}
-		denom := im.getIbcDenomFromPacketAndData(packet, data.Token)
-		// Check if it can be converted
-		if im.canBeConverted(ctx, denom) {
-			err = im.convertVouchers(
-				ctx,
+	cacheCtx, commit := ctx.CacheContext()
+	ack := im.app.OnRecvPacket(cacheCtx, channelVersion, packet, relayer)
+	if !ack.Success() {
+		// Underlying transfer failed: discard cacheCtx writes and return the
+		// failure ack. Committing would persist a half-applied transfer.
+		return ack
+	}
+	data, err := transferTypes.UnmarshalPacketData(packet.GetData(), channelVersion, "")
+	if err != nil {
+		return channeltypes.NewErrorAcknowledgement(errors.Wrap(sdkerrors.ErrUnknownRequest,
+			"cannot unmarshal ICS-20 transfer packet data in middleware"))
+	}
+	denom := im.getIbcDenomFromPacketAndData(packet, data.Token)
+	if im.canBeConverted(cacheCtx, denom) {
+		transferAmount, ok := sdkmath.NewIntFromString(data.Token.Amount)
+		if !ok {
+			return channeltypes.NewErrorAcknowledgement(errors.Wrapf(
+				transferTypes.ErrInvalidAmount,
+				"unable to parse transfer amount (%s) into sdk.Int in middleware",
 				data.Token.Amount,
-				data.Sender,
-				data.Receiver,
-				denom,
-				false,
+			))
+		}
+		token := sdk.NewCoin(denom, transferAmount)
+		if err := im.cronoskeeper.ConvertVouchersToEvmCoins(cacheCtx, data.Receiver, sdk.NewCoins(token)); err != nil {
+			im.cronoskeeper.Logger(ctx).Error(
+				"failed to convert vouchers on recv",
+				"denom", denom,
+				"receiver", data.Receiver,
+				"error", err,
 			)
-			if err != nil {
-				return channeltypes.NewErrorAcknowledgement(err)
-			}
+			return channeltypes.NewErrorAcknowledgement(err)
 		}
 	}
-
+	commit()
 	return ack
 }
 
@@ -149,14 +169,23 @@ func (im IBCConversionModule) OnAcknowledgementPacket(
 			}
 			denom := im.getIbcDenomFromDataForRefund(data.Token)
 			if im.canBeConverted(ctx, denom) {
-				return im.convertVouchers(
+				if err := im.convertVouchers(
 					ctx,
 					data.Token.Amount,
 					data.Sender,
 					data.Receiver,
 					denom,
 					true,
-				)
+				); err != nil {
+					// Intentional: log and continue so the IBC refund is not blocked.
+					// Sender keeps the refunded IBC vouchers and can retry conversion manually.
+					im.cronoskeeper.Logger(ctx).Error(
+						"failed to convert refund vouchers on acknowledgement",
+						"denom", denom,
+						"sender", data.Sender,
+						"error", err,
+					)
+				}
 			}
 		}
 	}
@@ -180,14 +209,23 @@ func (im IBCConversionModule) OnTimeoutPacket(
 		}
 		denom := im.getIbcDenomFromDataForRefund(data.Token)
 		if im.canBeConverted(ctx, denom) {
-			return im.convertVouchers(
+			if err := im.convertVouchers(
 				ctx,
 				data.Token.Amount,
 				data.Sender,
 				data.Receiver,
 				denom,
 				true,
-			)
+			); err != nil {
+				// Intentional: log and continue so the IBC refund is not blocked.
+				// Sender keeps the refunded IBC vouchers and can retry conversion manually.
+				im.cronoskeeper.Logger(ctx).Error(
+					"failed to convert refund vouchers on timeout",
+					"denom", denom,
+					"sender", data.Sender,
+					"error", err,
+				)
+			}
 		}
 
 	}
@@ -210,11 +248,9 @@ func (im IBCConversionModule) convertVouchers(
 	}
 	token := sdk.NewCoin(denom, transferAmount)
 	if isSender {
-		im.cronoskeeper.OnRecvVouchers(ctx, sdk.NewCoins(token), sender)
-	} else {
-		im.cronoskeeper.OnRecvVouchers(ctx, sdk.NewCoins(token), receiver)
+		return im.cronoskeeper.OnRecvVouchers(ctx, sdk.NewCoins(token), sender)
 	}
-	return nil
+	return im.cronoskeeper.OnRecvVouchers(ctx, sdk.NewCoins(token), receiver)
 }
 
 func (im IBCConversionModule) canBeConverted(ctx sdk.Context, denom string) bool {

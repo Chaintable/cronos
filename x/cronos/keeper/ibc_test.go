@@ -142,6 +142,27 @@ func (suite *KeeperTestSuite) TestConvertVouchersToEvmCoins() {
 	}
 }
 
+func (suite *KeeperTestSuite) TestConvertVouchersToEvmCoinsOverflow() {
+	privKey, err := ethsecp256k1.GenerateKey()
+	suite.Require().NoError(err)
+	address := sdk.AccAddress(privKey.PubKey().Address())
+
+	// 10^68 * 10^10 = 10^78, above the 256-bit ceiling of sdkmath.Int (~1.16*10^77),
+	// so the 8->18 decimal conversion overflows.
+	amount := sdkmath.NewIntFromBigInt(big.NewInt(0).Exp(big.NewInt(10), big.NewInt(68), nil))
+	coins := sdk.NewCoins(sdk.NewCoin(types.IbcCroDenomDefaultValue, amount))
+
+	suite.SetupTest()
+	suite.Require().NoError(suite.MintCoins(address, coins))
+
+	err = suite.app.CronosKeeper.ConvertVouchersToEvmCoins(suite.ctx, address.String(), coins)
+
+	suite.Require().ErrorIs(err, sdkmath.ErrIntOverflow)
+
+	suite.Require().Equal(amount, suite.GetBalance(address, types.IbcCroDenomDefaultValue).Amount)
+	suite.Require().True(suite.GetBalance(address, suite.evmParam.EvmDenom).Amount.IsZero())
+}
+
 func (suite *KeeperTestSuite) TestIbcTransferCoins() {
 	privKey, err := ethsecp256k1.GenerateKey()
 	suite.Require().NoError(err)
@@ -254,7 +275,8 @@ func (suite *KeeperTestSuite) TestIbcTransferCoins() {
 			"channel-0",
 			func() {
 				// Add support for the IBC token
-				suite.app.CronosKeeper.SetAutoContractForDenom(suite.ctx, "incorrect", common.HexToAddress("0x11"))
+				err := suite.app.CronosKeeper.SetAutoContractForDenom(suite.ctx, "incorrect", common.HexToAddress("0x11"))
+				suite.Require().NoError(err)
 			},
 			errors.New("the coin incorrect is neither an ibc voucher or a cronos token"),
 			func() {
@@ -271,7 +293,8 @@ func (suite *KeeperTestSuite) TestIbcTransferCoins() {
 				err := suite.MintCoins(address, sdk.NewCoins(sdk.NewCoin(CorrectIbcDenom, sdkmath.NewInt(123))))
 				suite.Require().NoError(err)
 				// Add support for the IBC token
-				suite.app.CronosKeeper.SetAutoContractForDenom(suite.ctx, CorrectIbcDenom, common.HexToAddress("0x11"))
+				err = suite.app.CronosKeeper.SetAutoContractForDenom(suite.ctx, CorrectIbcDenom, common.HexToAddress("0x11"))
+				suite.Require().NoError(err)
 			},
 			nil,
 			func() {
@@ -288,7 +311,8 @@ func (suite *KeeperTestSuite) TestIbcTransferCoins() {
 				err := suite.MintCoins(address, sdk.NewCoins(sdk.NewCoin(CorrectCronosDenom, sdkmath.NewInt(123))))
 				suite.Require().NoError(err)
 				// Add support for the IBC token
-				suite.app.CronosKeeper.SetAutoContractForDenom(suite.ctx, CorrectCronosDenom, common.HexToAddress("0x11"))
+				err = suite.app.CronosKeeper.SetAutoContractForDenom(suite.ctx, CorrectCronosDenom, common.HexToAddress("0xc1b37f2abdb778f540fa5db8e1fd2eadfc9a05ed"))
+				suite.Require().NoError(err)
 			},
 			errors.New("invalid channel id for ibc transfer of source token"),
 			func() {

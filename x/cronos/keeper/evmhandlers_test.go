@@ -19,8 +19,8 @@ import (
 )
 
 func (suite *KeeperTestSuite) TestSendToAccountHandler() {
-	contract := common.BigToAddress(big.NewInt(1))
-	recipient := common.BigToAddress(big.NewInt(3))
+	contract := common.BigToAddress(big.NewInt(0x101))
+	recipient := common.BigToAddress(big.NewInt(0x103))
 	var data []byte
 	var topics []common.Hash
 
@@ -55,7 +55,7 @@ func (suite *KeeperTestSuite) TestSendToAccountHandler() {
 				suite.Require().NoError(err)
 			},
 			func() {},
-			errors.New("contract 0x0000000000000000000000000000000000000001 is not connected to native token"),
+			errors.New("contract 0x0000000000000000000000000000000000000101 is not connected to native token"),
 		},
 		{
 			"success send to account",
@@ -106,8 +106,8 @@ func (suite *KeeperTestSuite) TestSendToAccountHandler() {
 }
 
 func (suite *KeeperTestSuite) TestSendToIbcHandler() {
-	contract := common.BigToAddress(big.NewInt(1))
-	sender := common.BigToAddress(big.NewInt(2))
+	contract := common.BigToAddress(big.NewInt(0x101))
+	sender := common.BigToAddress(big.NewInt(0x102))
 	invalidDenom := denom
 	validDenom := CorrectIbcDenom
 	var data []byte
@@ -140,7 +140,7 @@ func (suite *KeeperTestSuite) TestSendToIbcHandler() {
 				data = input
 			},
 			func() {},
-			errors.New("contract 0x0000000000000000000000000000000000000001 is not connected to native token"),
+			errors.New("contract 0x0000000000000000000000000000000000000101 is not connected to native token"),
 		},
 		{
 			"non IBC denom, expect fail",
@@ -165,7 +165,7 @@ func (suite *KeeperTestSuite) TestSendToIbcHandler() {
 				data = input
 			},
 			func() {},
-			errors.New("the native token associated with the contract 0x0000000000000000000000000000000000000001 is neither an ibc voucher or a cronos token"),
+			errors.New("the native token associated with the contract 0x0000000000000000000000000000000000000101 is neither an ibc voucher or a cronos token"),
 		},
 		{
 			"success send to ibc",
@@ -222,8 +222,8 @@ func (suite *KeeperTestSuite) TestSendToIbcHandler() {
 }
 
 func (suite *KeeperTestSuite) TestSendToIbcV2Handler() {
-	contract := common.BigToAddress(big.NewInt(1))
-	sender := common.BigToAddress(big.NewInt(2))
+	contract := common.BigToAddress(big.NewInt(0x101))
+	sender := common.BigToAddress(big.NewInt(0x102))
 	recipient := "recipient"
 	invalidDenom := denom
 	validDenom := CorrectIbcDenom
@@ -259,7 +259,7 @@ func (suite *KeeperTestSuite) TestSendToIbcV2Handler() {
 				data = input
 			},
 			func() {},
-			errors.New("contract 0x0000000000000000000000000000000000000001 is not connected to native token"),
+			errors.New("contract 0x0000000000000000000000000000000000000101 is not connected to native token"),
 		},
 		{
 			"non IBC denom, expect fail",
@@ -286,7 +286,7 @@ func (suite *KeeperTestSuite) TestSendToIbcV2Handler() {
 				data = input
 			},
 			func() {},
-			errors.New("the native token associated with the contract 0x0000000000000000000000000000000000000001 is neither an ibc voucher or a cronos token"),
+			errors.New("the native token associated with the contract 0x0000000000000000000000000000000000000101 is neither an ibc voucher or a cronos token"),
 		},
 		{
 			"success send to ibc",
@@ -345,8 +345,8 @@ func (suite *KeeperTestSuite) TestSendToIbcV2Handler() {
 }
 
 func (suite *KeeperTestSuite) TestSendCroToIbcHandler() {
-	contract := common.BigToAddress(big.NewInt(1))
-	sender := common.BigToAddress(big.NewInt(2))
+	contract := common.BigToAddress(big.NewInt(0x101))
+	sender := common.BigToAddress(big.NewInt(0x102))
 	var data []byte
 	var topics []common.Hash
 
@@ -357,8 +357,61 @@ func (suite *KeeperTestSuite) TestSendCroToIbcHandler() {
 		error     error
 	}{
 		{
+			"unauthorized contract (param not set), expect fail",
+			func() {
+				params := suite.app.CronosKeeper.GetParams(suite.ctx)
+				params.CroBridgeContractAddresses = []string{}
+				err := suite.app.CronosKeeper.SetParams(suite.ctx, params)
+				suite.Require().NoError(err)
+
+				coin := sdk.NewCoin(suite.evmParam.EvmDenom, sdkmath.NewInt(1230000000500))
+				err = suite.MintCoins(contract.Bytes(), sdk.NewCoins(coin))
+				suite.Require().NoError(err)
+				topics = []common.Hash{
+					evmhandlers.SendCroToIbcEvent.ID,
+				}
+				input, _ := evmhandlers.SendToIbcEvent.Inputs.NonIndexed().Pack(
+					sender,
+					"recipient",
+					coin.Amount.BigInt(),
+				)
+				data = input
+			},
+			func() {},
+			fmt.Errorf("contract %s is not authorized to use SendCroToIbc hook", contract),
+		},
+		{
+			"unauthorized contract (different address in param), expect fail",
+			func() {
+				params := suite.app.CronosKeeper.GetParams(suite.ctx)
+				params.CroBridgeContractAddresses = []string{common.BigToAddress(big.NewInt(0x999)).Hex()}
+				err := suite.app.CronosKeeper.SetParams(suite.ctx, params)
+				suite.Require().NoError(err)
+
+				coin := sdk.NewCoin(suite.evmParam.EvmDenom, sdkmath.NewInt(1230000000500))
+				err = suite.MintCoins(contract.Bytes(), sdk.NewCoins(coin))
+				suite.Require().NoError(err)
+				topics = []common.Hash{
+					evmhandlers.SendCroToIbcEvent.ID,
+				}
+				input, _ := evmhandlers.SendToIbcEvent.Inputs.NonIndexed().Pack(
+					sender,
+					"recipient",
+					coin.Amount.BigInt(),
+				)
+				data = input
+			},
+			func() {},
+			fmt.Errorf("contract %s is not authorized to use SendCroToIbc hook", contract),
+		},
+		{
 			"not enough balance, fail",
 			func() {
+				params := suite.app.CronosKeeper.GetParams(suite.ctx)
+				params.CroBridgeContractAddresses = []string{contract.Hex()}
+				err := suite.app.CronosKeeper.SetParams(suite.ctx, params)
+				suite.Require().NoError(err)
+
 				coin := sdk.NewCoin(suite.evmParam.EvmDenom, sdkmath.NewInt(10000000000000))
 				topics = []common.Hash{
 					evmhandlers.SendCroToIbcEvent.ID,
@@ -377,8 +430,13 @@ func (suite *KeeperTestSuite) TestSendCroToIbcHandler() {
 		{
 			"success send cro to ibc",
 			func() {
+				params := suite.app.CronosKeeper.GetParams(suite.ctx)
+				params.CroBridgeContractAddresses = []string{contract.Hex()}
+				err := suite.app.CronosKeeper.SetParams(suite.ctx, params)
+				suite.Require().NoError(err)
+
 				coin := sdk.NewCoin(suite.evmParam.EvmDenom, sdkmath.NewInt(1230000000500))
-				err := suite.MintCoins(contract.Bytes(), sdk.NewCoins(coin))
+				err = suite.MintCoins(contract.Bytes(), sdk.NewCoins(coin))
 				suite.Require().NoError(err)
 
 				balance := suite.app.BankKeeper.GetBalance(suite.ctx, contract.Bytes(), suite.evmParam.EvmDenom)

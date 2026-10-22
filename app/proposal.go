@@ -6,15 +6,20 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math/big"
 
 	"filippo.io/age"
 	abci "github.com/cometbft/cometbft/abci/types"
+	cronosmempool "github.com/crypto-org-chain/cronos/app/mempool"
 	evmtypes "github.com/evmos/ethermint/x/evm/types"
 
 	"cosmossdk.io/core/address"
+	sdkmath "cosmossdk.io/math"
 
 	"github.com/cosmos/cosmos-sdk/baseapp"
+	"github.com/cosmos/cosmos-sdk/telemetry"
 	sdk "github.com/cosmos/cosmos-sdk/types"
+	"github.com/cosmos/cosmos-sdk/types/mempool"
 	"github.com/cosmos/cosmos-sdk/x/auth/signing"
 )
 
@@ -24,54 +29,163 @@ type BlockList struct {
 
 var _ baseapp.TxSelector = &ExtTxSelector{}
 
-// ExtTxSelector extends a baseapp.TxSelector with extra tx validation method
+// ExtTxSelector is a custom tx selector for cronos
 type ExtTxSelector struct {
-	baseapp.TxSelector
-	TxDecoder  sdk.TxDecoder
-	ValidateTx func(sdk.Tx, []byte) error
+	validateTx       func(sdk.Tx, []byte) error
+	baseFeeRetriever func(sdk.Context) (*big.Int, string) // baseFee gate source; nil disables
+
+	selectedTxs [][]byte
+	totalBytes  int64
+	totalGas    uint64
+
+	// baseFee/evmDenom are constant within a proposal
+	baseFee  *big.Int
+	evmDenom string
+
+	// gateSkipped accumulates raw bytes of txs rejected by the baseFee gate this
+	// round. Drained after each proposal so stranded senders are staged for recheck.
+	gateSkipped [][]byte
 }
 
-func NewExtTxSelector(parent baseapp.TxSelector, txDecoder sdk.TxDecoder, validateTx func(sdk.Tx, []byte) error) *ExtTxSelector {
-	return &ExtTxSelector{
-		TxSelector: parent,
-		TxDecoder:  txDecoder,
-		ValidateTx: validateTx,
-	}
+func NewExtTxSelector(validateTx func(sdk.Tx, []byte) error, baseFeeRetriever func(sdk.Context) (*big.Int, string)) *ExtTxSelector {
+	return &ExtTxSelector{validateTx: validateTx, baseFeeRetriever: baseFeeRetriever}
 }
 
-func (ts *ExtTxSelector) SelectTxForProposal(ctx context.Context, maxTxBytes, maxBlockGas uint64, memTx sdk.Tx, txBz []byte, gasWanted uint64) bool {
-	if err := ts.ValidateTx(memTx, txBz); err != nil {
-		return false
-	}
-
-	// don't pass `memTx` to parent selector so it don't check tx gas wanted against block gas limit,
-	// it conflicts with the max-tx-gas-wanted logic.
-	return ts.TxSelector.SelectTxForProposal(ctx, maxTxBytes, maxBlockGas, nil, txBz, gasWanted)
+func (ts *ExtTxSelector) SelectedTxs(_ context.Context) [][]byte {
+	txs := make([][]byte, len(ts.selectedTxs))
+	copy(txs, ts.selectedTxs)
+	return txs
 }
 
-func (ts *ExtTxSelector) SelectTxForProposalFast(ctx context.Context, txs [][]byte) [][]byte {
-	var invalidTxs []int
-	for i, txBz := range txs {
-		if err := ts.ValidateTx(nil, txBz); err != nil {
-			invalidTxs = append(invalidTxs, i)
-		}
+func (ts *ExtTxSelector) Clear() {
+	ts.selectedTxs = nil
+	ts.totalBytes = 0
+	ts.totalGas = 0
+	ts.baseFee = nil
+	ts.evmDenom = ""
+}
+
+// DrainGateSkipped returns and clears the raw bytes of txs rejected by the
+// baseFee gate this proposal round.
+func (ts *ExtTxSelector) DrainGateSkipped() [][]byte {
+	out := ts.gateSkipped
+	ts.gateSkipped = nil
+	return out
+}
+
+func (ts *ExtTxSelector) SelectTxForProposal(goCtx context.Context, maxTxBytes, maxBlockGas uint64, memTx sdk.Tx, txBz []byte) bool {
+	// returned bool = stop iterating; true once the block is full.
+	isFull := func() bool {
+		return uint64(ts.totalBytes) >= maxTxBytes || (maxBlockGas > 0 && ts.totalGas >= maxBlockGas)
 	}
 
-	if len(invalidTxs) > 0 {
-		filtered := make([][]byte, 0, len(txs)-len(invalidTxs))
-		var offset int
-		for i, txBz := range txs {
-			if offset < len(invalidTxs) && i == invalidTxs[offset] {
-				offset++
-				continue
+	if err := ts.validateTx(memTx, txBz); err != nil {
+		return isFull() // blocked/invalid: skip, keep scanning
+	}
+
+	txSize := cronosmempool.ProtoSizeForTx(txBz)
+	if uint64(ts.totalBytes)+uint64(txSize) > maxTxBytes {
+		return isFull() // too large: try smaller txs unless already full
+	}
+
+	feeTx, isFeeTx := memTx.(sdk.FeeTx)
+
+	// baseFee gate: drop txs whose feeCap fell below a risen baseFee
+	if isFeeTx {
+		if bf, denom := ts.gateBaseFee(goCtx); bf != nil && denom != "" {
+			if gas := feeTx.GetGas(); gas > 0 {
+				feeCap := feeTx.GetFee().AmountOf(denom).Quo(sdkmath.NewIntFromUint64(gas))
+				if feeCap.LT(sdkmath.NewIntFromBigInt(bf)) {
+					ts.gateSkipped = append(ts.gateSkipped, txBz)
+					telemetry.IncrCounter(1, "cronos", "mempool", "proposal", "gate", "skipped")
+					return isFull()
+				}
 			}
-			filtered = append(filtered, txBz)
 		}
-
-		txs = filtered
 	}
 
-	return ts.TxSelector.SelectTxForProposalFast(ctx, txs)
+	if maxBlockGas > 0 && isFeeTx {
+		gasWanted := feeTx.GetGas()
+		// Overflow-safe: totalGas <= maxBlockGas by induction.
+		if gasWanted > maxBlockGas-ts.totalGas {
+			return isFull()
+		}
+		ts.totalGas += gasWanted
+	}
+
+	ts.selectedTxs = append(ts.selectedTxs, txBz)
+	ts.totalBytes += txSize
+	return isFull()
+}
+
+// gateBaseFee reads (baseFee, evmDenom) once per proposal; nil baseFee disables the gate.
+func (ts *ExtTxSelector) gateBaseFee(goCtx context.Context) (*big.Int, string) {
+	if ts.baseFee == nil && ts.baseFeeRetriever != nil {
+		ts.baseFee, ts.evmDenom = ts.baseFeeRetriever(sdk.UnwrapSDKContext(goCtx))
+	}
+	return ts.baseFee, ts.evmDenom
+}
+
+// MempoolProposalHandler defines a custom PrepareProposal for cronos.
+type MempoolProposalHandler struct {
+	mempoolManager *cronosmempool.Manager
+	extSel         *ExtTxSelector
+	inner          sdk.PrepareProposalHandler
+}
+
+// NewMempoolProposalHandler wraps h with the blocklist + baseFee gate ExtTxSelector.
+func NewMempoolProposalHandler(h *baseapp.DefaultProposalHandler, validateTx func(sdk.Tx, []byte) error, baseFeeRetriever func(sdk.Context) (*big.Int, string), signerExtractor mempool.SignerExtractionAdapter) *MempoolProposalHandler {
+	extSel := NewExtTxSelector(validateTx, baseFeeRetriever)
+	h.SetTxSelector(extSel)
+	if signerExtractor != nil {
+		h.SetSignerExtractionAdapter(signerExtractor)
+	}
+	return &MempoolProposalHandler{extSel: extSel, inner: h.PrepareProposalHandler()}
+}
+
+func (h *MempoolProposalHandler) SetMempoolManager(m *cronosmempool.Manager) {
+	h.mempoolManager = m
+}
+
+func (h *MempoolProposalHandler) PrepareProposalHandler() sdk.PrepareProposalHandler {
+	return func(ctx sdk.Context, req *abci.RequestPrepareProposal) (*abci.ResponsePrepareProposal, error) {
+		if h.mempoolManager != nil {
+			// On timeout, propose from the current pool instead of an empty block
+			if h.mempoolManager.WaitForRecheckTimedOut(ctx, recheckWaitTimeout) {
+				telemetry.IncrCounter(1, "cronos", "mempool", "recheck", "proposal_timeout")
+			}
+		}
+		resp, err := h.inner(ctx, req)
+		skipped := h.extSel.DrainGateSkipped() // drain every round, even on error, so it never goes stale
+		if err == nil && h.mempoolManager != nil && len(skipped) > 0 {
+			h.mempoolManager.StageSkippedSenders(skipped)
+		}
+		return resp, err
+	}
+}
+
+var _ baseapp.ProposalTxVerifier = &CacheProposalTxVerifier{}
+
+// CacheProposalTxVerifier is used to cache encoded transactions to avoid cpu overhead during proposal.
+type CacheProposalTxVerifier struct {
+	baseapp.ProposalTxVerifier
+	encCache *cronosmempool.EncoderCache
+}
+
+func NewCacheProposalTxVerifier(verifier baseapp.ProposalTxVerifier, encCache *cronosmempool.EncoderCache) *CacheProposalTxVerifier {
+	return &CacheProposalTxVerifier{ProposalTxVerifier: verifier, encCache: encCache}
+}
+
+func (txv *CacheProposalTxVerifier) PrepareProposalVerifyTx(tx sdk.Tx) ([]byte, error) {
+	// Wrapped in a closure so a cache hit never forms a bound method value off
+	// the embedded interface; that panics if it's nil (unlike a nil pointer embed).
+	bz, hit, err := cronosmempool.EncodeTx(txv.encCache, func(t sdk.Tx) ([]byte, error) { return txv.TxEncode(t) }, tx)
+	result := "miss"
+	if hit {
+		result = "hit"
+	}
+	telemetry.IncrCounter(1, "cronos", "mempool", "prepare", "encode_cache", result)
+	return bz, err
 }
 
 type ProposalHandler struct {
@@ -101,11 +215,10 @@ func (h *ProposalHandler) SetBlockList(blob []byte) error {
 	if bytes.Equal(h.lastBlockList, blob) {
 		return nil
 	}
-	h.lastBlockList = make([]byte, len(blob))
-	copy(h.lastBlockList, blob)
 
 	if len(blob) == 0 {
 		h.blocklist = make(map[string]struct{})
+		h.lastBlockList = nil
 		return nil
 	}
 
@@ -142,6 +255,8 @@ func (h *ProposalHandler) SetBlockList(blob []byte) error {
 	}
 
 	h.blocklist = m
+	h.lastBlockList = make([]byte, len(blob))
+	copy(h.lastBlockList, blob)
 	return nil
 }
 

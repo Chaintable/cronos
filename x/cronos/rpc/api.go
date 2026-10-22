@@ -20,7 +20,7 @@ import (
 	ethermint "github.com/evmos/ethermint/types"
 	evmtypes "github.com/evmos/ethermint/x/evm/types"
 
-	"cosmossdk.io/log"
+	"cosmossdk.io/log/v2"
 
 	"github.com/cosmos/cosmos-sdk/client"
 	"github.com/cosmos/cosmos-sdk/server"
@@ -86,6 +86,16 @@ func NewCronosAPI(
 	}
 }
 
+func checkTxsResultsLength(block *coretypes.ResultBlock, blockResults *coretypes.ResultBlockResults) error {
+	if len(blockResults.TxsResults) != len(block.Block.Txs) {
+		return fmt.Errorf(
+			"mismatched tx results length at height %d: block has %d txs, but got %d tx results",
+			block.Block.Height, len(block.Block.Txs), len(blockResults.TxsResults),
+		)
+	}
+	return nil
+}
+
 func (api *CronosAPI) getBlockDetail(blockNrOrHash rpctypes.BlockNumberOrHash) (
 	resBlock *coretypes.ResultBlock,
 	blockNumber int64,
@@ -94,24 +104,26 @@ func (api *CronosAPI) getBlockDetail(blockNrOrHash rpctypes.BlockNumberOrHash) (
 	baseFee *big.Int,
 	err error,
 ) {
-	var blockNum rpctypes.BlockNumber
 	resBlock, err = api.getBlock(blockNrOrHash)
 	if err != nil {
 		api.logger.Debug("block not found", "height", blockNrOrHash, "error", err.Error())
-		return
+		return nil, 0, "", nil, nil, err
 	}
 	blockNumber = resBlock.Block.Height
 	blockHash = common.BytesToHash(resBlock.Block.Header.Hash()).Hex()
 	blockRes, err = api.backend.TendermintBlockResultByNumber(&blockNumber)
 	if err != nil {
-		api.logger.Debug("failed to retrieve block results", "height", blockNum, "error", err.Error())
-		return
+		api.logger.Debug("failed to retrieve block results", "height", blockNumber, "error", err.Error())
+		return nil, 0, "", nil, nil, err
+	}
+	if err = checkTxsResultsLength(resBlock, blockRes); err != nil {
+		return nil, 0, "", nil, nil, err
 	}
 	baseFee, err = api.backend.BaseFee(blockRes)
 	if err != nil {
-		return
+		return nil, 0, "", nil, nil, err
 	}
-	return
+	return resBlock, blockNumber, blockHash, blockRes, baseFee, err
 }
 
 // GetTransactionReceiptsByBlock returns all the transaction receipts included in the block.
@@ -384,5 +396,5 @@ func (api *CronosAPI) getBlock(blockNrOrHash rpctypes.BlockNumberOrHash) (blk *c
 		}
 		blk, err = api.backend.TendermintBlockByNumber(blockNumber)
 	}
-	return
+	return blk, err
 }

@@ -43,7 +43,26 @@ func (tcp *TokenMappingChangeProposal) ProposalType() string { return ProposalTy
 
 // ValidateBasic validates the parameter change proposal
 func (tcp *TokenMappingChangeProposal) ValidateBasic() error {
-	// TODO
+	if err := govtypes.ValidateAbstract(tcp); err != nil {
+		return err
+	}
+
+	if !IsValidCoinDenom(tcp.Denom) {
+		return fmt.Errorf("invalid coin denom: %s", tcp.Denom)
+	}
+
+	if IsSourceCoin(tcp.Denom) {
+		// source-denom mappings always require a valid contract address
+		if !common.IsHexAddress(tcp.Contract) {
+			return fmt.Errorf("invalid contract address for source denom: %s", tcp.Contract)
+		}
+	} else {
+		// non-source mappings allow empty contract (delete) or a valid hex address
+		if len(tcp.Contract) > 0 && !common.IsHexAddress(tcp.Contract) {
+			return fmt.Errorf("invalid contract address: %s", tcp.Contract)
+		}
+	}
+
 	return nil
 }
 
@@ -51,14 +70,14 @@ func (tcp *TokenMappingChangeProposal) ValidateBasic() error {
 func (tcp TokenMappingChangeProposal) String() string {
 	var b strings.Builder
 
-	b.WriteString(fmt.Sprintf(`Token Mapping Change Proposal:
+	fmt.Fprintf(&b, `Token Mapping Change Proposal:
   Title:       %s
   Description: %s
   Denom:       %s
   Contract:    %s
   Symbol:      %s
   Decimal:     %d
-`, tcp.Title, tcp.Description, tcp.Denom, tcp.Contract, tcp.Symbol, tcp.Decimal))
+`, tcp.Title, tcp.Description, tcp.Denom, tcp.Contract, tcp.Symbol, tcp.Decimal)
 
 	return b.String()
 }

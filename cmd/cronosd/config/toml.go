@@ -13,4 +13,47 @@ disable-tx-replacement = {{ .Cronos.DisableTxReplacement }}
 
 # Set to true to disable optimistic execution (not recommended on validator nodes).
 disable-optimistic-execution = {{ .Cronos.DisableOptimisticExecution }}
+
+# Capacity of the sharded LRU tx encode/decode cache.
+# 0 = derive from mempool.max-txs at startup (cache off if unbounded/disabled). -1 = disable.
+mempool-tx-cache-size = {{ .Cronos.MempoolTxCacheSize }}
+
+# Re-gossip suppression window for mempool.type=app. A tx reaped for gossip is
+# not re-broadcast until this elapses, stopping the AppReactor from flooding the
+# whole pool to peers every reap_interval (~500ms). Default "15s".
+mempool-gossip-ttl = "{{ .Cronos.MempoolGossipTTL }}"
+
+# Tx budget per block for mempool.type=app (cronos mainnet empirical: ~2900).
+# Controls both the gossip-reap cap (txs per 500ms reap tick ≈ one block) and
+# the recheck-batch cap (candidates re-validated per Commit cycle ≈ one block of
+# senders). 0 = unlimited. Default 2900.
+mempool-txs-per-block = {{ .Cronos.MaxTxPerBlock }}
+
+# Evicts mempool.type=app txs older than 120 blocks by arrival height,
+# independent of per-tx TimeoutHeight (EVM txs have TimeoutHeight 0 = never
+# expire). Drains txs the proposal keeps skipping (baseFee gate, blocklist) whose
+# sender never commits. Default true. false disables.
+mempool-tx-ttl-enabled = {{ .Cronos.MempoolTxTTLEnabled }}
+
+# Caches the PendingTxs() pool-scan result, invalidated on tx admission and
+# block completion. Default true. false always walks the pool.
+mempool-pending-tx-cache-enabled = {{ .Cronos.MempoolPendingTxCacheEnabled }}
+`
+
+// DefaultRocksDBConfigTemplate defines the configuration template for rocksdb configuration
+const DefaultRocksDBConfigTemplate = `
+###############################################################################
+###                             RocksDB Configuration                       ###
+###############################################################################
+
+[rocksdb]
+
+# Defines the tuning profile for RocksDB based on the node's primary workload.
+# This is an experimental feature for performance optimization.
+# Valid values:
+# - ""          (default): standard configuration, safe for all nodes.
+# - "validator" : optimizes for lowest latency point-lookups (state reads) during block execution.
+# - "rpc"       : optimizes for highly concurrent read workloads (eth_calls, state queries) with lock-free caches.
+# - "archive"   : optimizes for massive historical data scanning and sequential reads (eth_getLogs).
+node_type = "{{ .RocksDB.NodeType }}"
 `
