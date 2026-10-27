@@ -11,6 +11,7 @@
 
 ### Bug fixes
 
+* [Chaintable/cometbft#2](https://github.com/Chaintable/cometbft/pull/2) fix: release disconnected peers from mempool broadcast waits during continuous block sync.
 * [#2115](https://github.com/crypto-org-chain/cronos/pull/2115) fix: add optional `traceReplay` trace-config flag to skip gas deduction during tracing and bypass a legacy bug.
 * [Chaintable/ethermint-cronos#9](https://github.com/Chaintable/ethermint-cronos/pull/9) fix: derive DeBank account, code, and storage diffs from committed IAVL changesets.
 

@@ -387,7 +387,7 @@ replace (
 	// Use cosmos keyring
 	github.com/99designs/keyring => github.com/cosmos/keyring v1.2.0
 	// v0.39.x
-	github.com/cometbft/cometbft => github.com/Chaintable/cometbft v0.0.0-20261022082704-613622821d5a
+	github.com/cometbft/cometbft => github.com/Chaintable/cometbft v0.39.3-ct.1
 	// release/v0.54.x
 	github.com/cosmos/cosmos-sdk => github.com/crypto-org-chain/cosmos-sdk v0.54.4-0.20260806150823-1e7193afaaf8
 	// v1.9.0
@@ -398,7 +398,7 @@ replace (
 	github.com/ethereum/go-ethereum => github.com/crypto-org-chain/go-ethereum v1.10.20-0.20260521015249-663dca6c618e
 
 	// v0.24.0
-	github.com/evmos/ethermint => github.com/Chaintable/ethermint-cronos v0.22.1-cronos-v1.7.8-ct.1.0.20261022082657-c22af9d38d9c
+	github.com/evmos/ethermint => github.com/Chaintable/ethermint-cronos v0.24.0-ct.1
 
 	github.com/syndtr/goleveldb => github.com/syndtr/goleveldb v1.0.1-0.20210819022825-2ae1ddf74ef7
 )

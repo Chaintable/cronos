@@ -65,10 +65,10 @@ github.com/Azure/go-ansiterm v0.0.0-20250102033503-faa5f7b0171c h1:udKWzYgxTojEK
 github.com/Azure/go-ansiterm v0.0.0-20250102033503-faa5f7b0171c/go.mod h1:xomTg63KZ2rFqZQzSB4Vz2SUXa1BpHTVz9L5PTmPC4E=
 github.com/BurntSushi/toml v0.3.1/go.mod h1:xHWCNGjB5oqiDr8zfno3MHue2Ht5sIBksp03qcyfWMU=
 github.com/BurntSushi/xgb v0.0.0-20160522181843-27f122750802/go.mod h1:IVnqGOEym/WlBOVXweHU+Q+/VP0lqqI8lqeDx9IjBqo=
-github.com/Chaintable/cometbft v0.0.0-20261022082704-613622821d5a h1:hvQfDYVjBTvkaU9LnM2ka1w6d2V32zn52qBIVR4+ZVA=
-github.com/Chaintable/cometbft v0.0.0-20261022082704-613622821d5a/go.mod h1:KcZvZTqdLgOisktAoWwwcS2fgO4E110r44KxEGyq8SI=
-github.com/Chaintable/ethermint-cronos v0.22.1-cronos-v1.7.8-ct.1.0.20261022082657-c22af9d38d9c h1:WkD8eSp/3cFsTDtAhV9Tx+QIDZMLtJG5KJf/DxOhoAI=
-github.com/Chaintable/ethermint-cronos v0.22.1-cronos-v1.7.8-ct.1.0.20261022082657-c22af9d38d9c/go.mod h1:4OIplP1UVBA2OwhPf3MB7+sT79o5CBLPYa6GwmtpdMc=
+github.com/Chaintable/cometbft v0.39.3-ct.1 h1:8xNCL0lV0cl/Dk8/PKDDrCB/WsmxIwkeL1Qofs+bEmU=
+github.com/Chaintable/cometbft v0.39.3-ct.1/go.mod h1:KcZvZTqdLgOisktAoWwwcS2fgO4E110r44KxEGyq8SI=
+github.com/Chaintable/ethermint-cronos v0.24.0-ct.1 h1:b745zMWRMASI60nULrFvepg5WONuVHNI6ncOlSXariA=
+github.com/Chaintable/ethermint-cronos v0.24.0-ct.1/go.mod h1:4OIplP1UVBA2OwhPf3MB7+sT79o5CBLPYa6GwmtpdMc=
 github.com/DataDog/datadog-go v4.8.3+incompatible h1:fNGaYSuObuQb5nzeTQqowRAd9bpDIRRV4/gUtIBjh8Q=
 github.com/DataDog/datadog-go v4.8.3+incompatible/go.mod h1:LButxg5PwREeZtORoXG3tL4fMGNddJ+vMq1mwgfaqoQ=
 github.com/DataDog/zstd v1.5.7 h1:ybO8RBeh29qrxIhCA9E8gKY6xfONU9T6G6aP9DTKfLE=
