@@ -4,6 +4,8 @@
 
 ### Improvements
 
+* [app] Support Cronos v1.8.1 while retaining the Chaintable writer forks and mempool disconnect fix.
+
 * [app] Support the Cronos v1.8 mainnet upgrade while retaining the Chaintable writer integration.
 
 * [#9](https://github.com/Chaintable/cronos/pull/9) feat(blocksync): add an opt-in continuous sync mode for non-validator nodes.
@@ -16,6 +18,14 @@
 * [Chaintable/ethermint-cronos#9](https://github.com/Chaintable/ethermint-cronos/pull/9) fix: derive DeBank account, code, and storage diffs from committed IAVL changesets.
 
 ## v1.7.5
+
+### Bug fixes
+
+* [#2226](https://github.com/crypto-org-chain/cronos/pull/2226) fix(test): fix flaky tx waits, expedited gov voting and EIP-7702 integration tests.
+
+*Sept 23, 2026*
+
+## v1.8.0
 
 ### Improvements
 
