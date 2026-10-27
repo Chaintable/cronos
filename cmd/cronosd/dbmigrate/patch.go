@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -14,7 +15,7 @@ import (
 	dbm "github.com/cosmos/cosmos-db"
 	"github.com/cosmos/gogoproto/proto"
 
-	"cosmossdk.io/log"
+	"cosmossdk.io/log/v2"
 )
 
 const (
@@ -740,7 +741,7 @@ func incrementBytes(b []byte) []byte {
 	copy(incremented, b)
 
 	// Increment from the last byte, carrying over if necessary
-	for i := len(incremented) - 1; i >= 0; i-- {
+	for i := range slices.Backward(incremented) {
 		if incremented[i] < 0xFF {
 			incremented[i]++
 			return incremented

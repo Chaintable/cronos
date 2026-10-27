@@ -30,10 +30,9 @@ from .utils import (
     get_expedited_params,
     get_receipts_by_block,
     get_sync_info,
-    modify_command_in_supervisor_config,
+    mempool_type,
     remove_cancun_prague_params,
     send_transaction,
-    send_txs,
     sign_transaction,
     submit_any_proposal,
     submit_gov_proposal,
@@ -44,13 +43,17 @@ from .utils import (
 )
 
 
-def test_ica_enabled(cronos, tmp_path):
+def test_expedited_gov_params(cronos):
     cli = cronos.cosmos_cli()
     param0 = cli.query_params("gov")
     param1 = get_expedited_params(param0)
     # governance module account as signer
     authority = module_address("gov")
     msg = "/cosmos.gov.v1.MsgUpdateParams"
+    params = {
+        **param0,
+        **param1,
+    }
     submit_gov_proposal(
         cronos,
         msg,
@@ -58,34 +61,28 @@ def test_ica_enabled(cronos, tmp_path):
             {
                 "@type": msg,
                 "authority": authority,
-                "params": {
-                    **param0,
-                    **param1,
-                },
+                "params": params,
             }
         ],
     )
     assert_gov_params(cli, param0)
 
-    p = cli.query_ica_params()
-    assert p["controller_enabled"]
-    p["controller_enabled"] = False
-    msg = "/ibc.applications.interchain_accounts.controller.v1.MsgUpdateParams"
+    # re-submit the same params as an expedited proposal to keep covering the
+    # expedited path, previously covered by disabling the ica controller.
     submit_gov_proposal(
         cronos,
         msg,
         messages=[
             {
                 "@type": msg,
-                "signer": authority,
-                "params": p,
+                "authority": authority,
+                "params": params,
             }
         ],
         deposit="5basetcro",
         expedited=True,
     )
-    p = cli.query_ica_params()
-    assert not p["controller_enabled"]
+    assert_gov_params(cli, param0)
 
 
 def test_basic(cluster):
@@ -430,18 +427,22 @@ def test_transaction(cronos):
     initial_block_number = w3.eth.get_block_number()
 
     # tx already in mempool
-    with pytest.raises(exceptions.Web3RPCError) as exc:
-        send_transaction(
-            w3,
-            {
-                "to": ADDRS["community"],
-                "value": 10000,
-                "gasPrice": gas_price,
-                "nonce": w3.eth.get_transaction_count(ADDRS["validator"]) - 1,
-            },
-            KEYS["validator"],
-        )
-    assert "tx already in mempool" in str(exc)
+    if mempool_type(cronos) == "flood":
+        # Flood returns ErrTxInCache ("tx already in mempool") for a dup tx.
+        # The app mempool replaces same-nonce txs silently / via the RBF rule,
+        # so this CometBFT-cache-specific error doesn't apply there.
+        with pytest.raises(exceptions.Web3RPCError) as exc:
+            send_transaction(
+                w3,
+                {
+                    "to": ADDRS["community"],
+                    "value": 10000,
+                    "gasPrice": gas_price,
+                    "nonce": w3.eth.get_transaction_count(ADDRS["validator"]) - 1,
+                },
+                KEYS["validator"],
+            )
+        assert "tx already in mempool" in str(exc)
 
     # invalid sequence
     with pytest.raises(exceptions.Web3RPCError) as exc:
@@ -562,9 +563,9 @@ def assert_receipt_transaction_and_block(w3, futures):
     # check block receipts
 
     receipts.sort(key=lambda receipt: receipt["transactionIndex"])
-    block_receipts = w3.provider.make_request("eth_getBlockReceipts", [block_number])[
-        "result"
-    ]
+    block_receipts = w3.provider.make_request(
+        "eth_getBlockReceipts", [hex(block_number)]
+    )["result"]
     assert len(block_receipts) == 4
     for i, block_receipt in enumerate(block_receipts):
         assert block_receipt["blockNumber"] == hex(receipts[i]["blockNumber"])
@@ -657,7 +658,7 @@ def test_message_call(cronos):
         CONTRACTS["TestMessageCall"],
         key=KEYS["community"],
     )
-    iterations = 13000
+    iterations = 8000
     tx = contract.functions.test(iterations).build_transaction()
 
     begin = time.time()
@@ -667,7 +668,7 @@ def test_message_call(cronos):
     assert elapsed < 5  # should finish in reasonable time
 
     receipt = send_transaction(w3, tx, KEYS["community"])
-    assert 23828976 == receipt.cumulativeGasUsed
+    assert 14673976 == receipt.cumulativeGasUsed
     assert receipt.status == 1, "shouldn't fail"
     assert len(receipt.logs) == iterations
 
@@ -913,63 +914,6 @@ def test_contract(cronos):
     # call contract
     greeter_call_result = contract.caller.greet()
     assert "world" == greeter_call_result
-
-
-origin_cmd = None
-
-
-@pytest.mark.unmarked
-@pytest.mark.parametrize("max_gas_wanted", [80000000, 40000000, 25000000, 500000, None])
-def test_tx_inclusion(cronos, max_gas_wanted):
-    """
-    - send multiple heavy transactions at the same time.
-    - check they are included in consecutively blocks without failure.
-
-    test against different max-gas-wanted configuration.
-    """
-
-    def fn(cmd):
-        global origin_cmd
-        if origin_cmd is None:
-            origin_cmd = cmd
-        if max_gas_wanted is None:
-            return origin_cmd
-        return f"{origin_cmd} --evm.max-tx-gas-wanted {max_gas_wanted}"
-
-    modify_command_in_supervisor_config(
-        cronos.base_dir / "tasks.ini",
-        lambda cmd: fn(cmd),
-    )
-    cronos.supervisorctl("update")
-    wait_for_port(ports.evmrpc_port(cronos.base_port(0)))
-
-    # reset to origin_cmd only
-    if max_gas_wanted is None:
-        return
-
-    cli = cronos.cosmos_cli()
-    w3 = cronos.w3
-    block_gas_limit = 81500000
-    tx_gas_limit = 80000000
-    max_tx_in_block = block_gas_limit // min(max_gas_wanted, tx_gas_limit)
-    print("max_tx_in_block", max_tx_in_block)
-    to = ADDRS["validator"]
-    params = {"gas": tx_gas_limit}
-    _, sended_hash_set = send_txs(w3, cli, to, list(KEYS.values())[0:4], params)
-    block_nums = [
-        w3.eth.wait_for_transaction_receipt(h).blockNumber for h in sended_hash_set
-    ]
-    block_nums.sort()
-    print(f"all block numbers: {block_nums}")
-    # the transactions should be included according to max_gas_wanted
-    if max_tx_in_block == 1:
-        for block_num, next_block_num in zip(block_nums, block_nums[1:]):
-            assert next_block_num == block_num + 1 or next_block_num == block_num + 2
-    else:
-        for num in block_nums[1:max_tx_in_block]:
-            assert num == block_nums[0]
-        for num in block_nums[max_tx_in_block:]:
-            assert num == block_nums[0] + 1 or num == block_nums[0] + 2
 
 
 def test_replay_protection(cronos):

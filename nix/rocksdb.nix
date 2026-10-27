@@ -23,7 +23,7 @@
 
 stdenv.mkDerivation (finalAttrs: {
   pname = "rocksdb";
-  version = "10.5.1";
+  version = "10.9.1";
 
   withLz4 = true;
 
@@ -31,7 +31,7 @@ stdenv.mkDerivation (finalAttrs: {
     owner = "facebook";
     repo = finalAttrs.pname;
     rev = "v${finalAttrs.version}";
-    sha256 = "sha256-TDYXzYbOLhcIRi+qi0FW1OLVtfKOF+gUbj62Tgpp3/E=";
+    sha256 = "sha256-AdYt97tcZdj4Kyq0mGl+JreOybKn04tSVvdyaFQWuy4=";
   };
 
   nativeBuildInputs = [

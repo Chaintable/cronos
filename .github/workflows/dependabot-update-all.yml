@@ -1,5 +1,5 @@
 name: Dependabot Update All Go Modules
-on: pull_request
+on: pull_request_target
 
 permissions:
   contents: write
@@ -11,46 +11,141 @@ env:
 jobs:
   update-all:
     runs-on: ubuntu-latest
-    if: ${{ github.actor == 'dependabot[bot]' }}
+    if: >
+      github.actor == 'dependabot[bot]' &&
+      startsWith(github.event.pull_request.head.ref, 'dependabot/go_modules/')
     steps:
-      - name: Generate Token
-        uses: actions/create-github-app-token@df432ceedc7162793a195dd1713ff69aefc7379e # v1
-        id: app-token
-        with:
-          app-id: "${{ secrets.APP_ID }}"
-          private-key: "${{ secrets.APP_PRIVATE_KEY }}"
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           repository: ${{ github.event.pull_request.head.repo.full_name }}
           ref: ${{ github.event.pull_request.head.ref }}
-          token: "${{ steps.app-token.outputs.token }}"
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
-          go-version: "1.25"
+          go-version: "1.25.10"
           check-latest: true
+      - name: Update ethermint to latest develop
+        run: ./scripts/go-update-ethermint.sh
       - name: Extract updated dependency
         id: deps
         run: |
           set -euo pipefail
-          # Example title:
-          # "build(deps): Bump github.com/cosmos/cosmos-sdk from v0.46.0 to v0.47.0-rc1"
-          
-          dep_name=$(grep -oE 'github.com/[^ ]+' <<<"$PR_TITLE" || true)
+          # Parse Dependabot PR titles of the form:
+          #   build(deps): bump <module-path> from <x> to <y>
+          # Grouped PR titles (e.g. "bump the gomod-minor-patch group across 1 directory")
+          # do not match and are handled by falling through to a tidy-only run.
+          dep_name=$(grep -oE 'github.com/[^ ]+' <<<"$PR_TITLE" | head -1 || true)
           dep_version=$(grep -oE 'to v?([0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.]+)?)' <<<"$PR_TITLE" | awk '{print $2}' || true)
-          
+
           if [[ -z "$dep_name" || -z "$dep_version" ]]; then
-             echo "❌ Unable to parse dependency from PR title: $PR_TITLE" >&2
-             exit 1
+            echo "Grouped or unparseable PR title; skipping single-dep update."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            {
+              echo "name=$dep_name"
+              echo "version=${dep_version#v}"
+              echo "skip=false"
+            } >> "$GITHUB_OUTPUT"
           fi
-          
-          echo "name=$dep_name" >> "$GITHUB_OUTPUT"
-          echo "version=${dep_version#v}" >> "$GITHUB_OUTPUT"
       - name: Update all Go modules
-        run: |
-          ./scripts/go-update-dep-all.sh ${{ format('{0}@v{1}', steps.deps.outputs.name, steps.deps.outputs.version) }}
-          ./scripts/go-mod-tidy-all.sh
-      - name: Commit changes
-        uses: EndBug/add-and-commit@v9
+        if: steps.deps.outputs.skip != 'true'
+        run: ./scripts/go-update-dep-all.sh ${{ format('{0}@v{1}', steps.deps.outputs.name, steps.deps.outputs.version) }}
+      - name: Tidy all Go modules
+        run: ./scripts/go-mod-tidy-all.sh
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
         with:
-          default_author: user_info
-          message: "${{ github.event.pull_request.title }} for all modules"
+          nix_path: nixpkgs=channel:nixos-25.11
+          extra_nix_config: |
+            access-tokens = github.com=${{ secrets.GITHUB_TOKEN }}
+      - name: Update gomod2nix.toml
+        run: nix develop -c gomod2nix
+      - name: Commit changes
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          BRANCH_NAME: ${{ github.event.pull_request.head.ref }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          REPOSITORY_NAME_WITH_OWNER: ${{ github.event.pull_request.head.repo.full_name }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const { execFileSync } = require('node:child_process');
+            const fs = require('node:fs');
+            const MAX_GITHUB_BLOB_SIZE = 40 * 1024 * 1024;
+
+            const git = (args) => {
+              try {
+                return execFileSync('git', args, { encoding: 'utf8' });
+              } catch (error) {
+                throw new Error(`git ${args.join(' ')} failed: ${error.message}`);
+              }
+            };
+
+            const lines = (args) =>
+              git(args)
+                .trim()
+                .split('\n')
+                .filter(Boolean);
+
+            const additions = [...new Set([
+              ...lines(['diff', '--name-only', '--diff-filter=ACMRTUX', 'HEAD']),
+              ...lines(['ls-files', '--others', '--exclude-standard']),
+            ])]
+              .sort()
+              .map((path) => {
+                try {
+                  const contents = fs.readFileSync(path);
+                  if (contents.length > MAX_GITHUB_BLOB_SIZE) {
+                    throw new Error(
+                      `${path} is ${contents.length} bytes, which exceeds GitHub's 40 MiB blob limit for API-created commits`,
+                    );
+                  }
+                  return {
+                    path,
+                    contents: contents.toString('base64'),
+                  };
+                } catch (error) {
+                  throw new Error(`Failed to read ${path}: ${error.message}`);
+                }
+              });
+
+            const deletions = lines(['diff', '--name-only', '--diff-filter=D', 'HEAD'])
+              .sort()
+              .map((path) => ({ path }));
+
+            if (!additions.length && !deletions.length) {
+              core.info('No changes to commit.');
+              return;
+            }
+
+            const input = {
+              branch: {
+                repositoryNameWithOwner: process.env.REPOSITORY_NAME_WITH_OWNER,
+                branchName: process.env.BRANCH_NAME,
+              },
+              message: {
+                headline: `${process.env.PR_TITLE} for all modules`,
+              },
+              expectedHeadOid: lines(['rev-parse', 'HEAD'])[0],
+              fileChanges: {},
+            };
+
+            if (additions.length) {
+              input.fileChanges.additions = additions;
+            }
+            if (deletions.length) {
+              input.fileChanges.deletions = deletions;
+            }
+
+            const result = await github.graphql(
+              `mutation ($input: CreateCommitOnBranchInput!) {
+                createCommitOnBranch(input: $input) {
+                  commit {
+                    oid
+                    url
+                  }
+                }
+              }`,
+              { input },
+            );
+
+            core.info(`Created commit ${result.createCommitOnBranch.commit.oid}`);
+            core.info(result.createCommitOnBranch.commit.url);

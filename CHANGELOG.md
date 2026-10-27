@@ -4,15 +4,106 @@
 
 ### Improvements
 
+* [app] Support the Cronos v1.8 mainnet upgrade while retaining the Chaintable writer integration.
+
 * [#9](https://github.com/Chaintable/cronos/pull/9) feat(blocksync): add an opt-in continuous sync mode for non-validator nodes.
 * [#2095](https://github.com/crypto-org-chain/cronos/pull/2095) feat: add hardcoded unblockable address list that is filtered out of both the mempool and consensus blocklists.
 
 ### Bug fixes
 
+* [Chaintable/cometbft#2](https://github.com/Chaintable/cometbft/pull/2) fix: release disconnected peers from mempool broadcast waits during continuous block sync.
 * [#2115](https://github.com/crypto-org-chain/cronos/pull/2115) fix: add optional `traceReplay` trace-config flag to skip gas deduction during tracing and bypass a legacy bug.
 * [Chaintable/ethermint-cronos#9](https://github.com/Chaintable/ethermint-cronos/pull/9) fix: derive DeBank account, code, and storage diffs from committed IAVL changesets.
 
 ## v1.7.5
+
+### Improvements
+
+* [#2156](https://github.com/crypto-org-chain/cronos/pull/2156) feat(mempool): cache PendingTxs for mempool rpc calls.
+
+### State Machine Breaking
+
+* [#2171](https://github.com/crypto-org-chain/cronos/pull/2171) fix(cronos): reject `MsgTurnBridge` instead of reporting success for a no-op.
+* [#2192](https://github.com/crypto-org-chain/cronos/pull/2192) chore(app): remove interchain-accounts (ICA) wiring.
+
+### Bug fixes
+
+* [#2215](https://github.com/crypto-org-chain/cronos/pull/2215) fix(deps): bump cronos-store to pick up memiavl WAL wait and prune underflow fixes.
+* [#2214](https://github.com/crypto-org-chain/cronos/pull/2214) fix(deps): bump ethermint to reject nonempty fee granter on EIP-712 signing paths.
+* [#2179](https://github.com/crypto-org-chain/cronos/pull/2179) fix(cronos): bound concurrent `ReplayBlock` queries and honor the request context.
+* [#2175](https://github.com/crypto-org-chain/cronos/pull/2175) fix(rpc): guard `TxsResults` length before indexing by block tx position.
+* [#2186](https://github.com/crypto-org-chain/cronos/pull/2186) fix(mempool): fall back to app.ChainID() for EVM sig preverifier when chain-id flag is unset.
+* [#2177](https://github.com/crypto-org-chain/cronos/pull/2177) fix(mempool): clear the ante nonce cache on eviction and bound it independently.
+* [#2147](https://github.com/crypto-org-chain/cronos/pull/2147) fix(cronos): bound ReplayBlock message count during decode.
+* [#2176](https://github.com/crypto-org-chain/cronos/pull/2176) fix(app): retry block list decryption instead of caching the blob before it is applied.
+* [#2155](https://github.com/crypto-org-chain/cronos/pull/2155) fix(mempool): size tx-cache-size and max-tx-bytes from mempool config directly.
+* [#2169](https://github.com/crypto-org-chain/cronos/pull/2169) fix(cronos): add safe multiply int check during voucher conversion to EVM coins.
+* [#2172](https://github.com/crypto-org-chain/cronos/pull/2172) fix(e2ee): cap the address batch in the `Keys` query.
+* [#2173](https://github.com/crypto-org-chain/cronos/pull/2173) fix(cronos): bound `IbcTimeout` in params validation to 30 days so a governance-set value cannot overflow the outbound IBC packet timeout.
+
+### Chores
+
+* [#2219](https://github.com/crypto-org-chain/cronos/pull/2219) chore(deps): bump ethermint to v0.24.0, cosmos-sdk fork to 1e7193a, pin cronos-store at v1.9.0.
+* [#2212](https://github.com/crypto-org-chain/cronos/pull/2212) chore(deps): bump ethermint and cronos-store.
+* [#2180](https://github.com/crypto-org-chain/cronos/pull/2180) chore: bump golang.org/x/text to v0.39.0.
+* [#2157](https://github.com/crypto-org-chain/cronos/pull/2157) chore: repin cronos-store, cometbft v0.39, cosmos-sdk v0.54 forks.
+* [#2181](https://github.com/crypto-org-chain/cronos/pull/2181) build(store): repin cronos-store to fix historical-query use-after-free and merge-iterator overhead.
+
+*Jul 16, 2026*
+
+## v1.8.0-alpha
+
+### Improvements
+
+* [#2100](https://github.com/crypto-org-chain/cronos/pull/2100) feat: support unblockable addresses
+* [#1977](https://github.com/crypto-org-chain/cronos/pull/1977) Upgrade rocksdb to v10.9.1 and add tuning profiles.
+* [#1970](https://github.com/crypto-org-chain/cronos/pull/1970) feat(testground): refine testground test process in local
+* [#1971](https://github.com/crypto-org-chain/cronos/pull/1971) Upgrade cosmos-sdk to v0.53.4.
+* [#1976](https://github.com/crypto-org-chain/cronos/pull/1976) Minor improvements for cosmos-sdk v0.53.4 upgrade.
+* [#1978](https://github.com/crypto-org-chain/cronos/pull/1978) feat(cosmos-sdk): Optimize staking end-block queue through using pending queue slots instead of iterators.
+* [#2089](https://github.com/crypto-org-chain/cronos/pull/2089) feat: upgrade to cosmos-sdk v0.54.3 + ibc-go v11 + cometbft v0.39.
+* [#2081](https://github.com/crypto-org-chain/cronos/pull/2081) Upgrade go-ethereum version to `v1.16.9`, enable Osaka hardfork.
+* [#2091](https://github.com/crypto-org-chain/cronos/pull/2091) feat(app): v0.54 upgrade perf optimizations + app-mempool feature.
+* [#2118](https://github.com/crypto-org-chain/cronos/pull/2118) perf(mempool): run post-Commit recheck async off consensus path.
+* [#2119](https://github.com/crypto-org-chain/cronos/pull/2119) feat(mempool): support direct insert tx via app mempool.
+* [#2120](https://github.com/crypto-org-chain/cronos/pull/2120) feat(ante): wire ethermint NewEVMSigPreVerifier for lock-free admission, via an app-owned PreVerifierRegistry that composes per-module verifiers.
+* [#2133](https://github.com/crypto-org-chain/cronos/pull/2133) test(app): reproduce historical-query memiavl fd leak.
+* [#2127](https://github.com/crypto-org-chain/cronos/pull/2127) feat(mempool): back txpool RPC with app mempool PendingTxs.
+* [#2139](https://github.com/crypto-org-chain/cronos/pull/2139) feat(mempool): honor CometBFT's mempool.recheck config in app mempool.
+* [#2144](https://github.com/crypto-org-chain/cronos/pull/2144) feat(mempool): add hash-keyed sender cache to VerifyEthSig.
+
+### Bug fixes
+
+* [#2104](https://github.com/crypto-org-chain/cronos/pull/2104) fix(baseapp): insert into mempool before committing ante state in CheckTx.
+* [#1979](https://github.com/crypto-org-chain/cronos/pull/1979) fix(testground): fix send_batch_size&send_interval setup failed in testground.
+* [#1987](https://github.com/crypto-org-chain/cronos/pull/1987) fix: fix ibc call back response.
+* [#1997](https://github.com/crypto-org-chain/cronos/pull/1997) fix(gov): validate token-mapping proposals and require contract code.
+* [#1998](https://github.com/crypto-org-chain/cronos/pull/1998) fix(cronos): retire auto mapping on denom remap.
+* [#2030](https://github.com/crypto-org-chain/cronos/pull/2030) fix(cronos): reject CRC21 token-mapping registrations targeting the zero address or the Ethereum precompile range.
+* [#2029](https://github.com/crypto-org-chain/cronos/pull/2029) fix(cronos): enforce source denom mapping immutability
+* [#2037](https://github.com/crypto-org-chain/cronos/pull/2037) fix(sim): skip MsgUpdateTokenMapping when contract address has no code.
+* [#2041](https://github.com/crypto-org-chain/ethermint/pull/2041) fix(evm): enforce floor-data-gas
+* [#2065](https://github.com/crypto-org-chain/cronos/pull/2065) fix(versiondb): ignore non-leaf nodes data in restore-versiondb cli command.
+* [#2068](https://github.com/crypto-org-chain/cronos/pull/2068) fix(ante): enforce eip-1559 cost balance check even if it is not checkTx.
+* [#2070](https://github.com/crypto-org-chain/cronos/pull/2070) fix(ci): fix github pr labeler to match v6 format.
+* [#2069](https://github.com/crypto-org-chain/cronos/pull/2069) fix(test): flaky test_mempool integration test.
+* [#2071](https://github.com/crypto-org-chain/cronos/pull/2071) fix(test): fix flaky ibc and versiondb integration tests.
+* [#2099](https://github.com/crypto-org-chain/cronos/pull/2099) fix(cronos): add contract authorization check to SendCroToIbcHandler
+* [#2131](https://github.com/crypto-org-chain/cronos/pull/2131) fix(cronos): bound message count and per-message gas in the ReplayBlock gRPC query.
+
+
+### Chores:
+* [#1986](https://github.com/crypto-org-chain/cronos/pull/1986) Remove unused precompiles
+* [#2017](https://github.com/crypto-org-chain/cronos/pull/2017) chore(deps): bump ibc to 10.5.1
+* [#2038](https://github.com/crypto-org-chain/cronos/pull/2038) chore(ci): improve ci running
+* [#2048](https://github.com/crypto-org-chain/cronos/pull/2048) refactor: use slices.Contains and strings.ContainsRune to simplify code
+* [#2044](https://github.com/crypto-org-chain/cronos/pull/2044) ci: fix dependabot workflows and drain PR backlog
+* [#2098](https://github.com/crypto-org-chain/cronos/pull/2098) chore(dep): pin ibc-go to upstream v11.1.0
+
+
+*Jan 26, 2026*
+
+## v1.7.0
 
 ### Improvements
 
