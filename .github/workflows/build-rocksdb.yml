@@ -43,7 +43,7 @@ jobs:
           swap-storage: false
 
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set env (determine image tag)
         run: |
@@ -53,7 +53,7 @@ jobs:
             echo "REVISION=$(git rev-parse --short=7 HEAD)-rocksdb" >> $GITHUB_ENV
           fi
       - name: Configure AWS Credentials
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@v6
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
@@ -65,10 +65,10 @@ jobs:
           registry-type: public
 
       - name: Set up Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Build and push image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           file: ${{ env.DOCKERFILE }}
           context: .
@@ -84,7 +84,7 @@ jobs:
       id-token: write
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set env (determine image tag)
         run: |
@@ -94,7 +94,7 @@ jobs:
             echo "REVISION=$(git rev-parse --short=7 HEAD)-rocksdb" >> $GITHUB_ENV
           fi
       - name: Configure AWS Credentials
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@v6
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
