@@ -4,6 +4,8 @@
 
 ### Improvements
 
+* [rpc] Replay complete Cosmos blocks for `trace_debankBlock` on v1.8 mainnet RocksDB nodes and validate the result against the committed execution.
+
 * [app] Support Cronos v1.8.1 while retaining the Chaintable writer forks and mempool disconnect fix.
 
 * [app] Support the Cronos v1.8 mainnet upgrade while retaining the Chaintable writer integration.
