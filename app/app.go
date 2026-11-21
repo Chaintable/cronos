@@ -271,6 +271,7 @@ type GenesisState = map[string]json.RawMessage
 // They are exported for convenience in creating helper functions, as object
 // capabilities aren't needed for testing.
 type App struct {
+	replayHome string
 	*baseapp.BaseApp
 
 	// encoding
@@ -452,6 +453,7 @@ func New(
 	invCheckPeriod := cast.ToUint(appOpts.Get(server.FlagInvCheckPeriod))
 	app := &App{
 		BaseApp:              bApp,
+		replayHome:           homePath,
 		cdc:                  cdc,
 		txConfig:             txConfig,
 		txDecoder:            txDecoder,
