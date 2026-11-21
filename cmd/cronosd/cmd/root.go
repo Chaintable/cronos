@@ -114,6 +114,7 @@ func initRootCmd(rootCmd *cobra.Command, encodingConfig params.EncodingConfig) {
 	cfg.Seal()
 
 	a := appCreator{encodingConfig}
+	rootCmd.AddCommand(a.replayBlocks())
 	rootCmd.AddCommand(
 		ethermintclient.ValidateChainID(
 			WrapInitCmd(app.DefaultNodeHome),
@@ -220,6 +221,10 @@ func (a appCreator) newApp(logger log.Logger, db dbm.DB, traceStore io.Writer, a
 	if cast.ToBool(appOpts.Get(server.FlagInterBlockCache)) {
 		cache = store.NewCommitKVStoreCacheManager()
 	}
+
+	return a.newReplayApp(logger, db, traceStore, appOpts, cache)
+}
+func (a appCreator) newReplayApp(logger log.Logger, db dbm.DB, traceStore io.Writer, appOpts servertypes.AppOptions, cache sdk.MultiStorePersistentCache) *app.App {
 
 	skipUpgradeHeights := make(map[int64]bool)
 	for _, h := range cast.ToIntSlice(appOpts.Get(server.FlagUnsafeSkipUpgrades)) {
