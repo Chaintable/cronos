@@ -1,0 +1,143 @@
+--- a/evm.go
++++ b/evm.go
+@@ -201,11 +201,31 @@
+ 	return evm.interpreter
+ }
+ 
++// ReplayNestedCalls identifies the optional observation hooks in this build.
++func (*EVM) ReplayNestedCalls() {}
++
++type replayCallTracer interface {
++	CaptureEnter(OpCode, common.Address, common.Address, []byte, uint64, *big.Int)
++	CaptureExit([]byte, uint64, error)
++}
++
++func (evm *EVM) replayTracer() replayCallTracer {
++	if !evm.vmConfig.Debug || evm.depth == 0 {
++		return nil
++	}
++	tracer, _ := evm.vmConfig.Tracer.(replayCallTracer)
++	return tracer
++}
++
+ // Call executes the contract associated with the addr with the given input as
+ // parameters. It also handles any necessary value transfer required and takes
+ // the necessary steps to create accounts and reverses the state in case of an
+ // execution error or failed value transfer.
+ func (evm *EVM) Call(caller ContractRef, addr common.Address, input []byte, gas uint64, value *big.Int) (ret []byte, leftOverGas uint64, err error) {
++	if tracer := evm.replayTracer(); tracer != nil {
++		tracer.CaptureEnter(CALL, caller.Address(), addr, input, gas, value)
++		defer func(start uint64) { tracer.CaptureExit(ret, start-leftOverGas, err) }(gas)
++	}
+ 	if evm.vmConfig.NoRecursion && evm.depth > 0 {
+ 		return nil, gas, nil
+ 	}
+@@ -282,6 +302,10 @@
+ // CallCode differs from Call in the sense that it executes the given address'
+ // code with the caller as context.
+ func (evm *EVM) CallCode(caller ContractRef, addr common.Address, input []byte, gas uint64, value *big.Int) (ret []byte, leftOverGas uint64, err error) {
++	if tracer := evm.replayTracer(); tracer != nil {
++		tracer.CaptureEnter(CALLCODE, caller.Address(), addr, input, gas, value)
++		defer func(start uint64) { tracer.CaptureExit(ret, start-leftOverGas, err) }(gas)
++	}
+ 	if evm.vmConfig.NoRecursion && evm.depth > 0 {
+ 		return nil, gas, nil
+ 	}
+@@ -325,6 +349,10 @@
+ // DelegateCall differs from CallCode in the sense that it executes the given address'
+ // code with the caller as context and the caller is set to the caller of the caller.
+ func (evm *EVM) DelegateCall(caller ContractRef, addr common.Address, input []byte, gas uint64) (ret []byte, leftOverGas uint64, err error) {
++	if tracer := evm.replayTracer(); tracer != nil {
++		tracer.CaptureEnter(DELEGATECALL, caller.Address(), addr, input, gas, caller.(*Contract).Value())
++		defer func(start uint64) { tracer.CaptureExit(ret, start-leftOverGas, err) }(gas)
++	}
+ 	if evm.vmConfig.NoRecursion && evm.depth > 0 {
+ 		return nil, gas, nil
+ 	}
+@@ -359,6 +387,10 @@
+ // Opcodes that attempt to perform such modifications will result in exceptions
+ // instead of performing the modifications.
+ func (evm *EVM) StaticCall(caller ContractRef, addr common.Address, input []byte, gas uint64) (ret []byte, leftOverGas uint64, err error) {
++	if tracer := evm.replayTracer(); tracer != nil {
++		tracer.CaptureEnter(STATICCALL, caller.Address(), addr, input, gas, nil)
++		defer func(start uint64) { tracer.CaptureExit(ret, start-leftOverGas, err) }(gas)
++	}
+ 	if evm.vmConfig.NoRecursion && evm.depth > 0 {
+ 		return nil, gas, nil
+ 	}
+@@ -500,6 +532,10 @@
+ // Create creates a new contract using code as deployment code.
+ func (evm *EVM) Create(caller ContractRef, code []byte, gas uint64, value *big.Int) (ret []byte, contractAddr common.Address, leftOverGas uint64, err error) {
+ 	contractAddr = crypto.CreateAddress(caller.Address(), evm.StateDB.GetNonce(caller.Address()))
++	if tracer := evm.replayTracer(); tracer != nil {
++		tracer.CaptureEnter(CREATE, caller.Address(), contractAddr, code, gas, value)
++		defer func(start uint64) { tracer.CaptureExit(ret, start-leftOverGas, err) }(gas)
++	}
+ 	return evm.create(caller, &codeAndHash{code: code}, gas, value, contractAddr)
+ }
+ 
+@@ -510,6 +546,10 @@
+ func (evm *EVM) Create2(caller ContractRef, code []byte, gas uint64, endowment *big.Int, salt *uint256.Int) (ret []byte, contractAddr common.Address, leftOverGas uint64, err error) {
+ 	codeAndHash := &codeAndHash{code: code}
+ 	contractAddr = crypto.CreateAddress2(caller.Address(), salt.Bytes32(), codeAndHash.Hash().Bytes())
++	if tracer := evm.replayTracer(); tracer != nil {
++		tracer.CaptureEnter(CREATE2, caller.Address(), contractAddr, code, gas, endowment)
++		defer func(start uint64) { tracer.CaptureExit(ret, start-leftOverGas, err) }(gas)
++	}
+ 	return evm.create(caller, codeAndHash, gas, endowment, contractAddr)
+ }
+ 
+--- a/instructions.go
++++ b/instructions.go
+@@ -390,16 +390,21 @@
+ // opExtCodeHash returns the code hash of a specified account.
+ // There are several cases when the function is called, while we can relay everything
+ // to `state.GetCodeHash` function to ensure the correctness.
+-//   (1) Caller tries to get the code hash of a normal contract account, state
++//
++//	(1) Caller tries to get the code hash of a normal contract account, state
++//
+ // should return the relative code hash and set it as the result.
+ //
+-//   (2) Caller tries to get the code hash of a non-existent account, state should
++//	(2) Caller tries to get the code hash of a non-existent account, state should
++//
+ // return common.Hash{} and zero will be set as the result.
+ //
+-//   (3) Caller tries to get the code hash for an account without contract code,
++//	(3) Caller tries to get the code hash for an account without contract code,
++//
+ // state should return emptyCodeHash(0xc5d246...) as the result.
+ //
+-//   (4) Caller tries to get the code hash of a precompiled account, the result
++//	(4) Caller tries to get the code hash of a precompiled account, the result
++//
+ // should be zero or emptyCodeHash.
+ //
+ // It is worth noting that in order to avoid unnecessary create and clean,
+@@ -408,10 +413,12 @@
+ // If the precompile account is not transferred any amount on a private or
+ // customized chain, the return value will be zero.
+ //
+-//   (5) Caller tries to get the code hash for an account which is marked as suicided
++//	(5) Caller tries to get the code hash for an account which is marked as suicided
++//
+ // in the current transaction, the code hash of this account should be returned.
+ //
+-//   (6) Caller tries to get the code hash for an account which is marked as deleted,
++//	(6) Caller tries to get the code hash for an account which is marked as deleted,
++//
+ // this account should be regarded as a non-existent account and zero should be returned.
+ func opExtCodeHash(pc *uint64, interpreter *EVMInterpreter, scope *ScopeContext) ([]byte, error) {
+ 	slot := scope.Stack.peek()
+@@ -789,6 +796,10 @@
+ func opSuicide(pc *uint64, interpreter *EVMInterpreter, scope *ScopeContext) ([]byte, error) {
+ 	beneficiary := scope.Stack.pop()
+ 	balance := interpreter.evm.StateDB.GetBalance(scope.Contract.Address())
++	if tracer := interpreter.evm.replayTracer(); tracer != nil {
++		tracer.CaptureEnter(SELFDESTRUCT, scope.Contract.Address(), beneficiary.Bytes20(), nil, 0, balance)
++		defer tracer.CaptureExit(nil, 0, nil)
++	}
+ 	interpreter.evm.StateDB.AddBalance(beneficiary.Bytes20(), balance)
+ 	interpreter.evm.StateDB.Suicide(scope.Contract.Address())
+ 	return nil, nil

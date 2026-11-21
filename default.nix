@@ -26,6 +26,7 @@ pkgs.buildGoApplication rec {
     "!/app/"
     "!/cmd/"
     "!/client/"
+    "!/scripts/"
     "!go.mod"
     "!go.sum"
     "!gomod2nix.toml"
@@ -34,6 +35,12 @@ pkgs.buildGoApplication rec {
   pwd = src; # needed to support replace
   subPackages = [ "cmd/cronosd" ];
   CGO_ENABLED = "1";
+  nativeBuildInputs = [ pkgs.python3 pkgs.patch ];
+  preBuild = ''
+    scratch=$(mktemp -d)
+    python3 scripts/replay-go.py --vendor-overlay "$PWD/vendor/github.com/ethereum/go-ethereum/core/vm" "$scratch"
+    buildFlagsArray+=("-overlay=$scratch/overlay.json")
+  '';
   buildFlags = "-tags=${tags}";
   buildFlagsArray = ''
     -ldflags=
