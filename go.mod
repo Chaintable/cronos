@@ -398,7 +398,7 @@ replace (
 	github.com/ethereum/go-ethereum => github.com/crypto-org-chain/go-ethereum v1.10.20-0.20260521015249-663dca6c618e
 
 	// v0.24.0
-	github.com/evmos/ethermint => github.com/Chaintable/ethermint-cronos v0.24.0-ct.2
+	github.com/evmos/ethermint => github.com/Chaintable/ethermint-cronos v0.24.0-ct.2.0.20261121134003-168584566438
 
 	github.com/syndtr/goleveldb => github.com/syndtr/goleveldb v1.0.1-0.20210819022825-2ae1ddf74ef7
 )
