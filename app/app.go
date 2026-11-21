@@ -265,7 +265,10 @@ type GenesisState = map[string]json.RawMessage
 // App extends an ABCI application, but with most of its parameters exported.
 // They are exported for convenience in creating helper functions, as object
 // capabilities aren't needed for testing.
+const FlagDisableOptimisticExecution = "cronos.disable-optimistic-execution"
+
 type App struct {
+	replayHome string
 	*baseapp.BaseApp
 
 	// encoding
@@ -419,7 +422,9 @@ func New(
 	baseAppOptions = memiavlstore.SetupMemIAVL(logger, homePath, appOpts, false, false, cacheSize, baseAppOptions)
 
 	// enable optimistic execution
-	baseAppOptions = append(baseAppOptions, baseapp.SetOptimisticExecution())
+	if !cast.ToBool(appOpts.Get(FlagDisableOptimisticExecution)) {
+		baseAppOptions = append(baseAppOptions, baseapp.SetOptimisticExecution())
+	}
 
 	// NOTE we use custom transaction decoder that supports the sdk.Tx interface instead of sdk.StdTx
 	bApp := baseapp.NewBaseApp(Name, logger, db, txConfig.TxDecoder(), baseAppOptions...)
@@ -434,6 +439,7 @@ func New(
 	invCheckPeriod := cast.ToUint(appOpts.Get(server.FlagInvCheckPeriod))
 	app := &App{
 		BaseApp:              bApp,
+		replayHome:           homePath,
 		cdc:                  cdc,
 		txConfig:             txConfig,
 		txDecoder:            txDecoder,

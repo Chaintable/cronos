@@ -25,12 +25,16 @@ func (app *App) RegisterUpgradeHandlers(cdc codec.BinaryCodec, maxVersion int64)
 
 	if !app.UpgradeKeeper.IsSkipHeight(upgradeInfo.Height) {
 		if upgradeInfo.Name == planName {
-			app.SetStoreLoader(MaxVersionUpgradeStoreLoader(maxVersion, upgradeInfo.Height, &storetypes.StoreUpgrades{
-				Deleted: []string{"capability", "feeibc"},
-			}))
+			app.SetStoreLoader(MaxVersionUpgradeStoreLoader(maxVersion, upgradeInfo.Height, activationStoreUpgrades()))
 			return true
 		}
 	}
 
 	return false
+}
+
+func activationStoreUpgrades() *storetypes.StoreUpgrades {
+	return &storetypes.StoreUpgrades{
+		Deleted: []string{"capability", "feeibc"},
+	}
 }
