@@ -5,6 +5,7 @@ import (
 	"fmt"
 	store "github.com/cosmos/cosmos-sdk/store/types"
 	sdk "github.com/cosmos/cosmos-sdk/types"
+	upgradetypes "github.com/cosmos/cosmos-sdk/x/upgrade/types"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/evmos/ethermint/x/evm/keeper"
 	evm "github.com/evmos/ethermint/x/evm/types"
@@ -77,13 +78,34 @@ func (a appCreator) replayBlocks() *cobra.Command {
 				return err
 			}
 			defer db.Close()
-			ctx.Viper.Set(flags.FlagHome, private)
+			// A live node writes the scheduled upgrade marker while halting on the
+			// previous binary. Recreate it only for this isolated activation run.
+			appHome := private
+			if first == 6542800 {
+				appHome, err = os.MkdirTemp(private, "activation-")
+				if err != nil {
+					return err
+				}
+				defer os.RemoveAll(appHome)
+				configDir := filepath.Join(appHome, "data")
+				if err = os.Mkdir(configDir, 0700); err != nil {
+					return err
+				}
+				marker, err := json.Marshal(upgradetypes.Plan{Name: "v1.0.0", Height: first})
+				if err != nil {
+					return err
+				}
+				if err = os.WriteFile(filepath.Join(configDir, "upgrade-info.json"), marker, 0600); err != nil {
+					return err
+				}
+			}
+			ctx.Viper.Set(flags.FlagHome, appHome)
 			// Historical checkpoints contain the versioned IAVL tree.
 			ctx.Viper.Set(server.FlagDisableIAVLFastNode, true)
 			writes := replay.NewStateWrites("basecro")
 			application := a.newReplayApp(log.NewNopLogger(), db, nil, ctx.Viper, writes)
 			cms := application.NewUncachedContext(false, proto.Header{}).MultiStore().(store.CommitMultiStore)
-			out := json.NewEncoder(cmd.OutOrStdout())
+			out := cmd.OutOrStdout()
 			for h := first; h <= last; h++ {
 				previous, err := cms.CacheMultiStoreWithVersion(h - 1)
 				if err != nil {
@@ -131,7 +153,17 @@ func (a appCreator) replayBlocks() *cobra.Command {
 				if err != nil {
 					return fmt.Errorf("assemble block %d: %w", h, err)
 				}
-				if err = out.Encode(bundle); err != nil {
+				raw, err := json.Marshal(bundle)
+				if err != nil {
+					return err
+				}
+				// Publish sequentially verified results under the same hash key used by RPC.
+				if archiveDir == "" {
+					if err = saveBundle(bundlePath(home, h, bundle.Header.Hash), raw); err != nil {
+						return err
+					}
+				}
+				if _, err = out.Write(append(raw, '\n')); err != nil {
 					return err
 				}
 			}
