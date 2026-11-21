@@ -88,6 +88,7 @@ func (a appCreator) replayBlocks() *cobra.Command {
 				application.InitChain(abci.RequestInitChain{Time: doc.GenesisTime, ChainId: doc.ChainID, InitialHeight: doc.InitialHeight, ConsensusParams: params, Validators: tm.TM2PB.ValidatorUpdates(tm.NewValidatorSet(validators)), AppStateBytes: doc.AppState})
 			}
 			out := cmd.OutOrStdout()
+			archive := replay.NewArchiveReader(source)
 			for h := first; h <= last; h++ {
 				var previous store.MultiStore
 				if h > 1 {
@@ -105,7 +106,7 @@ func (a appCreator) replayBlocks() *cobra.Command {
 					}
 					observations = append(observations, obs)
 				})
-				r, err := replay.FromArchive(cmd.Context(), source, application, h)
+				r, err := archive.Replay(cmd.Context(), application, h)
 				if err != nil {
 					return fmt.Errorf("replay %d: %w", h, err)
 				}
