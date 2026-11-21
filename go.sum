@@ -714,6 +714,8 @@ github.com/BurntSushi/xgb v0.0.0-20160522181843-27f122750802/go.mod h1:IVnqGOEym
 github.com/ChainSafe/go-schnorrkel v0.0.0-20200405005733-88cbf1b4c40d/go.mod h1:URdX5+vg25ts3aCh8H5IFZybJYKWhJHYMTnf+ULtoC4=
 github.com/ChainSafe/go-schnorrkel v1.0.0 h1:3aDA67lAykLaG1y3AOjs88dMxC88PgUuHRrLeDnvGIM=
 github.com/ChainSafe/go-schnorrkel v1.0.0/go.mod h1:dpzHYVxLZcp8pjlV+O+UR8K0Hp/z7vcchBSbMBEhCw4=
+github.com/Chaintable/ethermint-cronos v0.20.11-cronos.0.20261121052711-08cf748cfa4f h1:6x1gEO0qjqf5yR/Het/ctw839d2DSEOhkr+0yzUfFyQ=
+github.com/Chaintable/ethermint-cronos v0.20.11-cronos.0.20261121052711-08cf748cfa4f/go.mod h1:EDjmywAw/EMpMufJA2Q+E9pNHAB00Dt5siQanMOZC88=
 github.com/CloudyKit/fastprinter v0.0.0-20170127035650-74b38d55f37a/go.mod h1:EFZQ978U7x8IRnstaskI3IysnWY5Ao3QgZUKOXlsAdw=
 github.com/CloudyKit/jet v2.1.3-0.20180809161101-62edd43e4f88+incompatible/go.mod h1:HPYO+50pSWkPoj9Q/eq0aRGByCL6ScRlUmiEX5Zgm+w=
 github.com/DATA-DOG/go-sqlmock v1.3.3/go.mod h1:f/Ixk793poVmq4qj/V1dPUg2JEAKC73Q5eFN3EC/SaM=
@@ -1268,8 +1270,6 @@ github.com/crypto-org-chain/cronos/store v0.0.5 h1:Ll9FxohR4I3mJlng+w2m6X7iIqYej
 github.com/crypto-org-chain/cronos/store v0.0.5/go.mod h1:KC9cV7VK8BNIJySzztw2nWSqPqVGcffsumMl3sORPCM=
 github.com/crypto-org-chain/cronos/versiondb v0.0.0-20231115070216-b0af3db7b932 h1:t4TisWGxHLtmDeugl4KApCuxCplj/avwmlms7GFsJMk=
 github.com/crypto-org-chain/cronos/versiondb v0.0.0-20231115070216-b0af3db7b932/go.mod h1:i9e8vrU54C/JvSM+rX/jUidFRBcyXZ8FgNX+EvrasQc=
-github.com/crypto-org-chain/ethermint v0.20.11-cronos.0.20231220064956-a85daedc6ffc h1:1sdpqaZTdUJtq8N35yVVOhYT/5SzQnA/jI7UYAWXsjw=
-github.com/crypto-org-chain/ethermint v0.20.11-cronos.0.20231220064956-a85daedc6ffc/go.mod h1:EDjmywAw/EMpMufJA2Q+E9pNHAB00Dt5siQanMOZC88=
 github.com/crypto-org-chain/go-ethereum v1.10.19-deepcopy-jumptable h1:VQLW0R8t9DcC/HvQZO1i0mIWjJfAezhI8lLUCholP0M=
 github.com/crypto-org-chain/go-ethereum v1.10.19-deepcopy-jumptable/go.mod h1:IJBNMtzKcNHPtllYihy6BL2IgK1u+32JriaTbdt4v+w=
 github.com/crypto-org-chain/go-ethereum-hdwallet v0.1.2 h1:Qu2GMavGHCcomdVWmZej76JpOO6uvII6IpPDdJUG+Qo=

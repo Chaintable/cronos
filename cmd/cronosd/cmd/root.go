@@ -17,6 +17,7 @@ import (
 	"github.com/tendermint/tendermint/libs/log"
 	dbm "github.com/tendermint/tm-db"
 
+	"github.com/cosmos/cosmos-sdk/baseapp"
 	"github.com/cosmos/cosmos-sdk/client"
 	"github.com/cosmos/cosmos-sdk/client/config"
 	"github.com/cosmos/cosmos-sdk/client/debug"
@@ -112,6 +113,7 @@ func initRootCmd(rootCmd *cobra.Command, encodingConfig params.EncodingConfig) {
 	cfg.Seal()
 
 	a := appCreator{encodingConfig}
+	rootCmd.AddCommand(a.replayBlocks())
 	rootCmd.AddCommand(
 		ethermintclient.ValidateChainID(
 			WrapInitCmd(app.DefaultNodeHome),
@@ -237,6 +239,10 @@ type appCreator struct {
 
 // newApp is an AppCreator
 func (a appCreator) newApp(logger log.Logger, db dbm.DB, traceStore io.Writer, appOpts servertypes.AppOptions) servertypes.Application {
+	return a.newReplayApp(logger, db, traceStore, appOpts, nil)
+}
+func (a appCreator) newReplayApp(logger log.Logger, db dbm.DB, traceStore io.Writer, appOpts servertypes.AppOptions, cache sdk.MultiStorePersistentCache) *app.App {
+
 	snapshotDir := filepath.Join(cast.ToString(appOpts.Get(flags.FlagHome)), "data", "snapshots")
 	if err := os.MkdirAll(snapshotDir, os.ModePerm); err != nil {
 		panic(err)
@@ -248,6 +254,9 @@ func (a appCreator) newApp(logger log.Logger, db dbm.DB, traceStore io.Writer, a
 	}
 
 	baseappOptions := server.DefaultBaseappOptions(appOpts)
+	if cache != nil {
+		baseappOptions = append(baseappOptions, baseapp.SetInterBlockCache(cache))
+	}
 	return app.New(
 		logger, db, traceStore, true, skipUpgradeHeights,
 		cast.ToString(appOpts.Get(flags.FlagHome)),
