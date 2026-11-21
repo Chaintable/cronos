@@ -4,6 +4,8 @@
 
 ### Improvements
 
+* [rpc] Replay full Cosmos blocks for v1.7 mainnet archive traces.
+
 * [#9](https://github.com/Chaintable/cronos/pull/9) feat(blocksync): add an opt-in continuous sync mode for non-validator nodes.
 * [#2095](https://github.com/crypto-org-chain/cronos/pull/2095) feat: add hardcoded unblockable address list that is filtered out of both the mempool and consensus blocklists.
 

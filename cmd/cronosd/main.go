@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"os"
 
 	"github.com/crypto-org-chain/cronos/app"
@@ -10,6 +11,13 @@ import (
 )
 
 func main() {
+	if len(os.Args) == 3 && os.Args[1] == "replay-finalize-worker" {
+		if err := cmd.RunReplayWorker(os.Args[2], os.Stdin, os.Stdout); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
+	}
 	rootCmd := cmd.NewRootCmd()
 	if err := svrcmd.Execute(rootCmd, cmd.EnvPrefix, app.DefaultNodeHome); err != nil {
 		os.Exit(1)

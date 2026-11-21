@@ -3,6 +3,7 @@
 package opendb
 
 import (
+	"fmt"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -36,7 +37,7 @@ func OpenReadOnlyDB(home string, backendType dbm.BackendType) (dbm.DB, error) {
 }
 
 func openRocksdb(dir string, readonly bool) (dbm.DB, error) {
-	opts, err := loadLatestOptions(dir)
+	opts, err := loadLatestOptions(dir, grocksdb.NewLRUCache(BlockCacheSize))
 	if err != nil {
 		return nil, err
 	}
@@ -53,16 +54,43 @@ func openRocksdb(dir string, readonly bool) (dbm.DB, error) {
 		return nil, err
 	}
 
+	return wrapRocksDB(db), nil
+}
+
+// OpenReplayDB pins a secondary view of a live RocksDB. All writes are
+// rejected by RocksDB and its own metadata is confined to the scratch path.
+func OpenReplayDB(home, scratch string) (dbm.DB, error) {
+	dir := filepath.Join(home, "data", "application.db")
+	cache := grocksdb.NewLRUCache(32 << 20)
+	defer cache.Destroy()
+	opts, err := loadLatestOptions(dir, cache)
+	if err != nil {
+		return nil, err
+	}
+	if opts == nil {
+		return nil, fmt.Errorf("missing RocksDB options at %s", dir)
+	}
+	defer opts.Destroy()
+	opts.SetCreateIfMissing(false)
+	opts.SetMaxOpenFiles(-1)
+	db, err := grocksdb.OpenDbAsSecondary(opts, dir, scratch)
+	if err != nil {
+		return nil, err
+	}
+	return wrapRocksDB(db), nil
+}
+
+func wrapRocksDB(db *grocksdb.DB) dbm.DB {
 	ro := grocksdb.NewDefaultReadOptions()
 	wo := grocksdb.NewDefaultWriteOptions()
 	woSync := grocksdb.NewDefaultWriteOptions()
 	woSync.SetSync(true)
-	return dbm.NewRocksDBWithRawDB(db, ro, wo, woSync), nil
+	return dbm.NewRocksDBWithRawDB(db, ro, wo, woSync)
 }
 
 // loadLatestOptions try to load options from existing db, returns nil if not exists.
-func loadLatestOptions(dir string) (*grocksdb.Options, error) {
-	opts, err := grocksdb.LoadLatestOptions(dir, grocksdb.NewDefaultEnv(), true, grocksdb.NewLRUCache(BlockCacheSize))
+func loadLatestOptions(dir string, cache *grocksdb.Cache) (*grocksdb.Options, error) {
+	opts, err := grocksdb.LoadLatestOptions(dir, grocksdb.NewDefaultEnv(), true, cache)
 	if err != nil {
 		// not found is not an error
 		if strings.HasPrefix(err.Error(), "NotFound: ") {
