@@ -230,8 +230,8 @@ github.com/BurntSushi/toml v0.4.1/go.mod h1:CxXYINrC8qIiEnFrOxCa7Jy5BFHlXnUU2pbi
 github.com/BurntSushi/toml v1.1.0/go.mod h1:CxXYINrC8qIiEnFrOxCa7Jy5BFHlXnUU2pbicEuybxQ=
 github.com/ChainSafe/go-schnorrkel v1.0.0 h1:3aDA67lAykLaG1y3AOjs88dMxC88PgUuHRrLeDnvGIM=
 github.com/ChainSafe/go-schnorrkel v1.0.0/go.mod h1:dpzHYVxLZcp8pjlV+O+UR8K0Hp/z7vcchBSbMBEhCw4=
-github.com/Chaintable/ethermint-cronos v0.6.1-0.20261121060133-6a2826de540d h1:9zq29Uv9xzGxzMenz4g+xhCac99pnlAhbKCzyM2xw/E=
-github.com/Chaintable/ethermint-cronos v0.6.1-0.20261121060133-6a2826de540d/go.mod h1:zJYmx1D+tDggzvXmdJ0/I62TeIykdCMfJBjBxOcniAU=
+github.com/Chaintable/ethermint-cronos v0.6.1-0.20261121125109-5a3850ec4b07 h1:4yMQld6Aal8QKi8qd4oV7O0skKZynH1QIEhLVhTstZ4=
+github.com/Chaintable/ethermint-cronos v0.6.1-0.20261121125109-5a3850ec4b07/go.mod h1:zJYmx1D+tDggzvXmdJ0/I62TeIykdCMfJBjBxOcniAU=
 github.com/DATA-DOG/go-sqlmock v1.5.0/go.mod h1:f/Ixk793poVmq4qj/V1dPUg2JEAKC73Q5eFN3EC/SaM=
 github.com/DataDog/datadog-go v3.2.0+incompatible/go.mod h1:LButxg5PwREeZtORoXG3tL4fMGNddJ+vMq1mwgfaqoQ=
 github.com/DataDog/zstd v1.4.1/go.mod h1:1jcaCB/ufaK+sKp1NBhlGmpz41jOoPQ35bpF36t7BBo=
