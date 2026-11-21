@@ -4,6 +4,8 @@
 
 ### Improvements
 
+- Add verified full-block replay and the archive JSON-RPC method `trace_debankBlock` for Cronos v0.6 mainnet.
+
 - [#470](https://github.com/crypto-org-chain/cronos/pull/470) Run the tasks in `fix-unlucky-tx` command in parallel.
 - [#472](https://github.com/crypto-org-chain/cronos/pull/472) `fix-unlucky-tx` command supports `null` tendermint tx indexer.
 
