@@ -66,13 +66,13 @@ func (app *App) ReplayBlock(ctx context.Context, req replay.Request) (*replay.Re
 func ObserveReplayTransactions(k *keeper.Keeper) *[]replay.Transaction {
 	var txs []replay.Transaction
 	k.SetTransactionObserver(func(ctx sdk.Context, hash common.Hash) (*tracing.Hooks, func(*evmtypes.EVMResult, error)) {
-		t := tracer.NewExecutionTracer(hash)
+		hooks, finish := tracer.NewReplayTracer(hash)
 		tx := replay.Transaction{CosmosIndex: ctx.TxIndex(), MessageIndex: ctx.MsgIndex(), Hash: hash}
-		return t.Hooks, func(result *evmtypes.EVMResult, err error) {
+		return hooks, func(result *evmtypes.EVMResult, err error) {
 			if err == nil {
 				tx.GasUsed = result.GasUsed
 				tx.Failed = result.Failed()
-				tx.Trace, err = t.GetResult()
+				tx.Trace, err = finish(result.VmError)
 			}
 			if err != nil {
 				tx.Error = err.Error()
