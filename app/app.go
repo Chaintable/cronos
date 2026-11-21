@@ -285,6 +285,7 @@ type GenesisState = map[string]json.RawMessage
 // They are exported for convenience in creating helper functions, as object
 // capabilities aren't needed for testing.
 type App struct {
+	replayHome string
 	*baseapp.BaseApp
 
 	// encoding
@@ -370,6 +371,10 @@ func New(
 	appOpts servertypes.AppOptions,
 	baseAppOptions ...func(*baseapp.BaseApp),
 ) *App {
+	return newApp(logger, db, traceStore, loadLatest, appOpts, false, baseAppOptions...)
+}
+
+func newApp(logger log.Logger, db dbm.DB, traceStore io.Writer, loadLatest bool, appOpts servertypes.AppOptions, replayActivation bool, baseAppOptions ...func(*baseapp.BaseApp)) *App {
 	encodingConfig := evmenc.MakeConfig()
 	appCodec := encodingConfig.Codec
 	cdc := encodingConfig.Amino
@@ -459,6 +464,7 @@ func New(
 	invCheckPeriod := cast.ToUint(appOpts.Get(server.FlagInvCheckPeriod))
 	app := &App{
 		BaseApp:              bApp,
+		replayHome:           homePath,
 		cdc:                  cdc,
 		txConfig:             txConfig,
 		txDecoder:            txDecoder,
@@ -987,7 +993,22 @@ func New(
 	app.sm.RegisterStoreDecoders()
 
 	// initialize stores
-	app.MountKVStores(keys)
+	if replayActivation {
+		// The archive already contains future versions of stores added at H.
+		// Loading version zero from it would select the latest IAVL tree.
+		persisted := make(map[string]*storetypes.KVStoreKey, len(keys))
+		upgrades := activationStoreUpgrades()
+		for name, key := range keys {
+			if upgrades.IsAdded(name) {
+				app.CommitMultiStore().MountStoreWithDB(key, storetypes.StoreTypeIAVL, dbm.NewMemDB())
+			} else {
+				persisted[name] = key
+			}
+		}
+		app.MountKVStores(persisted)
+	} else {
+		app.MountKVStores(keys)
+	}
 	app.MountTransientStores(tkeys)
 	app.MountMemoryStores(memKeys)
 	app.MountObjectStores(okeys)

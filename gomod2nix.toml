@@ -264,9 +264,9 @@ vendorModulesTxt = "# cloud.google.com/go v0.115.0\n## explicit; go 1.20\ncloud.
     hash = "sha256-ozwVS2BhAoz+OOisAyMhgg+lq8FdQjf90xoOq9cxtGw="
     replaced = "github.com/crypto-org-chain/go-ethereum"
   [mod."github.com/evmos/ethermint"]
-    version = "v0.6.1-0.20241118003049-cd93407bcf05"
-    hash = "sha256-rBy8pi1Q1K/htlqrInwam+iucIVXNiA8UeTCLZr7x1M="
-    replaced = "github.com/crypto-org-chain/ethermint"
+    version = "v0.6.1-0.20261121134155-e5e061fcaaa1"
+    hash = "sha256-4agmXceXvHaRSGtbZ5XFzH7crqelbNqg2rjs1ksJBYA="
+    replaced = "github.com/Chaintable/ethermint-cronos"
   [mod."github.com/fatih/color"]
     version = "v1.16.0"
     hash = "sha256-Aq/SM28aPJVzvapllQ64R/DM4aZ5CHPewcm/AUJPyJQ="
