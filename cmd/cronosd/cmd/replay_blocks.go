@@ -47,6 +47,13 @@ func (a appCreator) replayBlocks() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			// ICS23 prints diagnostics directly to os.Stdout during historical
+			// IBC proof checks. Reserve the command output for JSON bundles.
+			out := cmd.OutOrStdout()
+			stdout := os.Stdout
+			os.Stdout = os.Stderr
+			defer func() { os.Stdout = stdout }()
+
 			ctx := server.GetServerContextFromCmd(cmd)
 			home := ctx.Viper.GetString(flags.FlagHome)
 			private := filepath.Join(home, "replay")
@@ -82,7 +89,6 @@ func (a appCreator) replayBlocks() *cobra.Command {
 			writes := replay.NewStateWrites("basecro")
 			application := a.newReplayApp(log.NewNopLogger(), db, nil, ctx.Viper, writes)
 			cms := application.NewUncachedContext(false, proto.Header{}).MultiStore().(store.CommitMultiStore)
-			out := cmd.OutOrStdout()
 			for h := first; h <= last; h++ {
 				previous, err := cms.CacheMultiStoreWithVersion(h - 1)
 				if err != nil {

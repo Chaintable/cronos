@@ -1,5 +1,9 @@
 # Changelog
 
+## Historical replay
+
+- Keep stdout valid JSON when `replay-blocks` executes an IBC proof check on v0.8.3. Diagnostics are written to stderr.
+
 ## v0.8.3
 
 ### Bug Fixes
