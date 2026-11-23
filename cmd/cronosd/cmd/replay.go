@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -44,6 +45,12 @@ func RunReplayWorker(home, socket string, stdin io.Reader, stderr io.Writer) err
 	if err != nil {
 		return err
 	}
+	// Each request builds a fresh app, so the worker trades memory for less GC.
+	gogc, err := replayIntEnv("CRONOS_REPLAY_GOGC", 400, 1)
+	if err != nil {
+		return err
+	}
+	debug.SetGCPercent(gogc)
 	scratch, err := os.MkdirTemp("", "cronos-replay-")
 	if err != nil {
 		return err
