@@ -25,8 +25,8 @@ func init() {
 }
 
 func main() {
-	if len(os.Args) == 3 && os.Args[1] == "replay-finalize-worker" {
-		if err := cmd.RunReplayWorker(os.Args[2], os.Stdin, os.Stdout); err != nil {
+	if len(os.Args) == 4 && os.Args[1] == "replay-worker" {
+		if err := cmd.RunReplayWorker(os.Args[2], os.Args[3], os.Stdin, os.Stderr); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}

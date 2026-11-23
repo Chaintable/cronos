@@ -7,6 +7,6 @@ import (
 	"io"
 )
 
-func RunReplayWorker(_ string, _ io.Reader, _ io.Writer) error {
+func RunReplayWorker(_, _ string, _ io.Reader, _ io.Writer) error {
 	return errors.New("historical replay requires read-only RocksDB support")
 }

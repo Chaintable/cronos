@@ -1,15 +1,11 @@
 package app
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"os"
-	"os/exec"
-	"strings"
 	"time"
 
-	"github.com/bytedance/sonic"
 	sdk "github.com/cosmos/cosmos-sdk/types"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/tracing"
@@ -43,8 +39,8 @@ func (app *App) BlockFileOnly() (bool, error) {
 	}
 }
 
-// ReplayBlock isolates the app constructor, keepers and IAVL working trees
-// from consensus. CommandContext terminates outstanding work on cancellation.
+// ReplayBlock executes the block in the long-lived replay worker, isolating
+// its app instances and IAVL working trees from consensus.
 func (app *App) ReplayBlock(ctx context.Context, req replay.Request) (*replay.Result, error) {
 	if req.Request == nil {
 		return nil, fmt.Errorf("missing finalize request")
@@ -53,37 +49,12 @@ func (app *App) ReplayBlock(ctx context.Context, req replay.Request) (*replay.Re
 		return nil, err
 	}
 	start := time.Now()
-	exe, err := os.Executable()
+	logger := app.Logger().With("module", "replay")
+	result, err := app.replayWorker.call(ctx, app.replayHome, logger, req)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("replay worker: %w", err)
 	}
-	input, err := sonic.ConfigStd.Marshal(req)
-	if err != nil {
-		return nil, err
-	}
-	temp, err := os.MkdirTemp("", "cronos-replay-worker-")
-	if err != nil {
-		return nil, err
-	}
-	defer os.RemoveAll(temp)
-	cmd := exec.CommandContext(ctx, exe, "replay-finalize-worker", app.replayHome)
-	cmd.Env = append(os.Environ(), "TMPDIR="+temp)
-	cmd.Stdin = bytes.NewReader(input)
-	var diagnostic bytes.Buffer
-	cmd.Stderr = &diagnostic
-	out, err := cmd.Output()
-	if ctx.Err() != nil {
-		return nil, ctx.Err()
-	}
-	if err != nil {
-		return nil, fmt.Errorf("finalize worker: %w: %s", err, diagnostic.String())
-	}
-	result, err := replay.ReadResult(bytes.NewReader(out))
-	if err != nil {
-		return nil, err
-	}
-	app.Logger().Debug("replay worker finished", "height", req.Request.Height,
-		"total_ms", time.Since(start).Milliseconds(), "worker", strings.TrimSpace(diagnostic.String()))
+	logger.Debug("replay finished", "height", req.Request.Height, "total_ms", time.Since(start).Milliseconds())
 	return result, nil
 }
 

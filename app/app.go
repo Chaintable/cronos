@@ -15,6 +15,7 @@ import (
 	stdruntime "runtime"
 	"slices"
 	"sort"
+	"sync"
 	"time"
 
 	"filippo.io/age"
@@ -270,6 +271,8 @@ var (
 	_ servertypes.Application = (*App)(nil)
 )
 
+var setEIP712EncodingOnce sync.Once
+
 type GenesisState = map[string]json.RawMessage
 
 // App extends an ABCI application, but with most of its parameters exported.
@@ -277,7 +280,8 @@ type GenesisState = map[string]json.RawMessage
 // capabilities aren't needed for testing.
 type App struct {
 	*baseapp.BaseApp
-	replayHome string
+	replayHome   string
+	replayWorker replayProcess
 
 	// encoding
 	cdc               *codec.LegacyAmino
@@ -411,7 +415,9 @@ func New(
 		activeDecoder = cronosmempool.NewCachingDecoder(txDecoder, cronosmempool.NewDecodeCache(uint(txCacheSize), uint(maxTxBytes)))
 	}
 
-	eip712.SetEncodingConfig(encodingConfig)
+	// Every app in a process shares one encoding; installing it again would
+	// race with EIP-712 decoding in apps that are already executing.
+	setEIP712EncodingOnce.Do(func() { eip712.SetEncodingConfig(encodingConfig) })
 
 	homePath := cast.ToString(appOpts.Get(flags.FlagHome))
 	var identity age.Identity
