@@ -39,6 +39,11 @@ func RunReplayWorker(home, socket string, stdin io.Reader, stderr io.Writer) err
 	if err != nil {
 		return err
 	}
+	// A static archive has nothing to catch up with; skip it for backfills.
+	catchUpEnabled, err := replayBoolEnv("CRONOS_REPLAY_CATCH_UP", true)
+	if err != nil {
+		return err
+	}
 	scratch, err := os.MkdirTemp("", "cronos-replay-")
 	if err != nil {
 		return err
@@ -61,6 +66,9 @@ func RunReplayWorker(home, socket string, stdin io.Reader, stderr io.Writer) err
 		listener.Close()
 	}()
 
+	if !catchUpEnabled {
+		catchUp = nil
+	}
 	w := &replayWorker{db: sharedDB{db}, catchUp: catchUp, scratch: scratch, slots: make(chan struct{}, workers), log: stderr}
 	var wg sync.WaitGroup
 	defer wg.Wait()
@@ -80,8 +88,8 @@ func RunReplayWorker(home, socket string, stdin io.Reader, stderr io.Writer) err
 
 type replayWorker struct {
 	db      dbm.DB
-	catchUp func() error
-	mu      sync.Mutex // serializes catch-up with the primary
+	catchUp func() error // nil when catch-up is disabled
+	mu      sync.Mutex   // serializes catch-up with the primary
 	scratch string
 	slots   chan struct{}
 	log     io.Writer
@@ -125,11 +133,13 @@ func (w *replayWorker) replay(in replay.Request, timing *workerTiming) (res *rep
 	if in.Request == nil || in.Request.Height < 2 || len(in.ParentHash) != 32 {
 		return nil, fmt.Errorf("invalid historical finalize request")
 	}
-	w.mu.Lock()
-	err = w.catchUp()
-	w.mu.Unlock()
-	if err != nil {
-		return nil, fmt.Errorf("catch up with application.db: %w", err)
+	if w.catchUp != nil {
+		w.mu.Lock()
+		err = w.catchUp()
+		w.mu.Unlock()
+		if err != nil {
+			return nil, fmt.Errorf("catch up with application.db: %w", err)
+		}
 	}
 	timing.mark("catch_up")
 	// Upgrade metadata and keeper scratch files belong to this request.
@@ -176,6 +186,18 @@ func replayIntEnv(key string, fallback, minimum int) (int, error) {
 	value, err := strconv.Atoi(raw)
 	if err != nil || value < minimum {
 		return 0, fmt.Errorf("invalid %s=%q: expected integer >= %d", key, raw, minimum)
+	}
+	return value, nil
+}
+
+func replayBoolEnv(key string, fallback bool) (bool, error) {
+	raw, set := os.LookupEnv(key)
+	if !set {
+		return fallback, nil
+	}
+	value, err := strconv.ParseBool(raw)
+	if err != nil {
+		return false, fmt.Errorf("invalid %s=%q: expected true or false", key, raw)
 	}
 	return value, nil
 }
