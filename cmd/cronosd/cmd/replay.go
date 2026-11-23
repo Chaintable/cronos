@@ -72,13 +72,5 @@ func RunReplayWorker(home string, input io.Reader, output io.Writer) error {
 	if err := verifyReplayChanges(a, in.Request.Height, keys); err != nil {
 		return err
 	}
-	state := a.NewUncachedContext(false, proto.Header{Height: in.Request.Height})
-	plan, height, err := a.UpgradeKeeper.GetLastCompletedUpgrade(state)
-	if err != nil {
-		return fmt.Errorf("read active upgrade: %w", err)
-	}
-	if plan != "v1.8" || height != 101485000 {
-		return fmt.Errorf("unsupported active upgrade %q at %d", plan, height)
-	}
 	return replay.WriteResult(output, replay.Result{Finalize: res, Transactions: *txs})
 }
