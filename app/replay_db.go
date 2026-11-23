@@ -46,10 +46,10 @@ func (o *overlayDB) ReverseIterator(start, end []byte) (dbm.Iterator, error) {
 }
 
 // Close leaves the shared parent open.
-func (o *overlayDB) Close() error              { return nil }
-func (o *overlayDB) Print() error              { return nil }
-func (o *overlayDB) Stats() map[string]string  { return nil }
-func (o *overlayDB) NewBatch() dbm.Batch       { return &overlayBatch{db: o} }
+func (o *overlayDB) Close() error             { return nil }
+func (o *overlayDB) Print() error             { return nil }
+func (o *overlayDB) Stats() map[string]string { return nil }
+func (o *overlayDB) NewBatch() dbm.Batch      { return &overlayBatch{db: o} }
 
 type overlayOp struct {
 	key, value []byte
