@@ -378,8 +378,8 @@ schema = 3
     version = "v0.2.2"
     hash = "sha256-0MLfSJKdeK3Z7tWAXTdzwB4091dmyxIX38S5SKH5QAw="
   [mod."github.com/evmos/ethermint"]
-    version = "v0.24.0-ct.2.0.20261123124434-692c9289e4ad"
-    hash = "sha256-dpAGBpQhgFCVi83Iw4XLsZ/XM/fEAQRXsXgPJBPQTF0="
+    version = "v0.24.0-ct.2.0.20261123125235-53c1bb27df5a"
+    hash = "sha256-AJKkBVSRz0s91T6u0NOD+9VZVReKfc/dhyZcnEV8AF8="
     replaced = "github.com/Chaintable/ethermint-cronos"
   [mod."github.com/fatih/color"]
     version = "v1.18.0"
