@@ -200,7 +200,7 @@ require (
 	github.com/bgentry/speakeasy v0.2.0 // indirect
 	github.com/bits-and-blooms/bitset v1.24.4 // indirect
 	github.com/bytedance/gopkg v0.1.4 // indirect
-	github.com/bytedance/sonic v1.15.1 // indirect
+	github.com/bytedance/sonic v1.15.1
 	github.com/bytedance/sonic/loader v0.5.1 // indirect
 	github.com/cenkalti/backoff/v4 v4.3.0 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0
@@ -398,7 +398,7 @@ replace (
 	github.com/ethereum/go-ethereum => github.com/crypto-org-chain/go-ethereum v1.10.20-0.20260521015249-663dca6c618e
 
 	// v0.24.0
-	github.com/evmos/ethermint => github.com/Chaintable/ethermint-cronos v0.24.0-ct.2.0.20261123123251-13e26d14e636
+	github.com/evmos/ethermint => github.com/Chaintable/ethermint-cronos v0.24.0-ct.2.0.20261123124434-692c9289e4ad
 
 	github.com/syndtr/goleveldb => github.com/syndtr/goleveldb v1.0.1-0.20210819022825-2ae1ddf74ef7
 )

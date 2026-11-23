@@ -4,13 +4,13 @@ package cmd
 
 import (
 	"bytes"
-	"encoding/json"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 
 	"cosmossdk.io/log/v2"
+	"github.com/bytedance/sonic"
 	proto "github.com/cometbft/cometbft/proto/tendermint/types"
 	"github.com/cosmos/cosmos-sdk/baseapp"
 	"github.com/cosmos/cosmos-sdk/client/flags"
@@ -26,7 +26,7 @@ import (
 // serving process would race with transaction decoding.
 func RunReplayWorker(home string, input io.Reader, output io.Writer) error {
 	var in replay.Request
-	if err := json.NewDecoder(input).Decode(&in); err != nil {
+	if err := sonic.ConfigStd.NewDecoder(input).Decode(&in); err != nil {
 		return err
 	}
 	if in.Request == nil || in.Request.Height < 2 || len(in.ParentHash) != 32 {
@@ -62,15 +62,20 @@ func RunReplayWorker(home string, input io.Reader, output io.Writer) error {
 	}
 	// FinalizeBlock computes WorkingHash on the private IAVL trees. Commit
 	// would persist them and is deliberately never called here.
+	// The write-set check only guards the state diff input.
 	keys := []storetypes.StoreKey{a.GetKey("acc"), a.GetKey("bank"), a.GetKey("evm")}
-	a.CommitMultiStore().AddListeners(keys)
+	if !in.BlockFileOnly {
+		a.CommitMultiStore().AddListeners(keys)
+	}
 	txs := app.ObserveReplayTransactions(a.EvmKeeper)
 	res, err := a.FinalizeBlock(in.Request)
 	if err != nil {
 		return err
 	}
-	if err := verifyReplayChanges(a, in.Request.Height, keys); err != nil {
-		return err
+	if !in.BlockFileOnly {
+		if err := verifyReplayChanges(a, in.Request.Height, keys); err != nil {
+			return err
+		}
 	}
 	return replay.WriteResult(output, replay.Result{Finalize: res, Transactions: *txs})
 }
