@@ -165,12 +165,12 @@ replace github.com/cosmos/ibc-go => github.com/crypto-org-chain/ibc-go v1.2.1-ho
 
 replace github.com/cosmos/iavl => github.com/cosmos/iavl v0.17.3
 
-replace github.com/ethereum/go-ethereum => github.com/Chaintable/go-ethereum v0.0.0-20261123171153-e6d694620c54
+replace github.com/ethereum/go-ethereum => github.com/Chaintable/go-ethereum v0.0.0-20261124034159-f2b887f14495
 
 // TODO: remove when ibc-go and ethermint upgrades cosmos-sdk
 replace github.com/cosmos/cosmos-sdk => github.com/crypto-org-chain/cosmos-sdk v0.44.6-cronos-revert-2
 
-replace github.com/tharsis/ethermint => github.com/Chaintable/ethermint-cronos v0.7.3-0.20261124024802-7f2ddb460341
+replace github.com/tharsis/ethermint => github.com/Chaintable/ethermint-cronos v0.7.3-0.20261124034304-a9b028ef4a71
 
 // Note: gorocksdb bindings for OptimisticTransactionDB are not merged upstream, so we use a fork
 // See https://github.com/tecbot/gorocksdb/pull/216
