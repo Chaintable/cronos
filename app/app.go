@@ -15,6 +15,7 @@ import (
 	stdruntime "runtime"
 	"slices"
 	"sort"
+	"sync"
 
 	"filippo.io/age"
 	abci "github.com/cometbft/cometbft/abci/types"
@@ -47,6 +48,7 @@ import (
 	cronosclient "github.com/crypto-org-chain/cronos/x/cronos/client"
 	cronoskeeper "github.com/crypto-org-chain/cronos/x/cronos/keeper"
 	evmhandlers "github.com/crypto-org-chain/cronos/x/cronos/keeper/evmhandlers"
+	cronosprecompiles "github.com/crypto-org-chain/cronos/x/cronos/keeper/precompiles"
 	"github.com/crypto-org-chain/cronos/x/cronos/middleware"
 	// force register the extension json-rpc.
 	_ "github.com/crypto-org-chain/cronos/x/cronos/rpc"
@@ -56,8 +58,11 @@ import (
 	e2eekeyring "github.com/crypto-org-chain/cronos/x/e2ee/keyring"
 	e2eetypes "github.com/crypto-org-chain/cronos/x/e2ee/types"
 	"github.com/ethereum/go-ethereum/common"
+	// Force-load the tracer engines to trigger registration
+	"github.com/ethereum/go-ethereum/core/vm"
 	_ "github.com/ethereum/go-ethereum/eth/tracers/js"
 	_ "github.com/ethereum/go-ethereum/eth/tracers/native"
+	ethparams "github.com/ethereum/go-ethereum/params"
 	"github.com/evmos/ethermint/ante/cache"
 	evmenc "github.com/evmos/ethermint/encoding"
 	"github.com/evmos/ethermint/ethereum/eip712"
@@ -261,6 +266,11 @@ var (
 	_ servertypes.Application = (*App)(nil)
 )
 
+var (
+	setEIP712EncodingOnce        sync.Once
+	validateProtoAnnotationsOnce sync.Once
+)
+
 type GenesisState = map[string]json.RawMessage
 
 // App extends an ABCI application, but with most of its parameters exported.
@@ -268,6 +278,8 @@ type GenesisState = map[string]json.RawMessage
 // capabilities aren't needed for testing.
 type App struct {
 	*baseapp.BaseApp
+	replayHome   string
+	replayWorker replayProcess
 
 	// encoding
 	cdc               *codec.LegacyAmino
@@ -350,7 +362,9 @@ func New(
 	txConfig := encodingConfig.TxConfig
 	interfaceRegistry := encodingConfig.InterfaceRegistry
 	txDecoder := txConfig.TxDecoder()
-	eip712.SetEncodingConfig(encodingConfig)
+	// Every app in a process shares one encoding; installing it again would
+	// race with EIP-712 decoding in apps that are already executing.
+	setEIP712EncodingOnce.Do(func() { eip712.SetEncodingConfig(encodingConfig) })
 
 	homePath := cast.ToString(appOpts.Get(flags.FlagHome))
 	var identity age.Identity
@@ -449,6 +463,7 @@ func New(
 	invCheckPeriod := cast.ToUint(appOpts.Get(server.FlagInvCheckPeriod))
 	app := &App{
 		BaseApp:              bApp,
+		replayHome:           homePath,
 		cdc:                  cdc,
 		txConfig:             txConfig,
 		txDecoder:            txDecoder,
@@ -640,13 +655,21 @@ func New(
 	// Set authority to x/gov module account to only expect the module account to update params
 	evmS := app.GetSubspace(evmtypes.ModuleName)
 
+	gasConfig := storetypes.TransientGasConfig()
 	app.EvmKeeper = evmkeeper.NewKeeper(
 		appCodec,
 		keys[evmtypes.StoreKey], okeys[evmtypes.ObjectStoreKey], authtypes.NewModuleAddress(govtypes.ModuleName),
 		app.AccountKeeper, app.BankKeeper, app.StakingKeeper, app.FeeMarketKeeper,
 		tracer,
 		evmS,
-		[]evmkeeper.CustomContractFn{},
+		[]evmkeeper.CustomContractFn{
+			func(_ sdk.Context, rules ethparams.Rules) vm.PrecompiledContract {
+				return cronosprecompiles.NewRelayerContract(app.IBCKeeper, appCodec, rules, app.Logger())
+			},
+			func(ctx sdk.Context, rules ethparams.Rules) vm.PrecompiledContract {
+				return cronosprecompiles.NewIcaContract(ctx, app.ICAControllerKeeper, &app.CronosKeeper, appCodec, gasConfig)
+			},
+		},
 		cast.ToUint64(appOpts.Get(server.FlagQueryGasLimit)),
 	)
 
@@ -1003,17 +1026,20 @@ func New(
 	app.setPostHandler()
 
 	// At startup, after all modules have been registered, check that all prot
-	// annotations are correct.
-	protoFiles, err := proto.MergedRegistry()
-	if err != nil {
-		panic(err)
-	}
-	err = msgservice.ValidateProtoAnnotations(protoFiles)
-	if err != nil {
-		// Once we switch to using protoreflect-based antehandlers, we might
-		// want to panic here instead of logging a warning.
-		fmt.Fprintln(os.Stderr, err.Error())
-	}
+	// annotations are correct. The registered files are fixed per binary, so
+	// apps built later in the same process skip the costly merge.
+	validateProtoAnnotationsOnce.Do(func() {
+		protoFiles, err := proto.MergedRegistry()
+		if err != nil {
+			panic(err)
+		}
+		err = msgservice.ValidateProtoAnnotations(protoFiles)
+		if err != nil {
+			// Once we switch to using protoreflect-based antehandlers, we might
+			// want to panic here instead of logging a warning.
+			fmt.Fprintln(os.Stderr, err.Error())
+		}
+	})
 
 	if loadLatest {
 		if err := app.LoadLatestVersion(); err != nil {
