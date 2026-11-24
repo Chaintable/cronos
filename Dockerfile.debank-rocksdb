@@ -1,0 +1,44 @@
+# Cronos v0.7.0 block replay image (trace_debankBlock over a stopped
+# RocksDB archive). The archive is written by RocksDB 10.9.1, so the replay
+# commands link that version; the node's own RocksDB backend is not built.
+
+FROM debian:bookworm AS go-builder
+
+RUN apt-get update && \
+    apt-get install -y build-essential git curl ca-certificates \
+      libgflags-dev libsnappy-dev zlib1g-dev libbz2-dev liblz4-dev libzstd-dev && \
+    rm -rf /var/lib/apt/lists/*
+
+# Go version of the v0.7.0 release.
+ARG GO_VERSION=1.17.13
+RUN curl -fsSL https://go.dev/dl/go${GO_VERSION}.linux-$(dpkg --print-architecture).tar.gz | tar -C /usr/local -xz
+ENV PATH=/usr/local/go/bin:/root/go/bin:$PATH
+
+# PORTABLE=1 keeps the library runnable across CPU generations;
+# DISABLE_WARNING_AS_ERROR=1 drops -Werror for newer GCC warnings.
+RUN git clone --depth 1 --branch v10.9.1 https://github.com/facebook/rocksdb.git /tmp/rocksdb && \
+    cd /tmp/rocksdb && \
+    PORTABLE=1 DISABLE_WARNING_AS_ERROR=1 make -j$(nproc) install-shared && \
+    ldconfig && \
+    rm -rf /tmp/rocksdb
+
+WORKDIR /code
+COPY . /code/
+
+RUN GOPRIVATE='github.com/Chaintable/*' make install BUILD_TAGS=replay
+
+# --------------------------------------------------------
+FROM debian:bookworm-slim
+
+RUN apt-get update \
+    && apt-get install -y libsnappy1v5 libgflags2.2 zlib1g libbz2-1.0 liblz4-1 libzstd1 ca-certificates curl jq \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=go-builder /usr/local/lib/ /usr/local/lib/
+RUN ldconfig
+
+COPY --from=go-builder /root/go/bin/cronosd /usr/bin/cronosd
+
+WORKDIR /opt
+
+CMD ["/usr/bin/cronosd", "version"]
