@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strings"
+	"time"
 
 	"github.com/bytedance/sonic"
 	sdk "github.com/cosmos/cosmos-sdk/types"
@@ -50,6 +52,7 @@ func (app *App) ReplayBlock(ctx context.Context, req replay.Request) (*replay.Re
 	if err := app.CheckReplayHeight(req.ChainID, req.Request.Height); err != nil {
 		return nil, err
 	}
+	start := time.Now()
 	exe, err := os.Executable()
 	if err != nil {
 		return nil, err
@@ -75,7 +78,13 @@ func (app *App) ReplayBlock(ctx context.Context, req replay.Request) (*replay.Re
 	if err != nil {
 		return nil, fmt.Errorf("finalize worker: %w: %s", err, diagnostic.String())
 	}
-	return replay.ReadResult(bytes.NewReader(out))
+	result, err := replay.ReadResult(bytes.NewReader(out))
+	if err != nil {
+		return nil, err
+	}
+	app.Logger().Debug("replay worker finished", "height", req.Request.Height,
+		"total_ms", time.Since(start).Milliseconds(), "worker", strings.TrimSpace(diagnostic.String()))
+	return result, nil
 }
 
 // ObserveReplayTransactions attaches a collector to a private sequential keeper.
