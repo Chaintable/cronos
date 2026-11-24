@@ -3,7 +3,7 @@ name: "Build artifacts (RocksDB)"
 on:
   pull_request:
     branches:
-      - "main"
+      - "release/full-replay-base-v1.7"
   release:
     types:
       - created
