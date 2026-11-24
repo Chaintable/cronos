@@ -40,6 +40,15 @@ func RunReplayServer(home, listen string) error {
 	if err != nil {
 		return err
 	}
+	// Each RPC database has a separate cache. Honor smaller worker cache
+	// budgets while keeping the existing 256 MiB ceiling per database.
+	cacheMB, err := replayIntEnv("CRONOS_REPLAY_BLOCK_CACHE_MB", 256, 8)
+	if err != nil {
+		return err
+	}
+	if cacheMB > 256 {
+		cacheMB = 256
+	}
 	var dbs []dbm.DB
 	defer func() {
 		for _, db := range dbs {
@@ -47,7 +56,7 @@ func RunReplayServer(home, listen string) error {
 		}
 	}()
 	open := func(name string) error {
-		db, err := opendb.OpenReadOnly(data, name, 256<<20, maxOpenFiles)
+		db, err := opendb.OpenReadOnly(data, name, uint64(cacheMB)<<20, maxOpenFiles)
 		if err == nil {
 			dbs = append(dbs, db)
 		}
