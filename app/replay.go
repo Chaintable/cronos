@@ -6,6 +6,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/cosmos/cosmos-sdk/baseapp"
 	sdk "github.com/cosmos/cosmos-sdk/types"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/tracing"
@@ -56,6 +57,16 @@ func (app *App) ReplayBlock(ctx context.Context, req replay.Request) (*replay.Re
 	}
 	logger.Debug("replay finished", "height", req.Request.Height, "total_ms", time.Since(start).Milliseconds())
 	return result, nil
+}
+
+// ReplayAppOptions configures a discarded per-request replay app. Async IAVL
+// pruning would start a goroutine per store that keeps the whole app alive.
+func ReplayAppOptions(chainID string) []func(*baseapp.BaseApp) {
+	return []func(*baseapp.BaseApp){
+		baseapp.SetChainID(chainID),
+		baseapp.SetIAVLDisableFastNode(true),
+		baseapp.SetIAVLSyncPruning(true),
+	}
 }
 
 // ObserveReplayTransactions attaches a collector to a private sequential keeper.
