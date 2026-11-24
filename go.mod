@@ -17,6 +17,7 @@ require (
 	cosmossdk.io/x/upgrade v0.2.0
 	filippo.io/age v1.2.1
 	github.com/99designs/keyring v1.2.2
+	github.com/bytedance/sonic v1.15.1
 	github.com/cometbft/cometbft v0.38.19
 	github.com/cosmos/cosmos-db v1.1.3
 	github.com/cosmos/cosmos-proto v1.0.0-beta.5
@@ -82,7 +83,6 @@ require (
 	github.com/btcsuite/btcd/btcutil v1.1.6 // indirect
 	github.com/btcsuite/btcd/chaincfg/chainhash v1.1.0 // indirect
 	github.com/bytedance/gopkg v0.1.3 // indirect
-	github.com/bytedance/sonic v1.15.1 // indirect
 	github.com/bytedance/sonic/loader v0.5.1 // indirect
 	github.com/cenkalti/backoff/v4 v4.3.0 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
@@ -306,7 +306,7 @@ replace (
 	// release/v1.15
 	github.com/ethereum/go-ethereum => github.com/crypto-org-chain/go-ethereum v1.10.20-0.20250815065500-a4fbafcae0dd
 	// DeBank: ethermint-cronos fork carrying the trace_debankBlock emitter (branch v1.7.8, base = ethermint 2593e6ed).
-	github.com/evmos/ethermint => github.com/Chaintable/ethermint-cronos v0.22.1-cronos-v1.7.8-ct.1.0.20261121133927-85c77b10b557
+	github.com/evmos/ethermint => github.com/Chaintable/ethermint-cronos v0.22.1-cronos-v1.7.8-ct.1.0.20261124070754-6f7b9426548d
 	// Fix upstream GHSA-h395-qcrw-5vmq and GHSA-3vp4-m3rf-835h vulnerabilities.
 	// TODO Remove it: https://github.com/cosmos/cosmos-sdk/issues/10409
 	github.com/gin-gonic/gin => github.com/gin-gonic/gin v1.9.0
