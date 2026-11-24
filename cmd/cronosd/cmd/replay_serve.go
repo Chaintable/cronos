@@ -36,6 +36,10 @@ func RunReplayServer(home, listen string) error {
 	app.SetConfig()
 
 	data := filepath.Join(home, "data")
+	maxOpenFiles, err := replayIntEnv("CRONOS_REPLAY_MAX_OPEN_FILES", 1024, 1)
+	if err != nil {
+		return err
+	}
 	var dbs []dbm.DB
 	defer func() {
 		for _, db := range dbs {
@@ -43,7 +47,7 @@ func RunReplayServer(home, listen string) error {
 		}
 	}()
 	open := func(name string) error {
-		db, err := opendb.OpenReadOnly(data, name, 256<<20, 1024)
+		db, err := opendb.OpenReadOnly(data, name, 256<<20, maxOpenFiles)
 		if err == nil {
 			dbs = append(dbs, db)
 		}

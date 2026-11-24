@@ -35,6 +35,11 @@ func RunReplayWorker(home, socket string, stdin io.Reader, stderr io.Writer) err
 	if err != nil {
 		return err
 	}
+	// A bounded table cache lets a small worker open a multi-terabyte archive.
+	maxOpenFiles, err := replayIntEnv("CRONOS_REPLAY_MAX_OPEN_FILES", -1, 1)
+	if err != nil {
+		return err
+	}
 	// Each request builds a fresh app, so the worker trades memory for less GC.
 	gogc, err := replayIntEnv("CRONOS_REPLAY_GOGC", 400, 1)
 	if err != nil {
@@ -46,7 +51,7 @@ func RunReplayWorker(home, socket string, stdin io.Reader, stderr io.Writer) err
 		return err
 	}
 	defer os.RemoveAll(scratch)
-	db, err := opendb.OpenReadOnly(filepath.Join(home, "data"), "application", uint64(cacheMB)<<20, -1)
+	db, err := opendb.OpenReadOnly(filepath.Join(home, "data"), "application", uint64(cacheMB)<<20, maxOpenFiles)
 	if err != nil {
 		return fmt.Errorf("open parent application.db: %w", err)
 	}
