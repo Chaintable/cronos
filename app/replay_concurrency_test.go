@@ -3,6 +3,7 @@ package app
 import (
 	"encoding/json"
 	"math/big"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -83,7 +84,8 @@ func TestConcurrentFreshAppReplay(t *testing.T) {
 	req := finalize(2, txs...)
 
 	run := func() (*abci.ResponseFinalizeBlock, []replay.Transaction) {
-		replica := open(false)
+		opts := MinimalOptionsMap{flags.FlagHome: t.TempDir(), FlagDisableOptimisticExecution: true}
+		replica := New(log.NewNopLogger(), db, nil, false, opts, ReplayAppOptions(TestAppChainID)...)
 		require.NoError(t, replica.LoadHeight(1))
 		observed := ObserveReplayTransactions(replica.EvmKeeper)
 		out, err := replica.FinalizeBlock(req)
@@ -107,4 +109,12 @@ func TestConcurrentFreshAppReplay(t *testing.T) {
 		}()
 	}
 	wg.Wait()
+
+	// Discarded replay apps must not leave goroutines behind.
+	before := runtime.NumGoroutine()
+	for i := 0; i < 5; i++ {
+		run()
+	}
+	runtime.GC()
+	require.LessOrEqual(t, runtime.NumGoroutine(), before+2)
 }

@@ -19,7 +19,6 @@ import (
 	"github.com/bytedance/sonic"
 	proto "github.com/cometbft/cometbft/proto/tendermint/types"
 	dbm "github.com/cosmos/cosmos-db"
-	"github.com/cosmos/cosmos-sdk/baseapp"
 	"github.com/cosmos/cosmos-sdk/client/flags"
 	"github.com/crypto-org-chain/cronos/app"
 	"github.com/crypto-org-chain/cronos/cmd/cronosd/opendb"
@@ -160,7 +159,7 @@ func (w *replayWorker) replay(in replay.Request, timing *workerTiming) (res *rep
 	opts.Set(flags.FlagChainID, in.ChainID)
 	// No block executor is set: the observer requires sequential execution.
 	opts.Set(app.FlagDisableOptimisticExecution, true)
-	a := app.New(log.NewNopLogger(), w.db, nil, false, opts, baseapp.SetChainID(in.ChainID), baseapp.SetIAVLDisableFastNode(true))
+	a := app.New(log.NewNopLogger(), w.db, nil, false, opts, app.ReplayAppOptions(in.ChainID)...)
 	timing.mark("new_app")
 	parent := in.Request.Height - 1
 	if err = a.LoadHeight(parent); err != nil {
