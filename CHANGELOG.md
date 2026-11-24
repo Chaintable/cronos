@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- `replay-serve` serves `trace_debankBlock` for v0.7 mainnet blocks from a stopped RocksDB archive (build tag `replay`).
+
 *Aug 5, 2022*
 
 ## v0.7.1
