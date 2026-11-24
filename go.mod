@@ -170,9 +170,9 @@ replace (
 
 	github.com/tendermint/tendermint => github.com/tendermint/tendermint v0.34.20
 
-	github.com/tharsis/ethermint => github.com/Chaintable/ethermint-cronos v0.10.0-cronos.0.20261124133948-b0c07a159347
+	github.com/tharsis/ethermint => github.com/Chaintable/ethermint-cronos v0.10.0-cronos.0.20261124152340-188d43d28c57
 
 	google.golang.org/grpc => google.golang.org/grpc v1.33.2
 )
 
-replace github.com/ethereum/go-ethereum => github.com/Chaintable/go-ethereum v1.10.10-0.20261124125948-1e5f09b57388
+replace github.com/ethereum/go-ethereum => github.com/Chaintable/go-ethereum v1.10.10-0.20261124152011-e65b58f19ebe
