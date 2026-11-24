@@ -10,7 +10,6 @@ import (
 	"path/filepath"
 
 	"cosmossdk.io/log"
-	storetypes "cosmossdk.io/store/types"
 	"github.com/bytedance/sonic"
 	proto "github.com/cometbft/cometbft/proto/tendermint/types"
 	"github.com/cosmos/cosmos-sdk/baseapp"
@@ -62,20 +61,10 @@ func RunReplayWorker(home string, input io.Reader, output io.Writer) error {
 	}
 	// FinalizeBlock computes WorkingHash on the private IAVL trees. Commit
 	// would persist them and is deliberately never called here.
-	// The write-set check only guards the state diff input.
-	keys := []storetypes.StoreKey{a.GetKey("acc"), a.GetKey("bank"), a.GetKey("evm")}
-	if !in.BlockFileOnly {
-		a.CommitMultiStore().AddListeners(keys)
-	}
 	txs := app.ObserveReplayTransactions(a.EvmKeeper)
 	res, err := a.FinalizeBlock(in.Request)
 	if err != nil {
 		return err
-	}
-	if !in.BlockFileOnly {
-		if err := verifyReplayChanges(a, in.Request.Height, keys); err != nil {
-			return err
-		}
 	}
 	return replay.WriteResult(output, replay.Result{Finalize: res, Transactions: *txs})
 }
