@@ -200,7 +200,7 @@ require (
 	github.com/bgentry/speakeasy v0.2.0 // indirect
 	github.com/bits-and-blooms/bitset v1.24.4 // indirect
 	github.com/bytedance/gopkg v0.1.4 // indirect
-	github.com/bytedance/sonic v1.15.1 // indirect
+	github.com/bytedance/sonic v1.15.1
 	github.com/bytedance/sonic/loader v0.5.1 // indirect
 	github.com/cenkalti/backoff/v4 v4.3.0 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0
@@ -387,7 +387,7 @@ replace (
 	// Use cosmos keyring
 	github.com/99designs/keyring => github.com/cosmos/keyring v1.2.0
 	// v0.39.x
-	github.com/cometbft/cometbft => github.com/crypto-org-chain/cometbft v0.0.0-20260729145603-14b7b93046e3
+	github.com/cometbft/cometbft => github.com/Chaintable/cometbft v0.39.3-ct.1
 	// release/v0.54.x
 	github.com/cosmos/cosmos-sdk => github.com/crypto-org-chain/cosmos-sdk v0.54.4-0.20260806150823-1e7193afaaf8
 	// v1.9.0
@@ -398,7 +398,7 @@ replace (
 	github.com/ethereum/go-ethereum => github.com/crypto-org-chain/go-ethereum v1.10.20-0.20260521015249-663dca6c618e
 
 	// v0.24.0
-	github.com/evmos/ethermint => github.com/crypto-org-chain/ethermint v0.24.1-0.20261026040228-e874216e33c8
+	github.com/evmos/ethermint => github.com/Chaintable/ethermint-cronos v0.24.0-ct.2.0.20261123160114-f7354cf073d5
 
 	github.com/syndtr/goleveldb => github.com/syndtr/goleveldb v1.0.1-0.20210819022825-2ae1ddf74ef7
 )

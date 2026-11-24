@@ -1,6 +1,25 @@
 # Changelog
 
-## UNRELEASED
+## Unreleased
+
+### Improvements
+
+* [rpc] Replay complete Cosmos blocks for `trace_debankBlock` on v1.8 mainnet RocksDB nodes and validate the result against the committed execution.
+
+* [app] Support Cronos v1.8.1 while retaining the Chaintable writer forks and mempool disconnect fix.
+
+* [app] Support the Cronos v1.8 mainnet upgrade while retaining the Chaintable writer integration.
+
+* [#9](https://github.com/Chaintable/cronos/pull/9) feat(blocksync): add an opt-in continuous sync mode for non-validator nodes.
+* [#2095](https://github.com/crypto-org-chain/cronos/pull/2095) feat: add hardcoded unblockable address list that is filtered out of both the mempool and consensus blocklists.
+
+### Bug fixes
+
+* [Chaintable/cometbft#2](https://github.com/Chaintable/cometbft/pull/2) fix: release disconnected peers from mempool broadcast waits during continuous block sync.
+* [#2115](https://github.com/crypto-org-chain/cronos/pull/2115) fix: add optional `traceReplay` trace-config flag to skip gas deduction during tracing and bypass a legacy bug.
+* [Chaintable/ethermint-cronos#9](https://github.com/Chaintable/ethermint-cronos/pull/9) fix: derive DeBank account, code, and storage diffs from committed IAVL changesets.
+
+## v1.7.5
 
 ### Bug fixes
 
@@ -113,6 +132,8 @@
 
 ### Bug fixes
 
+* [#1991](https://github.com/crypto-org-chain/cronos/pull/1991) fix(rpc): fix eth_getBlockReceipts crash
+
 * [#1982](https://github.com/crypto-org-chain/cronos/pull/1982) fix(nix): enable LZ4 support for Windows builds.
 * [#1946](https://github.com/crypto-org-chain/cronos/pull/1946) Fix: allow preinstall in case account has a balance
 * [#1947](https://github.com/crypto-org-chain/cronos/pull/1947) Fix: estimate gas not accurate
@@ -120,6 +141,7 @@
 * [#1959](https://github.com/crypto-org-chain/cronos/pull/1959) refactor: replace MsgEthereumTxResponse with EthCallResponse in EVM calls 
 * [#1959](https://github.com/crypto-org-chain/cronos/pull/1959) fix: eip712 legacy signature verify 
 * [#1963](https://github.com/crypto-org-chain/cronos/pull/1963) fix: apply tachyon patch
+* [#2027](https://github.com/crypto-org-chain/cronos/pull/2027) fix(ibc): update ibc-go dependency for ibc clientstates query issue
 
 *Dec 4, 2025*
 
