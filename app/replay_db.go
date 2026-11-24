@@ -1,6 +1,8 @@
 package app
 
 import (
+	"bytes"
+
 	"github.com/cosmos/cosmos-sdk/store/cachekv"
 	"github.com/cosmos/cosmos-sdk/store/dbadapter"
 	dbm "github.com/tendermint/tm-db"
@@ -94,3 +96,76 @@ func (b *overlayBatch) Write() error {
 
 func (b *overlayBatch) WriteSync() error { return b.Write() }
 func (b *overlayBatch) Close() error     { return nil }
+
+// storePrefix is the prefix of a multistore substore's keys in the database.
+func storePrefix(name string) []byte {
+	return []byte("s/k:" + name + "/")
+}
+
+// hidePrefix shows a read-only parent without the keys under prefix. A store
+// that an upgrade block adds must start empty, but the archive already holds
+// its later versions, which IAVL would load instead.
+func hidePrefix(parent dbm.DB, prefix []byte) dbm.DB {
+	end := append(append([]byte{}, prefix[:len(prefix)-1]...), prefix[len(prefix)-1]+1)
+	return &hiddenPrefixDB{DB: parent, prefix: prefix, end: end}
+}
+
+type hiddenPrefixDB struct {
+	dbm.DB
+	prefix, end []byte
+}
+
+func (h *hiddenPrefixDB) hidden(key []byte) bool { return bytes.HasPrefix(key, h.prefix) }
+
+func (h *hiddenPrefixDB) Get(key []byte) ([]byte, error) {
+	if h.hidden(key) {
+		return nil, nil
+	}
+	return h.DB.Get(key)
+}
+
+func (h *hiddenPrefixDB) Has(key []byte) (bool, error) {
+	if h.hidden(key) {
+		return false, nil
+	}
+	return h.DB.Has(key)
+}
+
+func (h *hiddenPrefixDB) Iterator(start, end []byte) (dbm.Iterator, error) {
+	return h.iterator(start, end, h.DB.Iterator)
+}
+
+func (h *hiddenPrefixDB) ReverseIterator(start, end []byte) (dbm.Iterator, error) {
+	return h.iterator(start, end, h.DB.ReverseIterator)
+}
+
+// iterator returns an empty iterator for a range inside the prefix, so a
+// substore scan never walks the hidden keys one by one.
+func (h *hiddenPrefixDB) iterator(start, end []byte, open func(start, end []byte) (dbm.Iterator, error)) (dbm.Iterator, error) {
+	if start != nil && end != nil && bytes.Compare(start, h.prefix) >= 0 && bytes.Compare(end, h.end) <= 0 {
+		return dbm.NewMemDB().Iterator(start, end)
+	}
+	it, err := open(start, end)
+	if err != nil {
+		return nil, err
+	}
+	s := &skipIterator{Iterator: it, hidden: h.hidden}
+	s.skip()
+	return s, nil
+}
+
+type skipIterator struct {
+	dbm.Iterator
+	hidden func([]byte) bool
+}
+
+func (s *skipIterator) skip() {
+	for s.Iterator.Valid() && s.hidden(s.Iterator.Key()) {
+		s.Iterator.Next()
+	}
+}
+
+func (s *skipIterator) Next() {
+	s.Iterator.Next()
+	s.skip()
+}

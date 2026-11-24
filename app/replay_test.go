@@ -224,33 +224,41 @@ func TestReplayBlockGasExceeded(t *testing.T) {
 	}
 }
 
-// At the v0.7.0 upgrade block the parent version lacks the fee market store;
-// it must start at the upgrade height as the node's upgrade store loader does.
-func TestUpgradeLoadingStoreAddsStore(t *testing.T) {
+// At the v0.7.0 upgrade block the parent version lacks the fee market store,
+// while the archive already holds its later versions. Replaying the upgrade
+// block must start the store empty at the upgrade height, as mainnet did.
+func TestUpgradeBlockStartsAddedStoreEmpty(t *testing.T) {
 	db := dbm.NewMemDB()
 	auth := storetypes.NewKVStoreKey("acc")
 	fee := storetypes.NewKVStoreKey(feemarkettypes.StoreKey)
+	mount := func(cms *rootmulti.Store, keys ...storetypes.StoreKey) {
+		for _, k := range keys {
+			cms.MountStoreWithDB(k, storetypes.StoreTypeIAVL, nil)
+		}
+	}
 	old := rootmulti.NewStore(db)
-	old.MountStoreWithDB(auth, storetypes.StoreTypeIAVL, nil)
+	mount(old, auth)
 	require.NoError(t, old.LoadLatestVersion())
 	old.GetKVStore(auth).Set([]byte("k"), []byte("v"))
-	old.Commit()
-	parent := old.LastCommitID().Version
+	parent := old.Commit().Version
 
-	commit := func(load func(*rootmulti.Store) error) (hash []byte, feeVersion int64) {
-		cms := rootmulti.NewStore(newOverlayDB(db))
+	// The node upgrades at parent+1 and keeps running.
+	node := rootmulti.NewStore(db)
+	mount(node, auth, fee)
+	require.NoError(t, node.LoadVersionAndUpgrade(parent, &v070StoreUpgrades))
+	node.GetKVStore(fee).Set([]byte("base"), []byte{1})
+	upgraded := node.Commit()
+	node.GetKVStore(fee).Set([]byte("base"), []byte{2})
+	node.Commit()
+
+	replay := func(parentDB dbm.DB) storetypes.CommitID {
+		cms := rootmulti.NewStore(newOverlayDB(parentDB))
 		cms.SetLazyLoading(true)
-		cms.MountStoreWithDB(auth, storetypes.StoreTypeIAVL, nil)
-		cms.MountStoreWithDB(fee, storetypes.StoreTypeIAVL, nil)
-		require.NoError(t, load(cms))
+		mount(cms, auth, fee)
+		require.NoError(t, upgradeLoadingStore{cms, &v070StoreUpgrades}.LoadVersion(parent))
 		cms.GetKVStore(fee).Set([]byte("base"), []byte{1})
-		return cms.Commit().Hash, cms.GetCommitKVStore(fee).LastCommitID().Version
+		return cms.Commit()
 	}
-	wantHash, wantVersion := commit(func(s *rootmulti.Store) error { return s.LoadVersionAndUpgrade(parent, &v070StoreUpgrades) })
-	require.Equal(t, parent+1, wantVersion)
-	gotHash, gotVersion := commit(func(s *rootmulti.Store) error { return upgradeLoadingStore{s, &v070StoreUpgrades}.LoadVersion(parent) })
-	require.Equal(t, wantHash, gotHash)
-	require.Equal(t, wantVersion, gotVersion)
-	_, plainVersion := commit(func(s *rootmulti.Store) error { return s.LoadVersion(parent) })
-	require.Equal(t, int64(1), plainVersion, "without the upgrade the new store starts at version 1")
+	require.Equal(t, upgraded, replay(hidePrefix(db, storePrefix(feemarkettypes.StoreKey))))
+	require.NotEqual(t, upgraded.Hash, replay(db).Hash, "lazy loading picks the store's latest archived version")
 }

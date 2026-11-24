@@ -94,14 +94,19 @@ func ReplayOnDB(db dbm.DB, home string, req replay.Request, mark func(string)) (
 	}
 	opts := viper.New()
 	opts.Set(flags.FlagHome, home)
-	overlay := newOverlayDB(db)
+	parentDB := db
+	upgrade := req.BeginBlock.Header.Height == ReplayFirstHeight
+	if upgrade {
+		parentDB = hidePrefix(db, storePrefix(feemarkettypes.StoreKey))
+	}
+	overlay := newOverlayDB(parentDB)
 	a := New(log.NewNopLogger(), overlay, nil, false, map[int64]bool{}, home, 0, MakeEncodingConfig(), opts,
 		baseapp.SetPruning(storetypes.PruneNothing),
 		// Loading a version by scanning every saved root is far too slow on an archive.
 		func(b *baseapp.BaseApp) {
 			cms := rootmulti.NewStore(overlay)
 			cms.SetLazyLoading(true)
-			if req.BeginBlock.Header.Height == ReplayFirstHeight {
+			if upgrade {
 				b.SetCMS(upgradeLoadingStore{cms, &v070StoreUpgrades})
 			} else {
 				b.SetCMS(cms)
