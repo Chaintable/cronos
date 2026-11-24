@@ -101,6 +101,34 @@ func openRocksdb(dir string, readonly bool, tuneUpOpts RocksDBTuneUpOptions) (db
 		return nil, err
 	}
 
+	return wrapRocksDB(db, tuneUpOpts), nil
+}
+
+// OpenReplayDB opens a secondary view of a live RocksDB with the given block
+// cache. All writes are rejected by RocksDB and its own metadata is confined
+// to the scratch path. The returned function catches up with the primary.
+func OpenReplayDB(home, scratch string, cacheBytes uint64) (dbm.DB, func() error, error) {
+	dir := filepath.Join(home, "data", "application.db")
+	cache := grocksdb.NewLRUCache(cacheBytes)
+	defer cache.Destroy()
+	opts, err := loadLatestOptions(dir, cache)
+	if err != nil {
+		return nil, nil, err
+	}
+	if opts == nil {
+		return nil, nil, fmt.Errorf("missing RocksDB options at %s", dir)
+	}
+	defer opts.Destroy()
+	opts.SetCreateIfMissing(false)
+	opts.SetMaxOpenFiles(-1)
+	db, err := grocksdb.OpenDbAsSecondary(opts, dir, scratch)
+	if err != nil {
+		return nil, nil, err
+	}
+	return wrapRocksDB(db, RocksDBTuneUpOptions{}), db.TryCatchUpWithPrimary, nil
+}
+
+func wrapRocksDB(db *grocksdb.DB, tuneUpOpts RocksDBTuneUpOptions) dbm.DB {
 	ro := grocksdb.NewDefaultReadOptions()
 	if tuneUpOpts.EnableAsyncIo {
 		ro.SetAsyncIO(true)
@@ -111,7 +139,7 @@ func openRocksdb(dir string, readonly bool, tuneUpOpts RocksDBTuneUpOptions) (db
 	wo := grocksdb.NewDefaultWriteOptions()
 	woSync := grocksdb.NewDefaultWriteOptions()
 	woSync.SetSync(true)
-	return dbm.NewRocksDBWithRawDB(db, ro, wo, woSync), nil
+	return dbm.NewRocksDBWithRawDB(db, ro, wo, woSync)
 }
 
 // loadLatestOptions try to load options from existing db, returns nil if not exists.
