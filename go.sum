@@ -69,8 +69,8 @@ github.com/BurntSushi/toml v0.3.1/go.mod h1:xHWCNGjB5oqiDr8zfno3MHue2Ht5sIBksp03
 github.com/BurntSushi/xgb v0.0.0-20160522181843-27f122750802/go.mod h1:IVnqGOEym/WlBOVXweHU+Q+/VP0lqqI8lqeDx9IjBqo=
 github.com/ChainSafe/go-schnorrkel v0.0.0-20200405005733-88cbf1b4c40d h1:nalkkPQcITbvhmL4+C4cKA87NW0tfm3Kl9VXRoPywFg=
 github.com/ChainSafe/go-schnorrkel v0.0.0-20200405005733-88cbf1b4c40d/go.mod h1:URdX5+vg25ts3aCh8H5IFZybJYKWhJHYMTnf+ULtoC4=
-github.com/Chaintable/ethermint-cronos v0.7.3-0.20261124235048-e919a4eed653 h1:h/TRNSBHgfdjRbblmLy4DfLpS1CYVlZDMMQFk/a5vlI=
-github.com/Chaintable/ethermint-cronos v0.7.3-0.20261124235048-e919a4eed653/go.mod h1:9Z8TU/09rDcUTHTFA0QCxNEhIsJWVw80oFj8FhnFWJc=
+github.com/Chaintable/ethermint-cronos v0.7.3-0.20261125085330-3b916695fb2b h1:QzvHyiWGoT9YUHmZWsHybUtG62OVoe9zEJndckhUdzY=
+github.com/Chaintable/ethermint-cronos v0.7.3-0.20261125085330-3b916695fb2b/go.mod h1:9Z8TU/09rDcUTHTFA0QCxNEhIsJWVw80oFj8FhnFWJc=
 github.com/Chaintable/go-ethereum v0.0.0-20261124045850-410a767f8ac3 h1:umWRspy3rC5SASW/PMbL6UGqEWjBViQYWlrdnvN5X+s=
 github.com/Chaintable/go-ethereum v0.0.0-20261124045850-410a767f8ac3/go.mod h1:99onQmSd1GRGOziyGldI41YQb7EESX3Q4H41IfJgIQQ=
 github.com/DATA-DOG/go-sqlmock v1.3.3/go.mod h1:f/Ixk793poVmq4qj/V1dPUg2JEAKC73Q5eFN3EC/SaM=
