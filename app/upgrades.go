@@ -55,12 +55,7 @@ func (app *App) RegisterUpgradeHandlers(cdc codec.BinaryCodec, maxVersion int64)
 	}
 	if !app.UpgradeKeeper.IsSkipHeight(upgradeInfo.Height) {
 		if upgradeInfo.Name == planName {
-			app.SetStoreLoader(MaxVersionUpgradeStoreLoader(maxVersion, upgradeInfo.Height, &storetypes.StoreUpgrades{
-				Added: []string{
-					icahosttypes.StoreKey,
-				},
-				Deleted: []string{"icaauth"},
-			}))
+			app.SetStoreLoader(MaxVersionUpgradeStoreLoader(maxVersion, upgradeInfo.Height, activationStoreUpgrades()))
 
 			return true
 		}
@@ -119,4 +114,13 @@ func DurationToDec(d time.Duration) sdkmath.LegacyDec {
 
 func DecToDuration(d sdkmath.LegacyDec) time.Duration {
 	return time.Second * time.Duration(d.RoundInt64())
+}
+
+func activationStoreUpgrades() *storetypes.StoreUpgrades {
+	return &storetypes.StoreUpgrades{
+		Added: []string{
+			icahosttypes.StoreKey,
+		},
+		Deleted: []string{"icaauth"},
+	}
 }
