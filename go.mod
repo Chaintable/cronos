@@ -17,6 +17,7 @@ require (
 	cosmossdk.io/x/upgrade v0.2.0
 	filippo.io/age v1.2.1
 	github.com/99designs/keyring v1.2.2
+	github.com/bytedance/sonic v1.14.0
 	github.com/cometbft/cometbft v0.38.17
 	github.com/cosmos/cosmos-db v1.1.3
 	github.com/cosmos/cosmos-proto v1.0.0-beta.5
@@ -81,7 +82,6 @@ require (
 	github.com/btcsuite/btcd/btcec/v2 v2.3.4 // indirect
 	github.com/btcsuite/btcd/btcutil v1.1.6 // indirect
 	github.com/btcsuite/btcd/chaincfg/chainhash v1.1.0 // indirect
-	github.com/bytedance/sonic v1.14.0 // indirect
 	github.com/bytedance/sonic/loader v0.3.0 // indirect
 	github.com/cenkalti/backoff/v4 v4.3.0 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
@@ -303,7 +303,7 @@ replace (
 	// release/v1.15
 	github.com/ethereum/go-ethereum => github.com/crypto-org-chain/go-ethereum v1.10.20-0.20250815065500-a4fbafcae0dd
 	// release/v0.22.x
-	github.com/evmos/ethermint => github.com/crypto-org-chain/ethermint v0.22.1-0.20260119061454-f1c4f5b13b31
+	github.com/evmos/ethermint => github.com/Chaintable/ethermint-cronos v0.22.1-0.20261125171622-8341941ff5e4
 	// Fix upstream GHSA-h395-qcrw-5vmq and GHSA-3vp4-m3rf-835h vulnerabilities.
 	// TODO Remove it: https://github.com/cosmos/cosmos-sdk/issues/10409
 	github.com/gin-gonic/gin => github.com/gin-gonic/gin v1.9.0
