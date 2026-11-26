@@ -134,18 +134,19 @@ func (app *App) RegisterUpgradeHandlers(cdc codec.BinaryCodec, clientKeeper clie
 	}
 	if !app.UpgradeKeeper.IsSkipHeight(upgradeInfo.Height) {
 		if upgradeInfo.Name == planName {
-			storeUpgrades := storetypes.StoreUpgrades{
-				Added: []string{
-					consensusparamtypes.StoreKey,
-					crisistypes.StoreKey,
-					icacontrollertypes.StoreKey,
-					icaauthtypes.StoreKey,
-				},
-				Deleted: []string{
-					authzkeeper.StoreKey,
-				},
-			}
-			app.SetStoreLoader(upgradetypes.UpgradeStoreLoader(upgradeInfo.Height, &storeUpgrades))
+			app.SetStoreLoader(upgradetypes.UpgradeStoreLoader(upgradeInfo.Height, &titanStoreUpgrades))
 		}
 	}
+}
+
+var titanStoreUpgrades = storetypes.StoreUpgrades{
+	Added: []string{
+		consensusparamtypes.StoreKey,
+		crisistypes.StoreKey,
+		icacontrollertypes.StoreKey,
+		icaauthtypes.StoreKey,
+	},
+	Deleted: []string{
+		authzkeeper.StoreKey,
+	},
 }
