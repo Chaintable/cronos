@@ -390,8 +390,8 @@ schema = 3
     version = "v0.6.7"
     hash = "sha256-hl/3RrBrpkk2zA6dmrNlIYKs1/GfqegSscDSkA5Pjlo="
   [mod."github.com/tharsis/ethermint"]
-    version = "v0.11.1-cronos.0.20261125111646-e8c271140bcf"
-    hash = "sha256-INpSghgg7bn29PUC1gqE4/UbucM5jKpW+gkoKafMQLc="
+    version = "v0.11.1-cronos.0.20261126051954-1540dd6acf1b"
+    hash = "sha256-N1eAs1RZwbSRH9Ln1uHl80m5dtpuxhElb5jy+qA+A3g="
     replaced = "github.com/Chaintable/ethermint-cronos"
   [mod."github.com/tklauser/go-sysconf"]
     version = "v0.3.10"

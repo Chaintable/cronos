@@ -98,6 +98,8 @@ github.com/Chaintable/ethermint-cronos v0.11.1-cronos.0.20261124162115-385f59638
 github.com/Chaintable/ethermint-cronos v0.11.1-cronos.0.20261124162115-385f59638696/go.mod h1:zsZ2+pd1rFYAP/nx7Rh2oRLT64Sr2aYyao5FcK1OmmU=
 github.com/Chaintable/ethermint-cronos v0.11.1-cronos.0.20261125111646-e8c271140bcf h1:dyI1Tdv53cRVM8HWYP+tSJwHbM/r0fW+krR44ciPlmo=
 github.com/Chaintable/ethermint-cronos v0.11.1-cronos.0.20261125111646-e8c271140bcf/go.mod h1:zsZ2+pd1rFYAP/nx7Rh2oRLT64Sr2aYyao5FcK1OmmU=
+github.com/Chaintable/ethermint-cronos v0.11.1-cronos.0.20261126051954-1540dd6acf1b h1:ussRejb/G/02jVj1g9DcMLfvFRtdbMh9QAPCxtSiBYI=
+github.com/Chaintable/ethermint-cronos v0.11.1-cronos.0.20261126051954-1540dd6acf1b/go.mod h1:zsZ2+pd1rFYAP/nx7Rh2oRLT64Sr2aYyao5FcK1OmmU=
 github.com/Chaintable/go-ethereum v1.10.10-0.20261124152011-e65b58f19ebe h1:mcPJHRYkVHv6uDlTwHugojVMAwVncv3ygHOhW4RR7pc=
 github.com/Chaintable/go-ethereum v1.10.10-0.20261124152011-e65b58f19ebe/go.mod h1:W3yfrFyL9C1pHcwY5hmRHVDaorTiQxhYBkKyu5mEDHw=
 github.com/DATA-DOG/go-sqlmock v1.3.3/go.mod h1:f/Ixk793poVmq4qj/V1dPUg2JEAKC73Q5eFN3EC/SaM=
