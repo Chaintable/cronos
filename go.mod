@@ -46,7 +46,7 @@ require (
 	github.com/DataDog/zstd v1.5.0 // indirect
 	github.com/HdrHistogram/hdrhistogram-go v1.1.2 // indirect
 	github.com/StackExchange/wmi v1.2.1 // indirect
-	github.com/VictoriaMetrics/fastcache v1.6.0 // indirect
+	github.com/VictoriaMetrics/fastcache v1.6.0
 	github.com/Workiva/go-datastructures v1.0.53 // indirect
 	github.com/alitto/pond v1.8.2 // indirect
 	github.com/allegro/bigcache v1.2.1 // indirect
