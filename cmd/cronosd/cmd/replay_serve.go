@@ -96,7 +96,7 @@ func openReplayDatabases(home string) ([]dbm.DB, error) {
 	}
 	var dbs []dbm.DB
 	open := func(name string) error {
-		db, err := opendb.OpenReadOnly(data, name, uint64(cacheMB)<<20, maxOpenFiles)
+		db, err := opendb.OpenReadOnly(data, name, uint64(cacheMB)<<20, maxOpenFiles, false)
 		if err == nil {
 			dbs = append(dbs, db)
 		}
