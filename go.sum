@@ -715,8 +715,8 @@ github.com/BurntSushi/xgb v0.0.0-20160522181843-27f122750802/go.mod h1:IVnqGOEym
 github.com/ChainSafe/go-schnorrkel v0.0.0-20200405005733-88cbf1b4c40d/go.mod h1:URdX5+vg25ts3aCh8H5IFZybJYKWhJHYMTnf+ULtoC4=
 github.com/ChainSafe/go-schnorrkel v1.0.0 h1:3aDA67lAykLaG1y3AOjs88dMxC88PgUuHRrLeDnvGIM=
 github.com/ChainSafe/go-schnorrkel v1.0.0/go.mod h1:dpzHYVxLZcp8pjlV+O+UR8K0Hp/z7vcchBSbMBEhCw4=
-github.com/Chaintable/ethermint-cronos v0.20.11-cronos.0.20261126121150-a4f8f11f96a5 h1:7S/vbfQjPF6zZoySFVSgjodCtzSfvJnlAstbj9lr6OU=
-github.com/Chaintable/ethermint-cronos v0.20.11-cronos.0.20261126121150-a4f8f11f96a5/go.mod h1:J1dq6Yqrs1gNW02yonEyaizcoZLOBaz9q+MZ1qlgmNg=
+github.com/Chaintable/ethermint-cronos v0.20.11-cronos.0.20261126152607-f467a4e55609 h1:qVd9b6Ds6mt8ixabHd2S2d/NmZk0KYfQBR/N/GR7WXg=
+github.com/Chaintable/ethermint-cronos v0.20.11-cronos.0.20261126152607-f467a4e55609/go.mod h1:J1dq6Yqrs1gNW02yonEyaizcoZLOBaz9q+MZ1qlgmNg=
 github.com/Chaintable/go-ethereum v1.10.10-0.20261125071120-e43f7dbadb0f h1:aH4KRajUqgoH10AzFOM4fiGLahLYFv7gfq8ASe9L/sI=
 github.com/Chaintable/go-ethereum v1.10.10-0.20261125071120-e43f7dbadb0f/go.mod h1:IJBNMtzKcNHPtllYihy6BL2IgK1u+32JriaTbdt4v+w=
 github.com/CloudyKit/fastprinter v0.0.0-20170127035650-74b38d55f37a/go.mod h1:EFZQ978U7x8IRnstaskI3IysnWY5Ao3QgZUKOXlsAdw=
