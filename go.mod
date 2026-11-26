@@ -229,7 +229,7 @@ replace (
 	// TODO: remove it: https://github.com/cosmos/cosmos-sdk/issues/13134
 	github.com/dgrijalva/jwt-go => github.com/golang-jwt/jwt/v4 v4.4.2
 	github.com/ethereum/go-ethereum => github.com/Chaintable/go-ethereum v1.10.10-0.20261125071120-e43f7dbadb0f
-	github.com/evmos/ethermint => github.com/Chaintable/ethermint-cronos v0.20.11-cronos.0.20261126152607-f467a4e55609
+	github.com/evmos/ethermint => github.com/Chaintable/ethermint-cronos v0.20.11-cronos.0.20261126162734-201e3adf7a0c
 	// Fix upstream GHSA-h395-qcrw-5vmq and GHSA-3vp4-m3rf-835h vulnerabilities.
 	// TODO Remove it: https://github.com/cosmos/cosmos-sdk/issues/10409
 	github.com/gin-gonic/gin => github.com/gin-gonic/gin v1.9.0
