@@ -256,17 +256,23 @@ func TestUpgradeBlockStartsAddedStoreEmpty(t *testing.T) {
 	node.GetKVStore(e2ee).Set([]byte("fee"), []byte{1})
 	upgraded := node.Commit()
 	node.GetKVStore(e2ee).Set([]byte("fee"), []byte{2})
-	node.Commit()
+	next := node.Commit()
 
-	replay := func(parentDB dbm.DB) storetypes.CommitID {
+	replay := func(parentDB dbm.DB) (storetypes.CommitID, storetypes.CommitID) {
 		cms := rootmulti.NewStore(newOverlayDB(parentDB), log.NewNopLogger())
 		cms.SetLazyLoading(true)
 		cms.SetIAVLDisableFastNode(true)
 		mount(cms, auth, e2ee)
 		require.NoError(t, upgradeLoadingStore{cms, &v13StoreUpgrades}.LoadVersion(parent))
 		cms.GetKVStore(e2ee).Set([]byte("fee"), []byte{1})
-		return cms.Commit()
+		first := cms.Commit()
+		// A segment keeps the same app for the blocks after the upgrade.
+		cms.GetKVStore(e2ee).Set([]byte("fee"), []byte{2})
+		return first, cms.Commit()
 	}
-	require.Equal(t, upgraded, replay(hidePrefix(db, storePrefix(e2eetypes.StoreKey))))
-	require.NotEqual(t, upgraded.Hash, replay(db).Hash, "lazy loading picks the store's latest archived version")
+	first, second := replay(hidePrefix(db, storePrefix(e2eetypes.StoreKey)))
+	require.Equal(t, upgraded, first)
+	require.Equal(t, next, second)
+	first, _ = replay(db)
+	require.NotEqual(t, upgraded.Hash, first.Hash, "lazy loading picks the store's latest archived version")
 }

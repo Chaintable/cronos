@@ -85,18 +85,29 @@ func (e *ReplayExecutor) ReplayBlock(ctx context.Context, req replay.Request) (*
 	return result, nil
 }
 
-// ReplayOnDB executes the requested block on a fresh app over db at the
-// parent height. Writes, including the commit that yields the AppHash, stay
-// in an in-memory overlay that is discarded afterwards. A sealed BaseApp
-// cannot be reloaded at another height, so every request builds its own app.
+// ReplayOnDB executes one block over a private overlay and discards the app.
 func ReplayOnDB(db dbm.DB, home string, req replay.Request, mark func(string)) (*replay.Result, error) {
-	if req.BeginBlock == nil || req.BeginBlock.Header.Height < 2 || len(req.ParentHash) != 32 {
-		return nil, fmt.Errorf("invalid historical replay request")
+	if req.BeginBlock == nil {
+		return nil, fmt.Errorf("missing begin block request")
+	}
+	a, err := OpenReplayApp(db, home, req.ChainID, req.BeginBlock.Header.Height-1, mark)
+	if err != nil {
+		return nil, err
+	}
+	return a.ReplayNextBlock(req, mark)
+}
+
+// OpenReplayApp loads a parent version once. Consecutive commits stay in the
+// same private overlay; no replay writes reach the underlying archive.
+func OpenReplayApp(db dbm.DB, home, chainID string, parent int64, mark func(string)) (*App, error) {
+	if parent < 1 {
+		return nil, fmt.Errorf("invalid replay parent height %d", parent)
 	}
 	opts := viper.New()
 	opts.Set(flags.FlagHome, home)
 	parentDB := db
-	upgrade := req.BeginBlock.Header.Height == ReplayFirstHeight
+	// Only an app opened below the first replay height loads the v1.3 store upgrade.
+	upgrade := parent+1 == ReplayFirstHeight
 	if upgrade {
 		parentDB = hidePrefix(db, storePrefix(e2eetypes.StoreKey))
 	}
@@ -105,7 +116,7 @@ func ReplayOnDB(db dbm.DB, home string, req replay.Request, mark func(string)) (
 	// Mainnet nodes run without the gravity bridge store (cmd.SkipGravity).
 	a := New(logger, overlay, nil, false, true, map[int64]bool{}, home, 0, MakeEncodingConfig(), opts,
 		// BeginBlock rejects a header whose chain-id differs from the app's.
-		baseapp.SetChainID(req.ChainID),
+		baseapp.SetChainID(chainID),
 		// Loading a version by scanning every saved root is far too slow on an archive.
 		func(b *baseapp.BaseApp) {
 			cms := rootmulti.NewStore(overlay, logger)
@@ -120,15 +131,25 @@ func ReplayOnDB(db dbm.DB, home string, req replay.Request, mark func(string)) (
 		},
 	)
 	mark("new_app")
-	parent := req.BeginBlock.Header.Height - 1
 	if err := a.LoadHeight(parent); err != nil {
 		return nil, fmt.Errorf("open parent multistore at %d: %w", parent, err)
 	}
+	mark("load_height")
+	return a, nil
+}
+
+// ReplayNextBlock checks the actual working commit before every execution,
+// including the first block after opening an archive version.
+func (a *App) ReplayNextBlock(req replay.Request, mark func(string)) (*replay.Result, error) {
+	if req.BeginBlock == nil || req.BeginBlock.Header.Height < 2 || len(req.ParentHash) != 32 {
+		return nil, fmt.Errorf("invalid historical replay request")
+	}
+	parent := req.BeginBlock.Header.Height - 1
 	if id := a.LastCommitID(); id.Version != parent || !bytes.Equal(id.Hash, req.ParentHash) {
 		return nil, fmt.Errorf("parent commit at %d: got %d/%X, want %X", parent, id.Version, id.Hash, req.ParentHash)
 	}
-	mark("load_height")
 	obs := ObserveReplayTransactions(a.EvmKeeper)
+	defer a.EvmKeeper.SetTransactionObserver(nil)
 	res := &tmstate.ABCIResponses{DeliverTxs: make([]*abci.ResponseDeliverTx, len(req.Txs))}
 	begin := a.BeginBlock(*req.BeginBlock)
 	res.BeginBlock = &begin
