@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -17,6 +18,15 @@ import (
 	tmstate "github.com/tendermint/tendermint/proto/tendermint/state"
 	"github.com/tharsis/ethermint/debank/replay"
 )
+
+func TestReplaySegmentDecision(t *testing.T) {
+	for _, prefix := range []string{"", "\n"} {
+		require.NoError(t, ReadReplaySegmentDecision(strings.NewReader(prefix+"Y")))
+		require.Equal(t, io.EOF, ReadReplaySegmentDecision(strings.NewReader(prefix)))
+		require.Error(t, ReadReplaySegmentDecision(strings.NewReader(prefix+"X")))
+	}
+	require.Error(t, ReadReplaySegmentDecision(strings.NewReader("\n\nY")))
+}
 
 func TestSegmentConfirmationUsesExecutingConnection(t *testing.T) {
 	for _, tc := range []struct {
@@ -97,15 +107,12 @@ func respondToSegment(ln net.Listener, seg replay.Segment) (bool, error) {
 	if err = replay.WriteResult(conn, replay.Result{Responses: &tmstate.ABCIResponses{}}); err != nil {
 		return false, err
 	}
-	ack, err := reader.ReadByte()
+	err = ReadReplaySegmentDecision(reader)
 	if err == io.EOF {
 		return false, nil
 	}
 	if err != nil {
 		return false, err
-	}
-	if ack != 'Y' {
-		return false, fmt.Errorf("unexpected acknowledgement %q", ack)
 	}
 	return true, WriteReplaySegmentAck(conn, nil)
 }

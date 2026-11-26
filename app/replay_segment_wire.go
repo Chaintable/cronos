@@ -27,6 +27,22 @@ type segmentAck struct {
 	Error string `json:"error,omitempty"`
 }
 
+// ReadReplaySegmentDecision reads the verifier's Y. Depending on the JSON
+// decoder's read-ahead, the request encoder's final newline can still precede it.
+func ReadReplaySegmentDecision(r io.ByteReader) error {
+	b, err := r.ReadByte()
+	if err == nil && b == '\n' {
+		b, err = r.ReadByte()
+	}
+	if err != nil {
+		return err
+	}
+	if b != 'Y' {
+		return fmt.Errorf("unexpected segment decision %q", b)
+	}
+	return nil
+}
+
 func WriteReplaySegmentAck(w io.Writer, err error) error {
 	ack := segmentAck{OK: err == nil}
 	if err != nil {

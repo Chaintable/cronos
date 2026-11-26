@@ -160,8 +160,7 @@ func (w *replayWorker) serve(conn net.Conn) {
 		}
 		decision = make(chan bool, 1)
 		go func() {
-			b, err := r.ReadByte()
-			decision <- err == nil && b == 'Y'
+			decision <- app.ReadReplaySegmentDecision(r) == nil
 		}()
 	}
 	select {
