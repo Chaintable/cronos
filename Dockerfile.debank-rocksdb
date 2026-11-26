@@ -1,0 +1,56 @@
+# RocksDB build of the DeBank cronos writer image.
+# Builds RocksDB from source to match the version cronos v1.6.2 pins
+# (nix/rocksdb.nix: v10.4.2) and links cronosd with COSMOS_BUILD_OPTIONS=rocksdb.
+# The trace_debankBlock emitter is pulled via the go.mod replace
+# (github.com/evmos/ethermint => github.com/Chaintable/ethermint-cronos).
+
+FROM golang:1.23.12-bookworm AS go-builder
+
+# RocksDB build + link dependencies
+RUN apt-get update && \
+    apt-get install -y libgflags-dev libsnappy-dev zlib1g-dev libbz2-dev liblz4-dev libzstd-dev && \
+    rm -rf /var/lib/apt/lists/*
+
+# Build RocksDB v10.4.2 from source (matches grocksdb v1.10.2 / cronos nix pin).
+# PORTABLE=1: baseline -march so the .so runs across CPU generations and avoids the
+# GCC AVX512 intrinsic codegen path. DISABLE_WARNING_AS_ERROR=1: drop -Werror, which
+# trips on a GCC self-init warning in avx512fintrin.h.
+RUN git clone https://github.com/facebook/rocksdb.git /tmp/rocksdb && \
+    cd /tmp/rocksdb && \
+    git checkout v10.4.2 && \
+    PORTABLE=1 DISABLE_WARNING_AS_ERROR=1 make -j$(nproc) install-shared && \
+    ldconfig && \
+    rm -rf /tmp/rocksdb
+
+WORKDIR /code
+COPY . /code/
+
+# grocksdb supplies -lrocksdb. The external linker also needs the source install's library directory.
+RUN CGO_LDFLAGS="-L/usr/local/lib" GOPRIVATE='github.com/Chaintable/*' make install COSMOS_BUILD_OPTIONS=rocksdb
+
+# --------------------------------------------------------
+FROM debian:bookworm-slim
+
+RUN apt-get update \
+    && apt-get install -y libsnappy1v5 libgflags2.2 zlib1g libbz2-1.0 liblz4-1 libzstd1 ca-certificates curl jq \
+    && rm -rf /var/lib/apt/lists/*
+
+# RocksDB shared objects from the builder
+COPY --from=go-builder /usr/local/lib/ /usr/local/lib/
+RUN ldconfig
+
+# cronosd binary
+COPY --from=go-builder /go/bin/cronosd /usr/bin/cronosd
+
+WORKDIR /opt
+
+# EVM JSON-RPC
+EXPOSE 8545
+# EVM WebSocket
+EXPOSE 8546
+# CometBFT P2P
+EXPOSE 26656
+# CometBFT RPC
+EXPOSE 26657
+
+CMD ["/usr/bin/cronosd", "version"]

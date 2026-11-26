@@ -4,6 +4,8 @@
 
 ### Improvements
 
+* [rpc] Replay full Cosmos blocks for v1.6 mainnet archive traces.
+
 * [#1903](https://github.com/crypto-org-chain/cronos/pull/1903) Feat: check authorization list in e2ee.
 * [#1922](https://github.com/crypto-org-chain/cronos/pull/1922) Feat: check destination address in the blocklist
 * [#1904](https://github.com/crypto-org-chain/cronos/pull/1904) Test: add eip-7702 tests
