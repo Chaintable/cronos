@@ -17,6 +17,7 @@ require (
 	cosmossdk.io/x/upgrade v0.2.0
 	filippo.io/age v1.2.1
 	github.com/99designs/keyring v1.2.2
+	github.com/VictoriaMetrics/fastcache v1.12.2
 	github.com/bytedance/sonic v1.14.0
 	github.com/cometbft/cometbft v0.38.17
 	github.com/cosmos/cosmos-db v1.1.3
@@ -71,7 +72,6 @@ require (
 	github.com/PuerkitoBio/purell v1.1.1 // indirect
 	github.com/PuerkitoBio/urlesc v0.0.0-20170810143723-de5bf2ad4578 // indirect
 	github.com/StackExchange/wmi v1.2.1 // indirect
-	github.com/VictoriaMetrics/fastcache v1.12.2 // indirect
 	github.com/alitto/pond v1.8.3 // indirect
 	github.com/aws/aws-sdk-go v1.44.224 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect

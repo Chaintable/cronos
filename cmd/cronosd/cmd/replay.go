@@ -60,6 +60,24 @@ func RunReplayWorker(home, socket string, stdin io.Reader, stderr io.Writer) err
 		return fmt.Errorf("open parent application.db: %w", err)
 	}
 	defer db.Close()
+	db = sharedDB{db}
+	nodeCacheMB, err := replayIntEnv("CRONOS_REPLAY_NODE_CACHE_MB", 0, 0)
+	if err != nil {
+		return err
+	}
+	if nodeCacheMB > 0 {
+		// Version/nonce keys are stable only within one archive view.
+		if catchUpEnabled {
+			return fmt.Errorf("CRONOS_REPLAY_NODE_CACHE_MB requires CRONOS_REPLAY_CATCH_UP=false")
+		}
+		nodes, err := newReplayNodeCache(db, nodeCacheMB)
+		if err != nil {
+			return err
+		}
+		db = nodes
+		defer nodes.cache.Reset()
+		defer nodes.report(stderr)
+	}
 	app.SetConfig()
 
 	listener, err := net.Listen("unix", socket)
@@ -75,7 +93,7 @@ func RunReplayWorker(home, socket string, stdin io.Reader, stderr io.Writer) err
 	if !catchUpEnabled {
 		catchUp = nil
 	}
-	w := &replayWorker{db: sharedDB{db}, catchUp: catchUp, scratch: scratch, slots: make(chan struct{}, workers), log: stderr}
+	w := &replayWorker{db: db, catchUp: catchUp, scratch: scratch, slots: make(chan struct{}, workers), log: stderr}
 	var wg sync.WaitGroup
 	defer wg.Wait()
 	for {
@@ -127,6 +145,9 @@ func (w *replayWorker) serve(conn net.Conn) {
 	timing.mark("write")
 	w.logMu.Lock()
 	timing.report(w.log, req.Request.Height)
+	if nodes, ok := w.db.(*replayNodeCache); ok && req.Request.Height%1000 == 0 {
+		nodes.report(w.log)
+	}
 	w.logMu.Unlock()
 }
 
