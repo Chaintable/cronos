@@ -51,11 +51,31 @@ func RunReplayWorker(home, socket string, stdin io.Reader, stderr io.Writer) err
 		return err
 	}
 	defer os.RemoveAll(scratch)
-	db, err := opendb.OpenReadOnly(filepath.Join(home, "data"), "application", uint64(cacheMB)<<20, maxOpenFiles)
+	var useFilter bool
+	if raw, set := os.LookupEnv("CRONOS_REPLAY_FILTER"); set {
+		useFilter, err = strconv.ParseBool(raw)
+		if err != nil {
+			return fmt.Errorf("invalid CRONOS_REPLAY_FILTER=%q: expected a boolean", raw)
+		}
+	}
+	db, err := opendb.OpenReadOnly(filepath.Join(home, "data"), "application", uint64(cacheMB)<<20, maxOpenFiles, useFilter)
 	if err != nil {
 		return fmt.Errorf("open parent application.db: %w", err)
 	}
 	defer db.Close()
+	nodeCacheMB, err := replayIntEnv("CRONOS_REPLAY_NODE_CACHE_MB", 0, 0)
+	if err != nil {
+		return err
+	}
+	if nodeCacheMB > 0 {
+		nodes, err := newReplayNodeCache(db, nodeCacheMB)
+		if err != nil {
+			return err
+		}
+		db = nodes
+		defer nodes.cache.Reset()
+		defer nodes.report(stderr)
+	}
 	app.SetConfig()
 
 	listener, err := net.Listen("unix", socket)
@@ -113,6 +133,11 @@ func (w *replayWorker) serve(conn net.Conn) {
 	timing.mark("write")
 	w.logMu.Lock()
 	timing.report(w.log, req.BeginBlock.Header.Height)
+	if req.BeginBlock.Header.Height%1000 == 0 {
+		if nodes, ok := w.db.(*replayNodeCache); ok {
+			nodes.report(w.log)
+		}
+	}
 	w.logMu.Unlock()
 }
 

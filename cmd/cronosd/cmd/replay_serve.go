@@ -56,7 +56,7 @@ func RunReplayServer(home, listen string) error {
 		}
 	}()
 	open := func(name string) error {
-		db, err := opendb.OpenReadOnly(data, name, uint64(cacheMB)<<20, maxOpenFiles)
+		db, err := opendb.OpenReadOnly(data, name, uint64(cacheMB)<<20, maxOpenFiles, false)
 		if err == nil {
 			dbs = append(dbs, db)
 		}
