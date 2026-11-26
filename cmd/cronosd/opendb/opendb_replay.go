@@ -27,9 +27,13 @@ var errReadOnly = errors.New("read-only database")
 
 // OpenReadOnly opens dir/name.db read-only with its own block cache. RocksDB
 // rejects every write; maxOpenFiles -1 keeps all table files open.
-func OpenReadOnly(dir, name string, cacheBytes uint64, maxOpenFiles int) (dbm.DB, error) {
+func OpenReadOnly(dir, name string, cacheBytes uint64, maxOpenFiles int, useRibbonFilter bool) (dbm.DB, error) {
 	table := C.rocksdb_block_based_options_create()
 	defer C.rocksdb_block_based_options_destroy(table)
+	if useRibbonFilter {
+		// The table takes ownership. Bits per key only affects newly built filters.
+		C.rocksdb_block_based_options_set_filter_policy(table, C.rocksdb_filterpolicy_create_ribbon(10))
+	}
 	cache := C.rocksdb_cache_create_lru(C.size_t(cacheBytes))
 	C.rocksdb_block_based_options_set_block_cache(table, cache)
 	opts := C.rocksdb_options_create()
