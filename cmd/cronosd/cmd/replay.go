@@ -4,6 +4,7 @@
 package cmd
 
 import (
+	"bufio"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -40,7 +41,7 @@ func RunReplayWorker(home, socket string, stdin io.Reader, stderr io.Writer) err
 	if err != nil {
 		return err
 	}
-	// Each request builds a fresh app, so the worker trades memory for less GC.
+	// Trade memory for less GC while replay apps are executing.
 	gogc, err := replayIntEnv("CRONOS_REPLAY_GOGC", 400, 1)
 	if err != nil {
 		return err
@@ -88,7 +89,15 @@ func RunReplayWorker(home, socket string, stdin io.Reader, stderr io.Writer) err
 		listener.Close()
 	}()
 
-	w := &replayWorker{db: db, scratch: scratch, slots: make(chan struct{}, workers), log: stderr}
+	timeoutSeconds, err := replayIntEnv("CRONOS_REPLAY_TIMEOUT_SECONDS", 600, 1)
+	if err != nil {
+		return err
+	}
+	w := &replayWorker{
+		db: db, scratch: scratch, slots: make(chan struct{}, workers), log: stderr,
+		sessions: newReplaySessions(workers, time.Duration(timeoutSeconds)*time.Second),
+	}
+	defer w.sessions.close()
 	var wg sync.WaitGroup
 	defer wg.Wait()
 	for {
@@ -106,23 +115,77 @@ func RunReplayWorker(home, socket string, stdin io.Reader, stderr io.Writer) err
 }
 
 type replayWorker struct {
-	db      dbm.DB
-	scratch string
-	slots   chan struct{}
-	log     io.Writer
-	logMu   sync.Mutex
+	db       dbm.DB
+	scratch  string
+	slots    chan struct{}
+	log      io.Writer
+	logMu    sync.Mutex
+	sessions *replaySessions
 }
 
 func (w *replayWorker) serve(conn net.Conn) {
-	req, err := replay.ReadRequest(conn)
+	r := bufio.NewReader(conn)
+	prefix, err := r.Peek(1)
+	if err != nil {
+		return
+	}
+	var segment *replay.Segment
+	var height int64
+	if prefix[0] == 'S' {
+		header, err := readSegmentHeader(r)
+		if err != nil {
+			_ = replay.WriteError(conn, err)
+			return
+		}
+		if header.Drop {
+			_ = app.WriteReplaySegmentAck(conn, w.sessions.drop(header.Segment, header.Height))
+			return
+		}
+		segment, height = &header.Segment, header.Height
+	}
+	req, err := replay.ReadRequest(r)
+	if err == nil && segment != nil {
+		err = checkSegmentRequest(req, height)
+	}
 	if err != nil {
 		_ = replay.WriteError(conn, err)
 		return
 	}
-	w.slots <- struct{}{}
+	// A segment connection doubles as its verification lease. Observe a
+	// disconnect while queued and release an unacknowledged app on timeout.
+	var decision chan bool
+	if segment != nil {
+		if err := conn.SetReadDeadline(time.Now().Add(w.sessions.timeout)); err != nil {
+			return
+		}
+		decision = make(chan bool, 1)
+		go func() {
+			decision <- app.ReadReplaySegmentDecision(r) == nil
+		}()
+	}
+	select {
+	case w.slots <- struct{}{}:
+	case <-decision:
+		return
+	}
 	defer func() { <-w.slots }()
+	session, err := w.sessions.acquire(segment, req)
+	if err != nil {
+		_ = replay.WriteError(conn, err)
+		return
+	}
+	// Any failure, including a disconnect before verification, invalidates
+	// the tentative state. Only a positive ACK can retain this app.
+	released := false
+	defer func() {
+		if !released {
+			w.sessions.release(session, req, false)
+		}
+	}()
+
 	timing := newWorkerTiming()
-	res, err := w.replay(req, timing)
+	reused := session.app != nil
+	res, err := w.replay(session, req, timing)
 	if err != nil {
 		_ = replay.WriteError(conn, err)
 		return
@@ -131,6 +194,17 @@ func (w *replayWorker) serve(conn net.Conn) {
 		return
 	}
 	timing.mark("write")
+	if segment != nil {
+		if !<-decision {
+			return
+		}
+		w.sessions.release(session, req, true)
+		released = true
+		if err := app.WriteReplaySegmentAck(conn, nil); err != nil {
+			return
+		}
+		timing.parts = append(timing.parts, fmt.Sprintf("segment_start=%d segment_end=%d segment_reused=%t", segment.Start, segment.End, reused))
+	}
 	w.logMu.Lock()
 	timing.report(w.log, req.BeginBlock.Header.Height)
 	if req.BeginBlock.Header.Height%1000 == 0 {
@@ -141,19 +215,23 @@ func (w *replayWorker) serve(conn net.Conn) {
 	w.logMu.Unlock()
 }
 
-func (w *replayWorker) replay(req replay.Request, timing *workerTiming) (res *replay.Result, err error) {
+func (w *replayWorker) replay(s *replaySession, req replay.Request, timing *workerTiming) (res *replay.Result, err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			err = fmt.Errorf("replay panic: %v", r)
 		}
 	}()
-	// Upgrade metadata and keeper scratch files belong to this request.
-	home, err := ioutil.TempDir(w.scratch, "app-")
-	if err != nil {
-		return nil, err
+	if s.app == nil {
+		s.home, err = ioutil.TempDir(w.scratch, "app-")
+		if err != nil {
+			return nil, err
+		}
+		s.app, err = app.OpenReplayApp(w.db, s.home, req.ChainID, req.BeginBlock.Header.Height-1, timing.mark)
+		if err != nil {
+			return nil, err
+		}
 	}
-	defer os.RemoveAll(home)
-	return app.ReplayOnDB(w.db, home, req, timing.mark)
+	return s.app.ReplayNextBlock(req, timing.mark)
 }
 
 func replayIntEnv(key string, fallback, minimum int) (int, error) {
