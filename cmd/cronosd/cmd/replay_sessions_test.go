@@ -7,6 +7,8 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/binary"
+	"encoding/json"
+	"net"
 	"testing"
 	"time"
 
@@ -99,4 +101,29 @@ func TestReplaySegmentCapacityExpiryAndDrop(t *testing.T) {
 		defer p.mu.Unlock()
 		return len(p.byID) == 0
 	}, time.Second, time.Millisecond)
+}
+
+func TestReplaySegmentDisconnectedWhileQueued(t *testing.T) {
+	w := &replayWorker{slots: make(chan struct{}, 1), sessions: newReplaySessions(1, time.Minute)}
+	w.slots <- struct{}{}
+	server, client := net.Pipe()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		defer server.Close()
+		w.serve(server)
+	}()
+	h := int64(app.ReplayFirstHeight)
+	seg := replay.Segment{ID: "A", Start: h, End: h + 1}
+	_, err := client.Write([]byte{'S'})
+	require.NoError(t, err)
+	require.NoError(t, json.NewEncoder(client).Encode(app.ReplaySegmentHeader{Segment: seg, Height: h}))
+	require.NoError(t, replay.WriteRequest(client, segmentTestBlock(h)))
+	require.NoError(t, client.Close())
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("disconnected segment still waiting for a slot")
+	}
+	require.Empty(t, w.sessions.byID)
 }

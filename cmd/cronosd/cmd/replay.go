@@ -151,7 +151,24 @@ func (w *replayWorker) serve(conn net.Conn) {
 		_ = replay.WriteError(conn, err)
 		return
 	}
-	w.slots <- struct{}{}
+	// A segment connection doubles as its verification lease. Observe a
+	// disconnect while queued and release an unacknowledged app on timeout.
+	var decision chan bool
+	if segment != nil {
+		if err := conn.SetReadDeadline(time.Now().Add(w.sessions.timeout)); err != nil {
+			return
+		}
+		decision = make(chan bool, 1)
+		go func() {
+			b, err := r.ReadByte()
+			decision <- err == nil && b == 'Y'
+		}()
+	}
+	select {
+	case w.slots <- struct{}{}:
+	case <-decision:
+		return
+	}
 	defer func() { <-w.slots }()
 	session, err := w.sessions.acquire(segment, req)
 	if err != nil {
@@ -179,11 +196,7 @@ func (w *replayWorker) serve(conn net.Conn) {
 	}
 	timing.mark("write")
 	if segment != nil {
-		if err = conn.SetReadDeadline(time.Now().Add(w.sessions.timeout)); err != nil {
-			return
-		}
-		decision, err := r.ReadByte()
-		if err != nil || decision != 'Y' {
+		if !<-decision {
 			return
 		}
 		w.sessions.release(session, req, true)
@@ -191,7 +204,7 @@ func (w *replayWorker) serve(conn net.Conn) {
 		if err := app.WriteReplaySegmentAck(conn, nil); err != nil {
 			return
 		}
-		timing.parts = append(timing.parts, "segment_reused="+strconv.FormatBool(reused))
+		timing.parts = append(timing.parts, fmt.Sprintf("segment_start=%d segment_end=%d segment_reused=%t", segment.Start, segment.End, reused))
 	}
 	w.logMu.Lock()
 	timing.report(w.log, req.BeginBlock.Header.Height)
