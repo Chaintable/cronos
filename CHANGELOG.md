@@ -6,6 +6,7 @@
 
 - [#470](https://github.com/crypto-org-chain/cronos/pull/470) Run the tasks in `fix-unlucky-tx` command in parallel.
 - [#472](https://github.com/crypto-org-chain/cronos/pull/472) `fix-unlucky-tx` command supports `null` tendermint tx indexer.
+- `replay-serve` serves `trace_debankBlock` for v0.6 mainnet blocks from a stopped RocksDB archive (build tag `replay`).
 
 *May 10, 2022*
 
