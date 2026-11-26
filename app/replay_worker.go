@@ -128,6 +128,8 @@ func (p *replayProcess) kill() {
 	defer p.mu.Unlock()
 	if p.cmd != nil && p.cmd.Process != nil {
 		_ = p.cmd.Process.Kill()
+		// Otherwise the next call can still be handed the dying worker's socket.
+		<-p.exited
 	}
 }
 

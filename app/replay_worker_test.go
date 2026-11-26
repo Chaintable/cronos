@@ -92,6 +92,30 @@ func TestReplayWorkerCallCancelled(t *testing.T) {
 	require.ErrorIs(t, err, context.DeadlineExceeded)
 }
 
+// After a deadline the worker must be gone before the next call picks one.
+func TestReplayWorkerTimeoutWaitsForExit(t *testing.T) {
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	p := fakeWorker(t, func(replay.Request) (*replay.Result, error) {
+		<-release
+		return nil, errors.New("unreachable")
+	})
+	cmd := exec.Command("sleep", "60")
+	require.NoError(t, cmd.Start())
+	exited := make(chan struct{})
+	go func() { _ = cmd.Wait(); close(exited) }()
+	p.cmd, p.exited = cmd, exited
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	_, err := p.call(ctx, "", log.NewNopLogger(), request(2))
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	select {
+	case <-exited:
+	default:
+		t.Fatal("timed-out worker has not exited")
+	}
+}
+
 func TestReplayExecutorChecks(t *testing.T) {
 	e := NewReplayExecutor("", log.NewNopLogger())
 	require.Error(t, e.CheckReplayHeight(ReplayChainID, ReplayFirstHeight-1))
