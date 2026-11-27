@@ -1,11 +1,16 @@
 package app
 
 import (
+	"fmt"
+	"os"
 	"sort"
 
+	"cosmossdk.io/log"
+	"cosmossdk.io/store/metrics"
 	"cosmossdk.io/store/rootmulti"
 	storetypes "cosmossdk.io/store/types"
 	upgradetypes "cosmossdk.io/x/upgrade/types"
+	dbm "github.com/cosmos/cosmos-db"
 	"github.com/cosmos/cosmos-sdk/baseapp"
 )
 
@@ -39,29 +44,32 @@ func MaxVersionUpgradeStoreLoader(version int64, upgradeHeight int64, storeUpgra
 	}
 }
 
-// ReplayHostStoreLoader opens the latest version of an archive written by a
-// later release: stores that a later upgrade deleted are mounted empty. A
-// replay host never commits, so nothing is written.
-func ReplayHostStoreLoader(ms storetypes.CommitMultiStore) error {
-	rs, ok := ms.(*rootmulti.Store)
-	version := ms.LastCommitID().Version
-	if !ok || version == 0 {
-		return baseapp.DefaultStoreLoader(ms)
+// replayHostMissingStores lists the persistent stores absent from the latest
+// commit when a replay host (CRONOS_REPLAY_CATCH_UP=false) opens an archive
+// written by a later release, e.g. capability and feeibc deleted by v1.5.
+// Such a host never commits; replays load their parents separately.
+func replayHostMissingStores(db dbm.DB, keys map[string]*storetypes.KVStoreKey) []string {
+	if os.Getenv("CRONOS_REPLAY_CATCH_UP") != "false" {
+		return nil
 	}
-	info, err := rs.GetCommitInfo(version)
+	version := rootmulti.GetLatestVersion(db)
+	if version == 0 {
+		return nil
+	}
+	info, err := rootmulti.NewStore(db, log.NewNopLogger(), metrics.NewNoOpMetrics()).GetCommitInfo(version)
 	if err != nil {
-		return err
+		panic(fmt.Sprintf("replay host commit info at %d: %s", version, err))
 	}
 	committed := make(map[string]bool, len(info.StoreInfos))
 	for _, si := range info.StoreInfos {
 		committed[si.Name] = true
 	}
-	var added []string
-	for name, key := range rs.StoreKeysByName() {
-		if _, persistent := key.(*storetypes.KVStoreKey); persistent && !committed[name] {
-			added = append(added, name)
+	var missing []string
+	for name := range keys {
+		if !committed[name] {
+			missing = append(missing, name)
 		}
 	}
-	sort.Strings(added)
-	return ms.LoadLatestVersionAndUpgrade(&storetypes.StoreUpgrades{Added: added})
+	sort.Strings(missing)
+	return missing
 }

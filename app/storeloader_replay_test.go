@@ -11,28 +11,39 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// The archive's latest version lacks a store this release still mounts, as
-// with capability and feeibc after the v1.5 upgrade.
-func TestReplayHostStoreLoaderMountsDeletedStoresEmpty(t *testing.T) {
+// A later release deleted a store this release mounts, as v1.5 did with
+// capability and feeibc; its old data stays under its prefix.
+func TestReplayHostOpensArchiveWithDeletedStores(t *testing.T) {
 	db := dbm.NewMemDB()
-	kept := storetypes.NewKVStoreKey("kept")
-	archive := rootmulti.NewStore(db, log.NewNopLogger(), metrics.NewNoOpMetrics())
-	archive.MountStoreWithDB(kept, storetypes.StoreTypeIAVL, nil)
-	require.NoError(t, archive.LoadLatestVersion())
-	archive.GetCommitKVStore(kept).Set([]byte("k"), []byte("v"))
-	want := archive.Commit()
+	kept, deleted := storetypes.NewKVStoreKey("kept"), storetypes.NewKVStoreKey("deleted")
+	older := rootmulti.NewStore(db, log.NewNopLogger(), metrics.NewNoOpMetrics())
+	older.MountStoreWithDB(kept, storetypes.StoreTypeIAVL, nil)
+	older.MountStoreWithDB(deleted, storetypes.StoreTypeIAVL, nil)
+	require.NoError(t, older.LoadLatestVersion())
+	older.GetCommitKVStore(deleted).Set([]byte("k"), []byte("old"))
+	older.Commit()
+	later := rootmulti.NewStore(db, log.NewNopLogger(), metrics.NewNoOpMetrics())
+	later.MountStoreWithDB(kept, storetypes.StoreTypeIAVL, nil)
+	require.NoError(t, later.LoadLatestVersion())
+	later.GetCommitKVStore(kept).Set([]byte("k"), []byte("v"))
+	want := later.Commit()
 
-	open := func() *rootmulti.Store {
+	keys := map[string]*storetypes.KVStoreKey{"kept": kept, "deleted": deleted}
+	require.Nil(t, replayHostMissingStores(db, keys), "only a replay host without catch-up")
+	t.Setenv("CRONOS_REPLAY_CATCH_UP", "false")
+	missing := replayHostMissingStores(db, keys)
+	require.Equal(t, []string{"deleted"}, missing)
+
+	open := func(deletedDB dbm.DB) (*rootmulti.Store, error) {
 		rs := rootmulti.NewStore(db, log.NewNopLogger(), metrics.NewNoOpMetrics())
 		rs.MountStoreWithDB(kept, storetypes.StoreTypeIAVL, nil)
-		rs.MountStoreWithDB(storetypes.NewKVStoreKey("deleted"), storetypes.StoreTypeIAVL, nil)
-		rs.MountStoreWithDB(storetypes.NewTransientStoreKey("transient"), storetypes.StoreTypeTransient, nil)
-		return rs
+		rs.MountStoreWithDB(deleted, storetypes.StoreTypeIAVL, deletedDB)
+		return rs, rs.LoadLatestVersionAndUpgrade(&storetypes.StoreUpgrades{Added: missing})
 	}
-	require.ErrorContains(t, open().LoadLatestVersion(), "version of store deleted mismatch")
-
-	rs := open()
-	require.NoError(t, ReplayHostStoreLoader(rs))
+	_, err := open(nil)
+	require.ErrorContains(t, err, "found earlier version")
+	rs, err := open(dbm.NewMemDB())
+	require.NoError(t, err)
 	require.Equal(t, want, rs.LastCommitID())
 	require.Equal(t, []byte("v"), rs.GetCommitKVStore(kept).Get([]byte("k")))
 }

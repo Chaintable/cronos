@@ -995,10 +995,14 @@ func newApp(logger log.Logger, db dbm.DB, traceStore io.Writer, loadLatest bool,
 		// Register the default store loader
 		app.SetStoreLoader(MaxVersionStoreLoader(qmsVersion))
 	}
-	// A replay host without catch-up serves a frozen archive, which may be
-	// newer than this release.
-	if os.Getenv("CRONOS_REPLAY_CATCH_UP") == "false" {
-		app.SetStoreLoader(ReplayHostStoreLoader)
+	var hostMissing []string
+	if loadLatest && !replayActivation {
+		hostMissing = replayHostMissingStores(db, keys)
+	}
+	if len(hostMissing) > 0 {
+		app.SetStoreLoader(func(ms storetypes.CommitMultiStore) error {
+			return ms.LoadLatestVersionAndUpgrade(&storetypes.StoreUpgrades{Added: hostMissing})
+		})
 	}
 
 	// add test gRPC service for testing gRPC queries in isolation
@@ -1039,7 +1043,17 @@ func newApp(logger log.Logger, db dbm.DB, traceStore io.Writer, loadLatest bool,
 		}
 		app.MountKVStores(persisted)
 	} else {
-		app.MountKVStores(keys)
+		// Stores missing from a newer archive start empty, as their old data
+		// is still under their prefix.
+		persisted := make(map[string]*storetypes.KVStoreKey, len(keys))
+		for name, key := range keys {
+			persisted[name] = key
+		}
+		for _, name := range hostMissing {
+			app.CommitMultiStore().MountStoreWithDB(keys[name], storetypes.StoreTypeIAVL, dbm.NewMemDB())
+			delete(persisted, name)
+		}
+		app.MountKVStores(persisted)
 	}
 	app.MountTransientStores(tkeys)
 	app.MountMemoryStores(memKeys)
