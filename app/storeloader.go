@@ -1,6 +1,9 @@
 package app
 
 import (
+	"sort"
+
+	"cosmossdk.io/store/rootmulti"
 	storetypes "cosmossdk.io/store/types"
 	upgradetypes "cosmossdk.io/x/upgrade/types"
 	"github.com/cosmos/cosmos-sdk/baseapp"
@@ -34,4 +37,31 @@ func MaxVersionUpgradeStoreLoader(version int64, upgradeHeight int64, storeUpgra
 		// Otherwise load default store loader
 		return MaxVersionStoreLoader(version)(ms)
 	}
+}
+
+// ReplayHostStoreLoader opens the latest version of an archive written by a
+// later release: stores that a later upgrade deleted are mounted empty. A
+// replay host never commits, so nothing is written.
+func ReplayHostStoreLoader(ms storetypes.CommitMultiStore) error {
+	rs, ok := ms.(*rootmulti.Store)
+	version := ms.LastCommitID().Version
+	if !ok || version == 0 {
+		return baseapp.DefaultStoreLoader(ms)
+	}
+	info, err := rs.GetCommitInfo(version)
+	if err != nil {
+		return err
+	}
+	committed := make(map[string]bool, len(info.StoreInfos))
+	for _, si := range info.StoreInfos {
+		committed[si.Name] = true
+	}
+	var added []string
+	for name, key := range rs.StoreKeysByName() {
+		if _, persistent := key.(*storetypes.KVStoreKey); persistent && !committed[name] {
+			added = append(added, name)
+		}
+	}
+	sort.Strings(added)
+	return ms.LoadLatestVersionAndUpgrade(&storetypes.StoreUpgrades{Added: added})
 }

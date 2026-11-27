@@ -995,6 +995,11 @@ func newApp(logger log.Logger, db dbm.DB, traceStore io.Writer, loadLatest bool,
 		// Register the default store loader
 		app.SetStoreLoader(MaxVersionStoreLoader(qmsVersion))
 	}
+	// A replay host without catch-up serves a frozen archive, which may be
+	// newer than this release.
+	if os.Getenv("CRONOS_REPLAY_CATCH_UP") == "false" {
+		app.SetStoreLoader(ReplayHostStoreLoader)
+	}
 
 	// add test gRPC service for testing gRPC queries in isolation
 	// testdata.RegisterQueryServer(app.GRPCQueryRouter(), testdata.QueryImpl{})
