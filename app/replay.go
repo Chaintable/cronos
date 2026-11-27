@@ -192,35 +192,42 @@ type replayObserver struct {
 // ObserveReplayTransactions attaches a collector to a private sequential keeper.
 func ObserveReplayTransactions(k *evmkeeper.Keeper) *replayObserver {
 	o := &replayObserver{}
-	k.SetTransactionObserver(func(hash common.Hash) (vm.EVMLogger, func(*evmtypes.MsgEthereumTxResponse, error)) {
-		t, finish := tracer.NewReplayTracer(hash)
-		index := len(o.txs)
-		o.txs = append(o.txs, replay.Transaction{CosmosIndex: o.cosmos, MessageIndex: o.msg, Hash: hash})
-		o.msg++
-		return t, func(res *evmtypes.MsgEthereumTxResponse, err error) {
-			o.pending = append(o.pending, func(r *abci.ResponseDeliverTx) {
-				tx := &o.txs[index]
-				if err == nil {
-					tx.GasUsed = res.GasUsed
-					tx.Failed = res.Failed()
-					vmError := res.VmError
-					exceeded := replay.ExceedsBlockGas(r)
-					if exceeded && vmError == "" {
-						vmError = replay.BlockGasExceeded
-					}
-					tx.Trace, err = finish(vmError)
-					if exceeded {
-						// The receipt has no logs; the dropped ones are error events.
-						tx.Failed = true
-					}
-				}
-				if err != nil {
-					tx.Error = err.Error()
-				}
-			})
-		}
-	})
+	k.SetTransactionObserver(o.observe)
 	return o
+}
+
+func (o *replayObserver) observe(hash common.Hash) (vm.EVMLogger, func(*evmtypes.MsgEthereumTxResponse, error)) {
+	t, finish := tracer.NewReplayTracer(hash)
+	index := len(o.txs)
+	o.txs = append(o.txs, replay.Transaction{CosmosIndex: o.cosmos, MessageIndex: o.msg, Hash: hash})
+	o.msg++
+	return t, func(res *evmtypes.MsgEthereumTxResponse, err error) {
+		o.pending = append(o.pending, func(r *abci.ResponseDeliverTx) {
+			tx := &o.txs[index]
+			// A panic inside the EVM unwinds past the named results; the
+			// SDK recovers it and fails the Cosmos transaction.
+			if res == nil && err == nil {
+				err = fmt.Errorf("execution panicked (code %d)", r.Code)
+			}
+			if err == nil {
+				tx.GasUsed = res.GasUsed
+				tx.Failed = res.Failed()
+				vmError := res.VmError
+				exceeded := replay.ExceedsBlockGas(r)
+				if exceeded && vmError == "" {
+					vmError = replay.BlockGasExceeded
+				}
+				tx.Trace, err = finish(vmError)
+				if exceeded {
+					// The receipt has no logs; the dropped ones are error events.
+					tx.Failed = true
+				}
+			}
+			if err != nil {
+				tx.Error = err.Error()
+			}
+		})
+	}
 }
 
 // settle finishes the observations of the Cosmos transaction that returned r.

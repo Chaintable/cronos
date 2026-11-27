@@ -266,3 +266,15 @@ func TestUpgradeBlockStartsAddedStoreEmpty(t *testing.T) {
 	require.Equal(t, upgraded, run(view))
 	require.NotEqual(t, upgraded.Hash, run(db).Hash, "the live database includes future store roots")
 }
+
+// An EVM panic skips the named results, so the keeper reports neither a
+// response nor an error; mainnet H13195078 tx[0] failed this way (code 111222).
+func TestReplayObserverEVMPanic(t *testing.T) {
+	o := &replayObserver{}
+	_, finish := o.observe(common.HexToHash("0x01"))
+	finish(nil, nil)
+	o.settle(&abci.ResponseDeliverTx{Code: 111222})
+	require.Len(t, o.txs, 1)
+	require.Contains(t, o.txs[0].Error, "execution panicked")
+	require.Empty(t, o.txs[0].Trace)
+}
