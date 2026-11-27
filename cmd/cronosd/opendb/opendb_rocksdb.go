@@ -4,6 +4,7 @@
 package opendb
 
 import (
+	"fmt"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -37,7 +38,9 @@ func OpenReadOnlyDB(home string, backendType dbm.BackendType) (dbm.DB, error) {
 }
 
 func openRocksdb(dir string, readonly bool) (dbm.DB, error) {
-	opts, err := loadLatestOptions(dir)
+	cache := grocksdb.NewLRUCache(BlockCacheSize)
+	defer cache.Destroy()
+	opts, err := loadLatestOptions(dir, cache)
 	if err != nil {
 		return nil, err
 	}
@@ -54,18 +57,56 @@ func openRocksdb(dir string, readonly bool) (dbm.DB, error) {
 		return nil, err
 	}
 
+	return wrapRocksDB(db), nil
+}
+
+// OpenReplayDB opens application.db as a secondary. RocksDB keeps secondary
+// metadata under scratch and shares the supplied block cache across worker requests.
+// useRibbonFilter replaces the stored table options with ones that read the
+// archive's Ribbon filters.
+func OpenReplayDB(home, scratch string, cacheBytes uint64, useRibbonFilter bool) (dbm.DB, func() error, error) {
+	dir := filepath.Join(home, "data", "application.db")
+	cache := grocksdb.NewLRUCache(cacheBytes)
+	defer cache.Destroy()
+	opts, err := loadLatestOptions(dir, cache)
+	if err != nil {
+		return nil, nil, err
+	}
+	if opts == nil {
+		return nil, nil, fmt.Errorf("missing RocksDB options at %s", dir)
+	}
+	defer opts.Destroy()
+	if useRibbonFilter {
+		table := grocksdb.NewDefaultBlockBasedTableOptions()
+		defer table.Destroy()
+		table.SetBlockCache(cache)
+		table.SetFilterPolicy(grocksdb.NewRibbonFilterPolicy(10))
+		opts.SetBlockBasedTableFactory(table)
+	}
+	opts.SetCreateIfMissing(false)
+	opts.SetMaxOpenFiles(-1)
+	db, err := grocksdb.OpenDbAsSecondary(opts, dir, scratch)
+	if err != nil {
+		return nil, nil, err
+	}
+	return wrapRocksDB(db), db.TryCatchUpWithPrimary, nil
+}
+
+func wrapRocksDB(db *grocksdb.DB) dbm.DB {
 	ro := grocksdb.NewDefaultReadOptions()
 	ro.SetAsyncIO(true)
 	ro.SetReadaheadSize(16 * 1024 * 1024)
 	wo := grocksdb.NewDefaultWriteOptions()
 	woSync := grocksdb.NewDefaultWriteOptions()
 	woSync.SetSync(true)
-	return dbm.NewRocksDBWithRawDB(db, ro, wo, woSync), nil
+	return dbm.NewRocksDBWithRawDB(db, ro, wo, woSync)
 }
 
 // loadLatestOptions try to load options from existing db, returns nil if not exists.
-func loadLatestOptions(dir string) (*grocksdb.Options, error) {
-	opts, err := grocksdb.LoadLatestOptions(dir, grocksdb.NewDefaultEnv(), true, grocksdb.NewLRUCache(BlockCacheSize))
+func loadLatestOptions(dir string, cache *grocksdb.Cache) (*grocksdb.Options, error) {
+	env := grocksdb.NewDefaultEnv()
+	defer env.Destroy()
+	opts, err := grocksdb.LoadLatestOptions(dir, env, true, cache)
 	if err != nil {
 		// not found is not an error
 		if strings.HasPrefix(err.Error(), "NotFound: ") {
@@ -74,16 +115,17 @@ func loadLatestOptions(dir string) (*grocksdb.Options, error) {
 		return nil, err
 	}
 
+	defer opts.Destroy()
 	cfNames := opts.ColumnFamilyNames()
 	cfOpts := opts.ColumnFamilyOpts()
 
 	for i := 0; i < len(cfNames); i++ {
 		if cfNames[i] == "default" {
-			return &cfOpts[i], nil
+			return cfOpts[i].Clone(), nil
 		}
 	}
 
-	return opts.Options(), nil
+	return opts.Options().Clone(), nil
 }
 
 // NewRocksdbOptions build options for `application.db`,
