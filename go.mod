@@ -258,7 +258,7 @@ replace (
 	// call-frame tracer hooks on crypto-org-chain go-ethereum 43cf32d91c3e (v1.11.5)
 	github.com/ethereum/go-ethereum => github.com/Chaintable/go-ethereum v1.10.10-0.20261126130619-4e1713f2380a
 	// trace_debankBlock replay on crypto-org-chain ethermint 88afe81ee8de
-	github.com/evmos/ethermint => ../../ethermint-cronos.worktrees/full-block-replay-v1.3.4
+	github.com/evmos/ethermint => github.com/Chaintable/ethermint-cronos v0.6.1-0.20261127034852-c0c7278841a8
 	// Fix upstream GHSA-h395-qcrw-5vmq and GHSA-3vp4-m3rf-835h vulnerabilities.
 	// TODO Remove it: https://github.com/cosmos/cosmos-sdk/issues/10409
 	github.com/gin-gonic/gin => github.com/gin-gonic/gin v1.9.0
