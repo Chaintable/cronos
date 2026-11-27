@@ -1,14 +1,18 @@
 package app
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"os"
 	"time"
 
 	"cosmossdk.io/log"
+	pruningtypes "cosmossdk.io/store/pruning/types"
+	cmtproto "github.com/cometbft/cometbft/proto/tendermint/types"
 	dbm "github.com/cosmos/cosmos-db"
 	"github.com/cosmos/cosmos-sdk/baseapp"
+	"github.com/cosmos/cosmos-sdk/client/flags"
 	servertypes "github.com/cosmos/cosmos-sdk/server/types"
 	sdk "github.com/cosmos/cosmos-sdk/types"
 	"github.com/ethereum/go-ethereum/common"
@@ -17,6 +21,7 @@ import (
 	"github.com/evmos/ethermint/debank/tracer"
 	"github.com/evmos/ethermint/x/evm/keeper"
 	evmtypes "github.com/evmos/ethermint/x/evm/types"
+	"github.com/spf13/viper"
 )
 
 // The JSON-RPC server finds the executor by a runtime type assertion.
@@ -24,13 +29,14 @@ var _ replay.Executor = (*App)(nil)
 
 // ReplayFirstHeight is the v1.4 upgrade block; v1.5 activates after ReplayLastHeight.
 const (
+	ReplayChainID     = "cronosmainnet_25-1"
 	ReplayFirstHeight = 17155000
 	ReplayLastHeight  = 38432211
 )
 
 // CheckReplayHeight selects the execution rules compiled into this binary.
 func (app *App) CheckReplayHeight(chainID string, height int64) error {
-	if chainID != "cronosmainnet_25-1" || height < ReplayFirstHeight || height > ReplayLastHeight {
+	if chainID != ReplayChainID || height < ReplayFirstHeight || height > ReplayLastHeight {
 		return fmt.Errorf("unsupported execution rules for %s at %d", chainID, height)
 	}
 	return nil
@@ -94,6 +100,45 @@ func (app *App) LoadReplayParent(height int64) error {
 		return err
 	}
 	return app.BaseApp.Init()
+}
+
+// OpenReplayApp loads a parent version once for a segment. Its commits stay
+// in a private overlay; no replay writes reach the underlying archive.
+func OpenReplayApp(db dbm.DB, home, chainID string, parent int64) (*App, error) {
+	opts := viper.New()
+	opts.Set(flags.FlagHome, home)
+	opts.Set(flags.FlagChainID, chainID)
+	options := append(ReplayAppOptions(chainID), baseapp.SetPruning(pruningtypes.NewPruningOptions(pruningtypes.PruningNothing)))
+	a := newApp(log.NewNopLogger(), newOverlayDB(db), nil, false, opts, parent+1 == ReplayFirstHeight, options...)
+	if err := a.LoadReplayParent(parent); err != nil {
+		return nil, fmt.Errorf("open parent multistore at %d: %w", parent, err)
+	}
+	if err := a.RefreshBlockList(a.NewUncachedContext(false, cmtproto.Header{})); err != nil {
+		return nil, err
+	}
+	return a, nil
+}
+
+// ReplayNextBlock executes the block on the app's current commit, which must
+// be the requested parent, and commits it so the segment can continue.
+func (app *App) ReplayNextBlock(req replay.Request) (*replay.Result, error) {
+	if req.Request == nil || len(req.ParentHash) != 32 {
+		return nil, fmt.Errorf("invalid historical finalize request")
+	}
+	parent := req.Request.Height - 1
+	if id := app.LastCommitID(); id.Version != parent || !bytes.Equal(id.Hash, req.ParentHash) {
+		return nil, fmt.Errorf("parent commit at %d: got %d/%X, want %X", parent, id.Version, id.Hash, req.ParentHash)
+	}
+	txs := ObserveReplayTransactions(app.EvmKeeper)
+	defer app.EvmKeeper.SetTransactionObserver(nil)
+	finalized, err := app.FinalizeBlock(req.Request)
+	if err != nil {
+		return nil, err
+	}
+	if _, err = app.Commit(); err != nil {
+		return nil, err
+	}
+	return &replay.Result{Finalize: finalized, Transactions: *txs}, nil
 }
 
 // ObserveReplayTransactions attaches a collector to a private sequential keeper.

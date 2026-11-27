@@ -30,9 +30,10 @@ import (
 	bank "github.com/cosmos/cosmos-sdk/x/bank/types"
 )
 
-// A long-lived replay process builds a fresh app per request while other
-// requests execute and decode transactions on the same database.
-func TestConcurrentFreshAppReplay(t *testing.T) {
+// newReplayChain commits block 1 of a one-validator chain and returns the
+// request for block 2, in which each of three senders deploys a contract that
+// calls the identity precompile and emits LOG0.
+func newReplayChain(t *testing.T) (dbm.DB, *App, func(int64, ...[]byte) *abci.RequestFinalizeBlock, *abci.RequestFinalizeBlock, int) {
 	db := dbm.NewMemDB()
 	open := func(latest bool) *App {
 		opts := AppOptionsMap{flags.FlagHome: t.TempDir()}
@@ -68,7 +69,6 @@ func TestConcurrentFreshAppReplay(t *testing.T) {
 	_, err = a.Commit()
 	require.NoError(t, err)
 
-	// Each sender deploys a contract that calls the identity precompile and emits LOG0.
 	code := common.FromHex("0x6000600060006000600073" + "0000000000000000000000000000000000000004" + "5af15060006000a000")
 	var txs [][]byte
 	for i, key := range keys {
@@ -81,7 +81,13 @@ func TestConcurrentFreshAppReplay(t *testing.T) {
 		require.NoError(t, err)
 		txs = append(txs, raw)
 	}
-	req := finalize(2, txs...)
+	return db, a, finalize, finalize(2, txs...), len(keys)
+}
+
+// A long-lived replay process builds a fresh app per request while other
+// requests execute and decode transactions on the same database.
+func TestConcurrentFreshAppReplay(t *testing.T) {
+	db, _, _, req, senders := newReplayChain(t)
 
 	run := func() (*abci.ResponseFinalizeBlock, []replay.Transaction) {
 		opts := AppOptionsMap{flags.FlagHome: t.TempDir()}
@@ -93,7 +99,7 @@ func TestConcurrentFreshAppReplay(t *testing.T) {
 		return out, *observed
 	}
 	want, wantTxs := run()
-	require.Len(t, wantTxs, len(keys))
+	require.Len(t, wantTxs, senders)
 	for _, r := range want.TxResults {
 		require.Zero(t, r.Code, r.Log)
 	}
