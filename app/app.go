@@ -15,6 +15,7 @@ import (
 	stdruntime "runtime"
 	"slices"
 	"sort"
+	"sync"
 
 	"filippo.io/age"
 
@@ -279,6 +280,11 @@ var (
 	_ servertypes.Application = (*App)(nil)
 )
 
+var (
+	setEIP712EncodingOnce        sync.Once
+	validateProtoAnnotationsOnce sync.Once
+)
+
 type GenesisState = map[string]json.RawMessage
 
 // App extends an ABCI application, but with most of its parameters exported.
@@ -286,6 +292,8 @@ type GenesisState = map[string]json.RawMessage
 // capabilities aren't needed for testing.
 type App struct {
 	*baseapp.BaseApp
+	replayHome   string
+	replayWorker replayProcess
 
 	// encoding
 	cdc               *codec.LegacyAmino
@@ -370,13 +378,19 @@ func New(
 	appOpts servertypes.AppOptions,
 	baseAppOptions ...func(*baseapp.BaseApp),
 ) *App {
+	return newApp(logger, db, traceStore, loadLatest, appOpts, false, baseAppOptions...)
+}
+
+func newApp(logger log.Logger, db dbm.DB, traceStore io.Writer, loadLatest bool, appOpts servertypes.AppOptions, replayActivation bool, baseAppOptions ...func(*baseapp.BaseApp)) *App {
 	encodingConfig := evmenc.MakeConfig()
 	appCodec := encodingConfig.Codec
 	cdc := encodingConfig.Amino
 	txConfig := encodingConfig.TxConfig
 	interfaceRegistry := encodingConfig.InterfaceRegistry
 	txDecoder := txConfig.TxDecoder()
-	eip712.SetEncodingConfig(encodingConfig)
+	// Every app in a process shares one encoding; installing it again would
+	// race with EIP-712 decoding in apps that are already executing.
+	setEIP712EncodingOnce.Do(func() { eip712.SetEncodingConfig(encodingConfig) })
 
 	homePath := cast.ToString(appOpts.Get(flags.FlagHome))
 	var identity age.Identity
@@ -459,6 +473,7 @@ func New(
 	invCheckPeriod := cast.ToUint(appOpts.Get(server.FlagInvCheckPeriod))
 	app := &App{
 		BaseApp:              bApp,
+		replayHome:           homePath,
 		cdc:                  cdc,
 		txConfig:             txConfig,
 		txDecoder:            txDecoder,
@@ -980,6 +995,10 @@ func New(
 		// Register the default store loader
 		app.SetStoreLoader(MaxVersionStoreLoader(qmsVersion))
 	}
+	var hostMissing []string
+	if loadLatest && !replayActivation {
+		hostMissing = replayHostMissingStores(db, keys)
+	}
 
 	// add test gRPC service for testing gRPC queries in isolation
 	// testdata.RegisterQueryServer(app.GRPCQueryRouter(), testdata.QueryImpl{})
@@ -1005,7 +1024,33 @@ func New(
 	app.sm.RegisterStoreDecoders()
 
 	// initialize stores
-	app.MountKVStores(keys)
+	if replayActivation {
+		// The archive already contains future versions of stores added at the
+		// upgrade; loading version zero from it would select the latest tree.
+		persisted := make(map[string]*storetypes.KVStoreKey, len(keys))
+		upgrades := activationStoreUpgrades()
+		for name, key := range keys {
+			if upgrades.IsAdded(name) {
+				app.CommitMultiStore().MountStoreWithDB(key, storetypes.StoreTypeIAVL, dbm.NewMemDB())
+			} else {
+				persisted[name] = key
+			}
+		}
+		app.MountKVStores(persisted)
+	} else {
+		// Stores missing from a newer archive are plain empty stores: their old
+		// trees are still under their prefixes, and the host reads neither
+		// their latest nor their historical versions.
+		persisted := make(map[string]*storetypes.KVStoreKey, len(keys))
+		for name, key := range keys {
+			persisted[name] = key
+		}
+		for _, name := range hostMissing {
+			app.CommitMultiStore().MountStoreWithDB(keys[name], storetypes.StoreTypeDB, dbm.NewMemDB())
+			delete(persisted, name)
+		}
+		app.MountKVStores(persisted)
+	}
 	app.MountTransientStores(tkeys)
 	app.MountMemoryStores(memKeys)
 	app.MountObjectStores(okeys)
@@ -1037,17 +1082,20 @@ func New(
 	app.setPostHandler()
 
 	// At startup, after all modules have been registered, check that all prot
-	// annotations are correct.
-	protoFiles, err := proto.MergedRegistry()
-	if err != nil {
-		panic(err)
-	}
-	err = msgservice.ValidateProtoAnnotations(protoFiles)
-	if err != nil {
-		// Once we switch to using protoreflect-based antehandlers, we might
-		// want to panic here instead of logging a warning.
-		fmt.Fprintln(os.Stderr, err.Error())
-	}
+	// annotations are correct. The registered files are fixed per binary, so
+	// apps built later in the same process skip the costly merge.
+	validateProtoAnnotationsOnce.Do(func() {
+		protoFiles, err := proto.MergedRegistry()
+		if err != nil {
+			panic(err)
+		}
+		err = msgservice.ValidateProtoAnnotations(protoFiles)
+		if err != nil {
+			// Once we switch to using protoreflect-based antehandlers, we might
+			// want to panic here instead of logging a warning.
+			fmt.Fprintln(os.Stderr, err.Error())
+		}
+	})
 
 	if loadLatest {
 		if err := app.LoadLatestVersion(); err != nil {
