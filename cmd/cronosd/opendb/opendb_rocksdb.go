@@ -61,7 +61,9 @@ func openRocksdb(dir string, readonly bool) (dbm.DB, error) {
 
 // OpenReplayDB opens application.db as a secondary. RocksDB keeps secondary
 // metadata under scratch and shares the supplied block cache across worker requests.
-func OpenReplayDB(home, scratch string, cacheBytes uint64) (dbm.DB, func() error, error) {
+// useRibbonFilter replaces the stored table options with ones that read the
+// archive's Ribbon filters.
+func OpenReplayDB(home, scratch string, cacheBytes uint64, useRibbonFilter bool) (dbm.DB, func() error, error) {
 	dir := filepath.Join(home, "data", "application.db")
 	cache := grocksdb.NewLRUCache(cacheBytes)
 	defer cache.Destroy()
@@ -73,6 +75,13 @@ func OpenReplayDB(home, scratch string, cacheBytes uint64) (dbm.DB, func() error
 		return nil, nil, fmt.Errorf("missing RocksDB options at %s", dir)
 	}
 	defer opts.Destroy()
+	if useRibbonFilter {
+		table := grocksdb.NewDefaultBlockBasedTableOptions()
+		defer table.Destroy()
+		table.SetBlockCache(cache)
+		table.SetFilterPolicy(grocksdb.NewRibbonFilterPolicy(10))
+		opts.SetBlockBasedTableFactory(table)
+	}
 	opts.SetCreateIfMissing(false)
 	opts.SetMaxOpenFiles(-1)
 	db, err := grocksdb.OpenDbAsSecondary(opts, dir, scratch)
