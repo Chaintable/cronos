@@ -999,11 +999,6 @@ func newApp(logger log.Logger, db dbm.DB, traceStore io.Writer, loadLatest bool,
 	if loadLatest && !replayActivation {
 		hostMissing = replayHostMissingStores(db, keys)
 	}
-	if len(hostMissing) > 0 {
-		app.SetStoreLoader(func(ms storetypes.CommitMultiStore) error {
-			return ms.LoadLatestVersionAndUpgrade(&storetypes.StoreUpgrades{Added: hostMissing})
-		})
-	}
 
 	// add test gRPC service for testing gRPC queries in isolation
 	// testdata.RegisterQueryServer(app.GRPCQueryRouter(), testdata.QueryImpl{})
@@ -1043,14 +1038,15 @@ func newApp(logger log.Logger, db dbm.DB, traceStore io.Writer, loadLatest bool,
 		}
 		app.MountKVStores(persisted)
 	} else {
-		// Stores missing from a newer archive start empty, as their old data
-		// is still under their prefix.
+		// Stores missing from a newer archive are plain empty stores: their old
+		// trees are still under their prefixes, and the host reads neither
+		// their latest nor their historical versions.
 		persisted := make(map[string]*storetypes.KVStoreKey, len(keys))
 		for name, key := range keys {
 			persisted[name] = key
 		}
 		for _, name := range hostMissing {
-			app.CommitMultiStore().MountStoreWithDB(keys[name], storetypes.StoreTypeIAVL, dbm.NewMemDB())
+			app.CommitMultiStore().MountStoreWithDB(keys[name], storetypes.StoreTypeDB, dbm.NewMemDB())
 			delete(persisted, name)
 		}
 		app.MountKVStores(persisted)

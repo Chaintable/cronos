@@ -34,16 +34,21 @@ func TestReplayHostOpensArchiveWithDeletedStores(t *testing.T) {
 	missing := replayHostMissingStores(db, keys)
 	require.Equal(t, []string{"deleted"}, missing)
 
-	open := func(deletedDB dbm.DB) (*rootmulti.Store, error) {
+	open := func(typ storetypes.StoreType) (*rootmulti.Store, error) {
 		rs := rootmulti.NewStore(db, log.NewNopLogger(), metrics.NewNoOpMetrics())
 		rs.MountStoreWithDB(kept, storetypes.StoreTypeIAVL, nil)
-		rs.MountStoreWithDB(deleted, storetypes.StoreTypeIAVL, deletedDB)
-		return rs, rs.LoadLatestVersionAndUpgrade(&storetypes.StoreUpgrades{Added: missing})
+		rs.MountStoreWithDB(deleted, typ, dbm.NewMemDB())
+		return rs, rs.LoadLatestVersion()
 	}
-	_, err := open(nil)
-	require.ErrorContains(t, err, "found earlier version")
-	rs, err := open(dbm.NewMemDB())
+	_, err := open(storetypes.StoreTypeIAVL)
+	require.ErrorContains(t, err, "version of store deleted mismatch")
+	rs, err := open(storetypes.StoreTypeDB)
 	require.NoError(t, err)
 	require.Equal(t, want, rs.LastCommitID())
 	require.Equal(t, []byte("v"), rs.GetCommitKVStore(kept).Get([]byte("k")))
+	// Historical reads, also at heights where the deleted store existed.
+	for _, version := range []int64{1, 2} {
+		_, err := rs.CacheMultiStoreWithVersion(version)
+		require.NoError(t, err)
+	}
 }
