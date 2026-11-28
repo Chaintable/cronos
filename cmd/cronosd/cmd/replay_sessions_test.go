@@ -40,7 +40,7 @@ func TestReplaySegmentVerifiedHandoff(t *testing.T) {
 	first, next, last := segmentTestBlock(seg.Start), segmentTestBlock(seg.Start+1), segmentTestBlock(seg.End)
 	s, err := p.acquire(&seg, first)
 	require.NoError(t, err)
-	a := new(app.App)
+	a := new(app.ReplayApp)
 	s.app = a
 	_, err = p.acquire(&seg, next)
 	require.Error(t, err, "cannot use results until verified")
@@ -78,7 +78,7 @@ func TestReplaySegmentCapacityExpiryAndDrop(t *testing.T) {
 	first := segmentTestBlock(seg.Start)
 	s, err := p.acquire(&seg, first)
 	require.NoError(t, err)
-	s.app = new(app.App)
+	s.app = new(app.ReplayApp)
 	p.release(s, first, true)
 	legacy, err := p.acquire(nil, first)
 	require.NoError(t, err)
