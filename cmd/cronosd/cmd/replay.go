@@ -185,7 +185,20 @@ func (w *replayWorker) serve(conn net.Conn) {
 
 	timing := newWorkerTiming()
 	reused := session.app != nil
+	// SDK execution cannot be cancelled safely in-process. Keep its deadline
+	// active even if the RPC client disconnects. The parent replaces this
+	// child on the next call and every unacknowledged height is replayed.
+	var watchdog *time.Timer
+	if segment != nil {
+		watchdog = time.AfterFunc(w.sessions.timeout, func() {
+			fmt.Fprintf(os.Stderr, "replay worker execution timed out at height %d\n", height)
+			os.Exit(1)
+		})
+	}
 	res, err := w.replay(session, req, timing)
+	if watchdog != nil {
+		watchdog.Stop()
+	}
 	if err != nil {
 		_ = replay.WriteError(conn, err)
 		return
